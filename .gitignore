@@ -1,0 +1,15 @@
+# Runtime state — per-project, must never be committed (would cross-wire mailboxes)
+_ipc.db
+_ipc.db-wal
+_ipc.db-shm
+_watcher_*.alive
+.claude/ipc_roles.json
+.claude/ipc_roles.json.lock
+.claude/ipc_roles.json.tmp
+
+# Local Claude Code settings (machine/user specific)
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc

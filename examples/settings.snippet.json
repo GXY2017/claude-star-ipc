@@ -1,0 +1,19 @@
+{
+  "_comment": "Merge these two hook entries into your project's .claude/settings.local.json. install_ipc.py does this automatically and idempotently; this snippet is for manual installs.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python .claude/hooks/ipc_role.py claim" }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python .claude/hooks/ipc_role.py release" }
+        ]
+      }
+    ]
+  }
+}
