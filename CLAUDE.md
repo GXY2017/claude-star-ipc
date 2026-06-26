@@ -1,5 +1,8 @@
 # 项目说明 / Project protocol
 
+> **定位：跨厂大模型协作。** 这套机制让**不同公司的大模型驱动各自独立、持久的终端会话，作为对等节点协作**（如 Anthropic Opus 中枢 A ＋ 智谱 GLM worker B），区别于 subagents / 同源 agent team（都在单一厂商 harness 内）。邮箱只是磁盘文件，不关心每个终端背后是哪家模型。
+> **Positioning: cross-vendor LLM collaboration.** This lets persistent, independent terminal sessions driven by models from *different companies* collaborate as peers (e.g. an Anthropic Opus hub A + a Zhipu GLM worker B) — unlike subagents / same-harness agent teams, which are single-vendor. The mailbox is just files on disk; it doesn't care which model drives each terminal.
+
 > 本文件是被 Claude Code 在 cwd=本项目时自动加载的「行为规范」。下面整段是多终端 IPC 协议，路径无关、可被 install_ipc.py 逐字复制到其他项目。
 > This CLAUDE.md is the agent behavior spec auto-loaded by Claude Code. The section below is the multi-terminal IPC protocol (path-agnostic; install_ipc.py copies it verbatim).
 
