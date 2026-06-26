@@ -12,13 +12,21 @@ results back — each worker keeping its own long-lived context, model, and acco
 > [`CLAUDE.md`](CLAUDE.md) and is written in Chinese. This README is the English
 > overview.
 
-## Why
+## Why — cross-vendor LLM collaboration
 
-Subagents are great for one-shot parallel fan-out within a single session. This is
-different: **persistent, independent sessions**. Use it when you want, e.g., an
-Opus hub (A) orchestrating a cheaper Sonnet worker (B) that does token-heavy data
-hauling, a Haiku worker (C) chewing through large files, and a different-provider
-model (D) doing an adversarial cross-check — each watchable in its own window.
+Subagents and "agent teams" live inside a single vendor's harness: one orchestrator
+spawns short-lived helpers that share the same provider. **This is different — it
+lets independent, persistent terminal sessions backed by models from *different
+companies* collaborate as peers.** The mailbox is just files on disk, so it does
+not care which model drives each terminal.
+
+So you can pair, e.g., an Anthropic **Opus** hub (A) with a **GLM** (Zhipu) worker
+(B) — or any cross-vendor mix — each in its own window, with its own context,
+account, and cost profile. A natural split: Opus orchestrates and makes the calls;
+a cheaper worker does token-heavy data hauling; another chews through large files;
+a **different-vendor** model runs an adversarial cross-check that doesn't share the
+hub's blind spots (no single-model monoculture). That kind of cross-company pairing
+is exactly what subagents and same-harness agent teams can't do.
 
 ## Topology — star, A at the hub
 
