@@ -29,7 +29,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 SRC = os.path.dirname(os.path.abspath(__file__))
-IPC_HEADER = "## 多终端通信协议"  # marks the start of the copyable protocol section
+IPC_HEADER = "## Multi-Terminal IPC Protocol"  # start of the copyable protocol section
 
 # The two hook entries this kit needs. Identified for idempotency by the unique
 # substring in their command, so a re-run won't duplicate them.
@@ -109,7 +109,7 @@ def _append_protocol(claude_md_path):
             f.write("\n" + section)
         return "append"
     with open(claude_md_path, "w", encoding="utf-8") as f:
-        f.write("# 项目说明\n\n" + section)
+        f.write("# Project protocol\n\n" + section)
     return "create"
 
 

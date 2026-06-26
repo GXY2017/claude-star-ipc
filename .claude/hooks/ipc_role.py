@@ -42,33 +42,43 @@ ROLES = ("A", "B", "C", "D")  # A = hub/master; B,C,D... = workers (extend freel
 
 # Behavior injected into each session so no manual /main or /sub is needed.
 MASTER_CONTEXT = (
-    "【IPC 角色：你是主终端 A（master / 星型中枢）】本项目用 ipc.py(_ipc.db) 与从终端 "
-    "B、C、D… 协作（星型拓扑，你是唯一中枢，worker 之间互不通信），协议见 CLAUDE.md。"
-    "你是发起方/决策方。派活给单个 worker：`python ipc.py send --from A --to B \"<任务>\"`；"
-    "并发派给多个：`--to B,C`；广播给所有在线 worker：`--to ALL`。要等回复时，把 "
-    "`python ipc.py recv --me A --block` 用后台 Bash(run_in_background) 挂起——worker 一回复"
-    "该命令退出、harness 自动唤醒你读结果。多 worker 并发时回复是逐条唤醒，要等齐需自己计数、"
-    "收一条重挂一次。只用 recv/peek 收消息，绝不 Read 整个 _ipc.db。本角色已自动指定，无需再敲 /main。"
+    "[IPC role: you are master terminal A (master / star hub)] This project uses "
+    "ipc.py(_ipc.db) to collaborate with worker terminals B, C, D… (star topology: "
+    "you are the sole hub; workers don't talk to each other). See CLAUDE.md for the "
+    "protocol. You are the initiator/decider. Dispatch to one worker: "
+    "`python ipc.py send --from A --to B \"<task>\"`; to several at once: `--to B,C`; "
+    "broadcast to all live workers: `--to ALL`. To wait for a reply, run "
+    "`python ipc.py recv --me A --block` as a background Bash(run_in_background) — when "
+    "a worker replies, that command exits and the harness wakes you to read the result. "
+    "With several workers, replies wake you one at a time; to wait for all, keep count "
+    "and re-arm one per reply. Only use recv/peek to receive; never Read the whole "
+    "_ipc.db. This role is auto-assigned; no need to type /main."
 )
 
 
 def _worker_context(role):
     return (
-        f"【IPC 角色：你是从终端 {role}（subordinate / worker）】本项目用 ipc.py(_ipc.db) 与主终端 A "
-        f"协作（星型拓扑，你只跟 A 通信、不与其他 worker 通信），协议见 CLAUDE.md。立即进入从属待命："
-        f"① 先跑一次 `python ipc.py recv --me {role}` 清积压未读任务，有就执行并用 "
-        f"`python ipc.py send --from {role} --to A \"<结果摘要>\"` 发回；② 把 "
-        f"`python ipc.py recv --me {role} --block` 用后台 Bash(run_in_background) 挂为阻塞盯哨，"
-        f"然后结束本轮。每当盯哨完成被唤醒：有任务则执行→send 回 A→重挂新盯哨；输出 "
-        f"NONE (timeout) 则直接重挂。做完即停，不寒暄、不替 A 决定。只用 recv/peek，"
-        f"绝不 Read 整个 _ipc.db。本角色已自动指定，无需再敲 /sub。"
+        f"[IPC role: you are worker terminal {role} (subordinate / worker)] This project "
+        f"uses ipc.py(_ipc.db) to collaborate with master terminal A (star topology: you "
+        f"talk only to A, never to other workers). See CLAUDE.md for the protocol. Enter "
+        f"standby immediately: (1) first run `python ipc.py recv --me {role}` to drain any "
+        f"backlog; if there is a task, do it and send the result back with "
+        f"`python ipc.py send --from {role} --to A \"<result summary>\"`; (2) park "
+        f"`python ipc.py recv --me {role} --block` as a background Bash(run_in_background) "
+        f"blocking watcher, then end this turn. Each time the watcher wakes you: if there "
+        f"is a task, execute → send back to A → re-arm a new watcher; on NONE (timeout), "
+        f"just re-arm. Stop when done; no chit-chat, don't decide on A's behalf. Only use "
+        f"recv/peek; never Read the whole _ipc.db. This role is auto-assigned; no need to "
+        f"type /sub."
     )
 
 
 NONE_CONTEXT = (
-    "【IPC 角色：无】本项目 A 及所有 worker 协作角色均已被占用，此终端不参与多终端协作，"
-    "按普通会话使用即可。若确认某终端已关闭却仍显示占用，运行 "
-    "`python .claude/hooks/ipc_role.py reset` 清空角色登记后重开本终端。"
+    "[IPC role: none] A and all worker roles in this project are already taken; this "
+    "terminal does not join the multi-terminal collaboration — use it as a normal "
+    "session. If a terminal is confirmed closed but still shows as occupied, run "
+    "`python .claude/hooks/ipc_role.py reset` to clear the role registry, then reopen "
+    "this terminal."
 )
 
 
