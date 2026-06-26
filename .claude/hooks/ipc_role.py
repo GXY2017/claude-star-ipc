@@ -67,9 +67,11 @@ def _worker_context(role):
         f"`python ipc.py recv --me {role} --block` as a background Bash(run_in_background) "
         f"blocking watcher, then end this turn. Each time the watcher wakes you: if there "
         f"is a task, execute → send back to A → re-arm a new watcher; on NONE (timeout), "
-        f"just re-arm. Stop when done; no chit-chat, don't decide on A's behalf. Only use "
-        f"recv/peek; never Read the whole _ipc.db. This role is auto-assigned; no need to "
-        f"type /sub."
+        f"just re-arm. HARD RULE: send exactly one reply to A for EVERY message you recv — "
+        f"even a test, a greeting, or 'received, no action needed'; never consume (mark "
+        f"read) a message without replying, or A's --block watcher waits forever. Stop when "
+        f"done; no chit-chat, don't decide on A's behalf. Only use recv/peek; never Read the "
+        f"whole _ipc.db. This role is auto-assigned; no need to type /sub."
     )
 
 
