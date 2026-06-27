@@ -14,6 +14,9 @@ CLI:
     python ipc.py recv --me B                # print NEW messages for B, mark them read
     python ipc.py recv --me A --block        # wait until a message arrives, then print it
     python ipc.py recv --me A --block --count 3  # BARRIER: wait until 3 replies arrive (parallel fan-out)
+    # recv --block exit code: 0 = returned message(s); 2 = empty timeout (lets a
+    # backgrounded watcher skip re-reading output — shows as status=failed but is
+    # a normal timeout, not an error). Non-block recv always exits 0.
     python ipc.py send --from A --to B "msg" --require-watcher  # refuse if B not listening
     python ipc.py status --watch B           # is B's --block watcher parked? ALIVE/DOWN
     python ipc.py peek --me B [--tail 5]     # show recent thread WITHOUT marking read
@@ -328,6 +331,19 @@ def main():
             rows = recv(args.me)
         if not rows:
             print("NONE (timeout)" if args.block else "NONE")
+            if args.block:
+                # Two-state exit code for the backgrounded watcher: exit 2 on an
+                # empty timeout, exit 0 when messages were returned (the else
+                # branch below). This lets the agent tell "nothing arrived" from
+                # "got a message" straight from the task-notification exit code
+                # and SKIP re-reading the output on every idle timeout — the
+                # top token sink for a long-parked hub/worker. The harness shows
+                # a non-zero background exit as status=failed/"exit code 2": that
+                # is a NORMAL park timeout, NOT an error (verified: no auto-retry,
+                # no permission prompt). Non-block recv keeps exit 0 so existing
+                # drain scripts/hooks stay safe. (A future non-consuming partial
+                # barrier could add exit 4; 3 stays reserved for send REFUSED.)
+                sys.exit(2)
         else:
             for mid, ts, sender, body in rows:
                 print(f"#{mid} [{ts}] {sender}: {body}")

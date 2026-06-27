@@ -110,8 +110,13 @@ reply shouldn't be blocked even when A isn't watching).
    worker `send`s back, that command exits and the harness feeds the reply in and
    wakes A — this is push, no polling by A. A watcher reports once: for multiple
    round-trips (or to wait on several workers), resend/re-arm a background `--block`
-   each round. `NONE (timeout)` (default 580s, under bash's 600s cap) means nothing
-   arrived yet — just arm another one and keep waiting.
+   each round (or use the `--count N` barrier to collect all N in one call). **Exit
+   code tells you what happened without re-reading the output**: `recv --block` exits
+   `0` when it returns message(s) — read them — and `2` on an empty timeout — just
+   re-arm, don't re-read. The harness shows exit 2 as `status=failed`/`NONE (timeout)`;
+   that is a normal park timeout (default 580s, under bash's 600s cap), **not an
+   error**. Skipping the output read on every idle timeout is the main token saving
+   for a long-parked hub or worker.
 
 **Auto-relay for workers:** roles and watcher instructions are injected by the
 SessionStart hook, so **a worker usually needn't type `/sub`**. Mechanism: the

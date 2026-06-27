@@ -105,6 +105,8 @@ python ipc.py send --from A --to ALL "task"
 python ipc.py recv --me A --block
 # A waits for ALL N replies after a fan-out (BARRIER: one call collects all N):
 python ipc.py recv --me A --block --count 3
+# recv --block exit code: 0 = returned message(s) (read them); 2 = empty timeout
+# (re-arm without re-reading — shown as status=failed, but a normal timeout, not an error)
 
 # A worker drains its inbox / parks its watcher:
 python ipc.py recv --me B
