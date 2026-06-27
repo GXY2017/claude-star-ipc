@@ -159,13 +159,15 @@ Monitor keeps listening — no `/loop`, no re-arm.
 role (the registry keeps `session_id`→role; `release()` early-returns on `reason=="clear"`);
 it only kills the background **watcher process**. So recovery = re-establish the watcher,
 not re-claim the role — and `recv`/`watch` only need the `--me <role>` argument, not the
-registry. The SessionStart hook is designed to re-fire on `/clear` and re-inject the role
-context (so often, typing one line is enough — the injected instructions tell the worker to
-drain + start its Monitor). The explicit, deterministic path is the **`/ipc-recover`**
-command (takes the role as `$ARGUMENTS`, or reads it from the injected context): it drains
-the backlog (`recv --me <role>`) and starts the persistent Monitor `watch --me <role>`.
-Use `/ipc-recover B` when the hook didn't re-inject (you can always assert the role
-explicitly). A (hub) needs no standby watcher — it just continues per its hub role.
+registry. **Do NOT rely on a bare nudge after `/clear`** — observed (2026-06-28): a cleared worker
+comes back without acting on its role (the SessionStart hook does not reliably re-inject on
+`/clear`, and even if it did, the "manual floor" means a blank `ok` won't tell the worker
+what to do). **Recover explicitly:** run **`/ipc-recover B`** (the command takes the role as
+`$ARGUMENTS`, or reads it from any injected context; it drains `recv --me <role>` then starts
+the persistent Monitor `watch --me <role>`). If that slash command isn't loaded in the cleared
+session, paste the equivalent recipe instead: tell the worker its role, then `recv --me B`
+(drain) → start a persistent Monitor `watch --me B` → end turn. A (hub) needs no standby
+watcher — it just continues per its hub role.
 (Replaces the old `/sub`; `/main` is kept as A's optional hub self-assertion / hook-failure
 fallback. A bash `recv --block` fallback watcher, if used instead of the Monitor, must be
 re-armed each wake: exit `0`=message, `2`=empty timeout/re-arm without reading, `killed`
