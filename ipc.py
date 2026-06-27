@@ -13,6 +13,7 @@ CLI:
     python ipc.py send --from A --to ALL "m" # broadcast to every other live role
     python ipc.py recv --me B                # print NEW messages for B, mark them read
     python ipc.py recv --me A --block        # wait until a message arrives, then print it
+    python ipc.py recv --me A --block --count 3  # BARRIER: wait until 3 replies arrive (parallel fan-out)
     python ipc.py send --from A --to B "msg" --require-watcher  # refuse if B not listening
     python ipc.py status --watch B           # is B's --block watcher parked? ALIVE/DOWN
     python ipc.py peek --me B [--tail 5]     # show recent thread WITHOUT marking read
@@ -174,24 +175,40 @@ def recv(me):
         return rows
 
 
-def recv_block(me, timeout, interval):
-    """Like recv(), but if nothing is waiting, poll until a message for `me`
-    arrives or `timeout` seconds elapse. Returns the rows (empty on timeout).
+def recv_block(me, timeout, interval, count=1):
+    """Like recv(), but if fewer than `count` messages are waiting, poll until
+    `count` messages for `me` have arrived (accumulated across polls) or
+    `timeout` seconds elapse. Returns the rows (fewer than `count`, possibly
+    empty, on timeout).
 
     This is the push primitive for the lightweight watcher pattern: A sends a
     task to B, then runs this as a BACKGROUND bash command. The process stays
     parked until B replies (or timeout), at which point it exits and the harness
     re-invokes A with the reply — no polling loop in the agent itself.
+
+    count>1 is the BARRIER primitive for parallel fan-out: A dispatches to N
+    workers (`--to B,C,D`), then a SINGLE `recv --count N --block` parks until
+    all N have replied and returns them together. The tally lives inside this
+    one blocking process, NOT across A's turns — so it survives context
+    compression, unlike A re-arming N separate watchers and counting replies by
+    hand (which silently breaks when the count is lost on compaction). On
+    timeout it returns the k<N collected so far; A diffs the senders it got
+    against the recipients it fanned out to, to find who is absent, then
+    probes/re-dispatches those (see CLAUDE.md). count<=1 keeps the original
+    "return on first message" behaviour unchanged.
     """
     deadline = time.monotonic() + timeout
+    collected = []
     try:
         while True:
             _beat(me)  # tell the other terminal this watcher is parked & listening
             rows = recv(me)
             if rows:
-                return rows
+                collected.extend(rows)
+                if len(collected) >= count:
+                    return collected
             if time.monotonic() >= deadline:
-                return []
+                return collected
             # Sleep, but never overshoot the deadline.
             time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
     finally:
@@ -254,6 +271,12 @@ def main():
                    help="max seconds to wait in --block mode (stay under bash's 600s cap)")
     r.add_argument("--interval", type=float, default=2.0,
                    help="seconds between polls in --block mode")
+    r.add_argument("--count", type=int, default=1,
+                   help="BARRIER: in --block mode, wait until this many messages "
+                        "have arrived (accumulated) before returning. Use after a "
+                        "fan-out (--to B,C,D) so one blocking call collects all N "
+                        "replies; the tally lives in the process, not across A's "
+                        "context. On timeout returns however many arrived (k<N).")
 
     k = sub.add_parser("peek")
     k.add_argument("--me", required=True)
@@ -300,7 +323,7 @@ def main():
     elif args.cmd == "recv":
         _require_valid(args.me, "--me")
         if args.block:
-            rows = recv_block(args.me, args.timeout, args.interval)
+            rows = recv_block(args.me, args.timeout, args.interval, args.count)
         else:
             rows = recv(args.me)
         if not rows:

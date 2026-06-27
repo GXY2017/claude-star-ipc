@@ -56,6 +56,7 @@ python ipc.py send --from A --to B "task" --require-watcher  # refuse (exit 3) &
 python ipc.py status --watch B                # is B's watcher parked? ALIVE(exit 0)/DOWN(exit 1)
 python ipc.py recv --me B                     # take NEW unread messages addressed to me, mark them read
 python ipc.py recv --me A --block             # block until a new message arrives (prints NONE (timeout) on timeout)
+python ipc.py recv --me A --block --count 3   # BARRIER: after fanning out to 3 workers, one call blocks until all 3 reply (timeout returns the k<3 received)
 python ipc.py peek --me A --tail 5            # view the last 5 without marking read
 python ipc.py archive --keep 50               # trim old read messages, keep the most recent 50
 ```
@@ -86,12 +87,21 @@ reply shouldn't be blocked even when A isn't watching).
    watcher will wait forever. Don't judge test/greeting messages as "no reply needed"
    and silently swallow them; reply once first, then decide what's next.
 4. **A (master/hub)**: converse normally; `recv --me A` when you need a worker's
-   reply. **To dispatch to several workers at once** use `--to B,C` or `--to ALL`;
-   but replies wake A **one at a time** (each reply makes one background `--block`
-   exit), so to "wait for B, C, D then synthesize" A must keep count: take one reply,
-   re-arm a background `--block`, until all expected parties have reported. Synthesis
-   (reconciliation, coverage check, final call) always stays with A, not delegated to
-   workers.
+   reply. **To dispatch to several workers at once** use `--to B,C` or `--to ALL`.
+   **To wait for all of them, use the barrier** `recv --me A --block --count N`
+   as a single background Bash: it parks until N replies have arrived and returns
+   them together, so the tally lives in that one process and survives A's context
+   compression — prefer this over manually re-arming `--block` N times and counting
+   replies by hand (that silently breaks when the count is lost on compaction). On
+   timeout the barrier returns the k<N replies received; A diffs the senders it got
+   against the workers it dispatched to, finds who is absent, probes them
+   (`status --watch X`, or a `--require-watcher` ping) and re-dispatches — but cap
+   re-dispatch (≤2 tries) and then `log` the slice as failed rather than looping.
+   Don't blind-re-dispatch on timeout alone: a worker may just be slow, and a second
+   copy of a non-idempotent task running in parallel is worse than waiting (current
+   read-only data pulls are idempotent, so the risk is low — but keep it in mind if
+   parallel work ever extends to writes). Synthesis (reconciliation, coverage check,
+   final call) always stays with A, never delegated to workers.
 5. Fold a bare acknowledgement ("got it") into the substantive reply where possible;
    don't send a message just to acknowledge — save tokens.
 6. **A waits for a worker reply automatically (lightweight watcher)**: after sending

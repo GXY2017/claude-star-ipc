@@ -103,6 +103,8 @@ python ipc.py send --from A --to ALL "task"
 
 # A waits for replies (run in the background; it exits on the first reply):
 python ipc.py recv --me A --block
+# A waits for ALL N replies after a fan-out (BARRIER: one call collects all N):
+python ipc.py recv --me A --block --count 3
 
 # A worker drains its inbox / parks its watcher:
 python ipc.py recv --me B
