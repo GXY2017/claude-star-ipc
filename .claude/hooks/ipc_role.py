@@ -100,6 +100,18 @@ NONE_CONTEXT = (
 )
 
 
+RECOVER_CONTEXT = (
+    "[IPC role: recovery needed] This terminal was cleared/resumed/compacted and its "
+    "previous IPC role could NOT be auto-matched (/clear changes the session_id, so the "
+    "registry can't map you back). The role slot is still held under your old session, so "
+    "the auto-assign deliberately did NOT grab you a new role (that's how a cleared B used "
+    "to wrong-turn into D). Recover explicitly: if you are a worker, run `/ipc-recover B` "
+    "(use your real letter), or manually `python ipc.py recv --me B` then start a persistent "
+    "Monitor `python ipc.py watch --me B`. If you are the hub, you are A — continue as hub "
+    "(or `/main`). Don't claim a different role."
+)
+
+
 def _context_for(role):
     if role == "A":
         return MASTER_CONTEXT
@@ -166,15 +178,25 @@ def _owned_role(reg, session_id):
     return None
 
 
+_CONTINUATION = ("clear", "resume", "compact")  # same terminal continuing, NOT a new one
+
+
 def claim():
     info = _read_stdin()
     sid = info.get("session_id") or "unknown"
+    source = info.get("source", "")
     locked = _lock()
     try:
         reg = _load()
-        role = _owned_role(reg, sid)          # reuse on clear/resume/compact
-        if role is None:
-            for r in ROLES:                    # else take the lowest free slot
+        role = _owned_role(reg, sid)          # reuse if this session already owns a role
+        # Only a genuinely NEW terminal (startup, or unknown source on old harnesses)
+        # may take a free slot. On clear/resume/compact the terminal is CONTINUING — and
+        # /clear changes the session_id, so `role` won't match; grabbing "the lowest free
+        # slot" here is exactly the bug that turned a cleared B into D. Skip claiming;
+        # the role slot stays held under the old session_id and the worker recovers
+        # explicitly via /ipc-recover (recv/watch route by --me <role>, not the registry).
+        if role is None and source not in _CONTINUATION:
+            for r in ROLES:                    # take the lowest free slot
                 if not reg.get(r):
                     role = r
                     reg[r] = {"session_id": sid,
@@ -184,7 +206,12 @@ def claim():
     finally:
         if locked:
             _unlock()
-    _inject(_context_for(role))
+    if role is not None:
+        _inject(_context_for(role))
+    elif source in _CONTINUATION:
+        _inject(RECOVER_CONTEXT)              # cleared/resumed but role unmatched: recover explicitly
+    else:
+        _inject(NONE_CONTEXT)                 # genuinely no free role for a new terminal
 
 
 def release():
