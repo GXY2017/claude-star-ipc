@@ -52,9 +52,16 @@ and does not enforce it (intentional: keeps test names and future topologies ope
 - **Mailbox** — every message is one row with a single recipient and a `handled`
   flag, so `recv` only ever returns *new* messages addressed to you. History never
   re-enters context; token cost stays flat as the log grows.
-- **Push wake** — a worker parks `recv --me B --block` as a *background* process.
-  When A sends, that process exits and the harness re-invokes the worker with the
-  task. No polling loop in the agent.
+- **Push wake** — a worker keeps a watcher alive so the harness re-invokes it when
+  a message lands. Two forms: **(recommended, Claude Code)** one persistent **Monitor**
+  running `ipc.py watch --me B` — each message fires a tiny `NEW MSG #id` *signal*
+  notification (never the body, so long messages aren't truncated; read the full text
+  with `peek`), the watcher lives the whole session, and idle costs ~zero turns;
+  **(fallback / any CLI)** park `recv --me B --block` as a *background* process that
+  exits on the first message (re-arm each wake; capped ~600s so long idle re-wakes
+  periodically). One watcher per inbox — never run both on the same inbox (they race
+  and double-deliver). *(The Monitor watcher is validated for surviving turns/compaction
+  and for no-truncation; hours-long idle stability is not yet stress-tested.)*
 - **Heartbeat liveness** — a parked `--block` watcher touches `_watcher_<me>.alive`
   every poll. `send --require-watcher` refuses to queue to a worker whose watcher
   isn't live (so tasks never vanish into a dead mailbox). A registered role does
@@ -71,10 +78,19 @@ and does not enforce it (intentional: keeps test names and future topologies ope
 
 | File | Role |
 |---|---|
-| `ipc.py` | the mailbox CLI (send/recv/peek/archive/status) — stdlib only |
-| `.claude/hooks/ipc_role.py` | `SessionStart`/`SessionEnd` hook: auto-assigns roles, injects behavior |
+| `ipc.py` | the mailbox CLI (send/recv/watch/peek/archive/status) — stdlib only. **Neutral core: any CLI that runs python+bash can use it.** |
+| `.claude/hooks/ipc_role.py` | `SessionStart`/`SessionEnd` hook: auto-assigns roles, injects behavior. *Claude Code integration layer.* |
+| `.claude/commands/main.md`, `ipc-recover.md` | optional slash commands: `/main` (A self-assert hub), `/ipc-recover` (rebuild role+watcher after `/clear`/compaction/hook-failure). *Claude Code only.* |
 | `CLAUDE.md` | the protocol the terminals follow (path-agnostic; Chinese) |
 | `install_ipc.py` | one-command installer into another project |
+
+> **Two layers.** The portable, model/CLI-neutral core is `ipc.py` + the `CLAUDE.md`
+> protocol — any harness that can run python+bash can drive it. Everything else
+> (the `SessionStart` hook, `/main` `/ipc-recover`, the Monitor watcher, the
+> background-bash push-wake) is **Claude Code harness integration**; it makes the kit
+> ergonomic under Claude Code (any model backend) but does **not** port to a different
+> CLI. "Cross-vendor" here means different *models* under the same Claude Code harness,
+> not different harnesses.
 
 ## Install
 
@@ -84,12 +100,12 @@ Into an existing Claude Code project:
 python install_ipc.py /path/to/your/project
 ```
 
-It copies `ipc.py` + the hook, merges the `SessionStart`/`SessionEnd` hooks into
-the target's `.claude/settings.local.json` (preserving everything already there),
-and appends the protocol to the target's `CLAUDE.md`. It is **idempotent** and
-**never copies runtime state** (`_ipc.db`, `_watcher_*.alive`, `ipc_roles.json` are
-created fresh per project). Manual install: copy those 4 files yourself and wire the
-two hooks (see `examples/settings.snippet.json`).
+It copies `ipc.py` + the hook + the `/main` `/ipc-recover` slash commands, merges the
+`SessionStart`/`SessionEnd` hooks into the target's `.claude/settings.local.json`
+(preserving everything already there), and appends the protocol to the target's
+`CLAUDE.md`. It is **idempotent** and **never copies runtime state** (`_ipc.db`,
+`_watcher_*.alive`, `ipc_roles.json` are created fresh per project). Manual install:
+copy those files yourself and wire the two hooks (see `examples/settings.snippet.json`).
 
 ## Usage
 
@@ -107,6 +123,10 @@ python ipc.py recv --me A --block
 python ipc.py recv --me A --block --count 3
 # recv --block exit code: 0 = returned message(s) (read them); 2 = empty timeout
 # (re-arm without re-reading — shown as status=failed, but a normal timeout, not an error)
+
+# Recommended watcher (Claude Code): run this under the Monitor tool, persistent=true —
+# emits a tiny "NEW MSG #id" signal per message (never the body); read full with peek:
+python ipc.py watch --me B
 
 # A worker drains its inbox / parks its watcher:
 python ipc.py recv --me B

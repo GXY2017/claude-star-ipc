@@ -8,9 +8,11 @@ Usage:
 What it does (idempotent — safe to re-run):
   1. copies ipc.py            -> <target>/ipc.py
   2. copies ipc_role.py       -> <target>/.claude/hooks/ipc_role.py
-  3. merges the SessionStart(claim)/SessionEnd(release) hooks into
+  3. copies the slash commands -> <target>/.claude/commands/{main,ipc-recover}.md
+     (Claude Code convenience layer; the hook works without them)
+  4. merges the SessionStart(claim)/SessionEnd(release) hooks into
      <target>/.claude/settings.local.json (preserving everything already there)
-  4. appends the IPC protocol section to <target>/CLAUDE.md (creates it if absent)
+  5. appends the IPC protocol section to <target>/CLAUDE.md (creates it if absent)
 
 What it deliberately does NOT copy (per-project runtime state — copying it would
 cross-wire two projects' mailboxes): _ipc.db (+ -wal/-shm), _watcher_*.alive,
@@ -130,6 +132,12 @@ def main():
     _copy(os.path.join(SRC, ".claude", "hooks", "ipc_role.py"),
           os.path.join(target, ".claude", "hooks", "ipc_role.py"))
     print("  + .claude/hooks/ipc_role.py")
+
+    for cmd in ("main.md", "ipc-recover.md"):  # Claude Code slash-command sugar (optional layer)
+        src_cmd = os.path.join(SRC, ".claude", "commands", cmd)
+        if os.path.exists(src_cmd):
+            _copy(src_cmd, os.path.join(target, ".claude", "commands", cmd))
+            print(f"  + .claude/commands/{cmd}")
 
     added = _merge_hooks(os.path.join(target, ".claude", "settings.local.json"))
     if added is False:

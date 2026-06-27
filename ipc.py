@@ -17,6 +17,10 @@ CLI:
     # recv --block exit code: 0 = returned message(s); 2 = empty timeout (lets a
     # backgrounded watcher skip re-reading output — shows as status=failed but is
     # a normal timeout, not an error). Non-block recv always exits 0.
+    python ipc.py watch --me B               # run under the Monitor tool (persistent): emit a tiny SIGNAL
+                                             # per new message (never the body — avoids notification
+                                             # truncation); read full content with `peek`. One long-lived
+                                             # watcher, ~zero idle turns, survives turns/user input (TRIAL)
     python ipc.py send --from A --to B "msg" --require-watcher  # refuse if B not listening
     python ipc.py status --watch B           # is B's --block watcher parked? ALIVE/DOWN
     python ipc.py peek --me B [--tail 5]     # show recent thread WITHOUT marking read
@@ -162,6 +166,27 @@ def expand_recipients(recipient, sender):
     return out
 
 
+def _select_unhandled(me):
+    """SELECT unhandled messages for `me` WITHOUT marking them read.
+    Used by watch() so a message is marked handled only AFTER it is delivered."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT id, ts, sender, body FROM messages "
+            "WHERE recipient=? AND handled=0 ORDER BY id",
+            (me,),
+        ).fetchall()
+
+
+def _mark_handled(ids):
+    """Mark the given message ids handled (call only after successful delivery)."""
+    if not ids:
+        return
+    with _conn() as conn:
+        conn.executemany(
+            "UPDATE messages SET handled=1 WHERE id=?", [(i,) for i in ids]
+        )
+
+
 def recv(me):
     """Return and mark-as-read every unhandled message addressed to `me`."""
     with _conn() as conn:
@@ -224,6 +249,58 @@ def recv_block(me, timeout, interval, count=1):
             pass
 
 
+def watch(me, interval):
+    """Poll forever, printing a tiny SIGNAL for each new message for `me`.
+    Designed to run under the Monitor tool with persistent=true: each printed
+    line becomes an event/notification, so ONE long-lived Monitor replaces
+    re-arming a `recv --block` bash watcher every ~580s. Wins over the bash
+    watcher (2026-06-27): ~zero idle agent turns (only fires on a
+    real message, no spurious timeout wakes), survives across turns AND user
+    input (Monitor is session-scoped; a backgrounded bash watcher gets killed by
+    a new turn), reachability intact (polls every `interval`s). Lifetime is owned
+    by the Monitor (TaskStop or session end); this loop never exits. Refreshes the
+    same heartbeat file as recv_block so `status --watch` still reports live.
+
+    SIGNAL-ONLY (2026-06-27, fixes the truncation problem): the printed line is
+    just `NEW MSG #id from SENDER (N chars) — read full: ipc.py peek ...`, never
+    the body. The harness notification layer truncates long event text, so putting
+    the body inline silently lost the tail of long messages; a tiny fixed-size
+    signal can never be truncated. On the notification, the agent reads the FULL
+    message with `peek --me <me>` (peek shows handled rows too). One short read per
+    message — same cost as the old bash watcher's Read — in exchange for guaranteed
+    no truncation.
+
+    Mark-AFTER-signal: select unhandled, print the signal, then mark that id
+    handled — a signal-print failure leaves it unhandled to retry, not lost (and
+    the signal is tiny, so it ~never fails). Per-message and per-poll try/except so
+    one bad message or a transient DB error can't kill the loop. `handled` here
+    means "signalled" (so a watch restart won't re-announce it); the body stays in
+    the DB for `peek`. If a burst arrives, several signals may batch into one
+    notification — fine, each carries its own `#id`; peek `--tail` enough to cover
+    them. Keep `interval` < `status --max-age` (default 8s) or the heartbeat ages
+    out and `status` reports DOWN while watch is running."""
+    while True:
+        _beat(me)
+        try:
+            for mid, ts, sender, body in _select_unhandled(me):
+                try:
+                    # SIGNAL ONLY (never the body): a tiny line that can never be
+                    # truncated by the harness notification layer. Read the full
+                    # message with `peek` (see below). This trades the inline-content
+                    # convenience for guaranteed no-truncation of long messages.
+                    print(
+                        f"NEW MSG #{mid} from {sender} ({len(body)} chars) "
+                        f"— read full: python ipc.py peek --me {me} --tail 3",
+                        flush=True,
+                    )
+                    _mark_handled([mid])  # mark only after the signal is delivered
+                except Exception as e:  # noqa: BLE001 — never lose a msg / kill the loop
+                    sys.stderr.write(f"[watch] signal failed for #{mid}: {e}\n")
+        except Exception as e:  # noqa: BLE001 — transient DB error: log, keep polling
+            sys.stderr.write(f"[watch] poll error: {e}\n")
+        time.sleep(interval)
+
+
 def peek(me, tail):
     """Show the last `tail` messages involving `me` without marking read."""
     with _conn() as conn:
@@ -280,6 +357,13 @@ def main():
                         "fan-out (--to B,C,D) so one blocking call collects all N "
                         "replies; the tally lives in the process, not across A's "
                         "context. On timeout returns however many arrived (k<N).")
+
+    w = sub.add_parser("watch")
+    w.add_argument("--me", required=True)
+    w.add_argument("--interval", type=float, default=3.0,
+                   help="seconds between polls (default 3). Keep it < status "
+                        "--max-age (default 8) or the heartbeat ages out and "
+                        "status reports DOWN while watch is running.")
 
     k = sub.add_parser("peek")
     k.add_argument("--me", required=True)
@@ -347,6 +431,9 @@ def main():
         else:
             for mid, ts, sender, body in rows:
                 print(f"#{mid} [{ts}] {sender}: {body}")
+    elif args.cmd == "watch":
+        _require_valid(args.me, "--me")
+        watch(args.me, args.interval)  # never returns; Monitor owns the lifetime
     elif args.cmd == "peek":
         _require_valid(args.me, "--me")
         rows = peek(args.me, args.tail)

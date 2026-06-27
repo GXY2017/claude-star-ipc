@@ -104,29 +104,42 @@ reply shouldn't be blocked even when A isn't watching).
    final call) always stays with A, never delegated to workers.
 5. Fold a bare acknowledgement ("got it") into the substantive reply where possible;
    don't send a message just to acknowledge — save tokens.
-6. **A waits for a worker reply automatically (lightweight watcher)**: after sending
-   a task, run `python ipc.py recv --me A --block` as a **background Bash**
-   (`run_in_background`); A immediately regains control to do other things, and when a
-   worker `send`s back, that command exits and the harness feeds the reply in and
-   wakes A — this is push, no polling by A. A watcher reports once: for multiple
-   round-trips (or to wait on several workers), resend/re-arm a background `--block`
-   each round (or use the `--count N` barrier to collect all N in one call). **Exit
-   code tells you what happened without re-reading the output**: `recv --block` exits
-   `0` when it returns message(s) — read them — and `2` on an empty timeout — just
-   re-arm, don't re-read. The harness shows exit 2 as `status=failed`/`NONE (timeout)`;
-   that is a normal park timeout (default 580s, under bash's 600s cap), **not an
-   error**. Skipping the output read on every idle timeout is the main token saving
-   for a long-parked hub or worker.
+6. **A waits for worker replies (watcher).** **[2026-06-27 — default
+   watcher is now a persistent Monitor]** Start ONE persistent Monitor (the Monitor
+   tool, `persistent=true`) running `python ipc.py watch --me A`: each reply fires a
+   tiny **SIGNAL** notification (`NEW MSG #id from …`, **never the body** — a fixed
+   short line can't be truncated, unlike inline content which the harness silently
+   clips on long messages); on the signal, read the **full** message with `python
+   ipc.py peek --me A --tail 3`. The watcher lives the whole session and idle costs
+   **~zero turns** — it only fires on a real message, no re-arming. This beats the old re-arm-bash watcher (which paid one full agent turn
+   per ~580s of idle, since a background bash is capped at ~600s and a new turn/user
+   input can kill it; the Monitor survives both — verified). To wait on several
+   workers, let replies stream in and track "how many of N have replied" in your
+   **harness task list** (TaskCreate/TaskList, survives compaction). **Fallback if
+   Monitor is unavailable:** `python ipc.py recv --me A --block` as a background Bash
+   — exits `0` = message (read it), `2` = empty timeout (re-arm without re-reading;
+   harness shows it as `status=failed`, a normal timeout not an error); or
+   `--block --count N` to barrier-collect N replies in one call. Only use
+   watch/recv/peek to receive; never Read the whole `_ipc.db`.
 
 **Auto-relay for workers:** roles and watcher instructions are injected by the
-SessionStart hook, so **a worker usually needn't type `/sub`**. Mechanism: the
+SessionStart hook, so **a worker usually needn't type any command to come online**
+(for explicit/manual recovery use `/ipc-recover`; see Recovery below). Mechanism: the
 `python .claude/hooks/ipc_role.py claim` wired in `.claude/settings.local.json`
 assigns a role the moment a terminal enters the project, by "first-come-first-served
 + a `session_id` registry (`.claude/ipc_roles.json`)" (the first in gets A, the rest
 take the lowest free slot B, C, D…; a lockfile guards races; `/clear` doesn't release
 the role, the same session reuses it), and injects that role's behavior (A = hub
-dispatch/synthesis; worker = immediately `recv --me <self>` to drain the backlog +
-park `recv --me <self> --block` as a background Bash watcher) as `additionalContext`.
+dispatch/synthesis; worker = `recv --me <self>` once to drain the backlog + start ONE
+persistent Monitor running `ipc.py watch --me <self>` as its watcher; bash
+`recv --block` is the fallback) as `additionalContext`.
+
+> **Hard rule while a Monitor `watch` is running on an inbox: do NOT also run
+> `recv --block` or a manual `recv` on that same inbox.** Both call the same receive
+> and would race the unhandled rows → the SAME message delivered twice (a task run
+> twice). The heartbeat file is liveness, not a lock — nothing in `ipc.py` enforces
+> single-consumer, so this is held by discipline: one watcher per inbox, receive only
+> through it.
 
 **The one manual floor:** the hook can only "inject instructions", it can't fire a
 worker's first tool call for it — Claude won't auto-run a background command before
@@ -139,8 +152,21 @@ not a config defect. (Before dispatching, A should remind the user to type one l
 in each worker window to bring it online.)
 
 After that it self-drives: a worker idles without spending tokens; when A dispatches,
-the watcher exits, the harness wakes the worker to execute and `send` the result
-back, then the worker re-arms a new watcher — no `/loop` needed. `/sub` is a
-**manual fallback only** (migration period when the hook isn't active, or to re-park
-a watcher manually after `/clear`; it drains the unread backlog first, then re-arms).
-For only-occasional exchanges, a manual `recv` is cheaper.
+the worker's Monitor signals it, it executes and `send`s the result back, and the same
+Monitor keeps listening — no `/loop`, no re-arm.
+
+**Recovery after `/clear` / compaction / hook failure.** `/clear` does NOT release the
+role (the registry keeps `session_id`→role; `release()` early-returns on `reason=="clear"`);
+it only kills the background **watcher process**. So recovery = re-establish the watcher,
+not re-claim the role — and `recv`/`watch` only need the `--me <role>` argument, not the
+registry. The SessionStart hook is designed to re-fire on `/clear` and re-inject the role
+context (so often, typing one line is enough — the injected instructions tell the worker to
+drain + start its Monitor). The explicit, deterministic path is the **`/ipc-recover`**
+command (takes the role as `$ARGUMENTS`, or reads it from the injected context): it drains
+the backlog (`recv --me <role>`) and starts the persistent Monitor `watch --me <role>`.
+Use `/ipc-recover B` when the hook didn't re-inject (you can always assert the role
+explicitly). A (hub) needs no standby watcher — it just continues per its hub role.
+(Replaces the old `/sub`; `/main` is kept as A's optional hub self-assertion / hook-failure
+fallback. A bash `recv --block` fallback watcher, if used instead of the Monitor, must be
+re-armed each wake: exit `0`=message, `2`=empty timeout/re-arm without reading, `killed`
+[e.g. by `/clear`]=`peek --tail 3` to check for a missed message then re-arm.)
