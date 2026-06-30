@@ -59,9 +59,13 @@ and does not enforce it (intentional: keeps test names and future topologies ope
   with `peek`), the watcher lives the whole session, and idle costs ~zero turns;
   **(fallback / any CLI)** park `recv --me B --block` as a *background* process that
   exits on the first message (re-arm each wake; capped ~600s so long idle re-wakes
-  periodically). One watcher per inbox — never run both on the same inbox (they race
-  and double-deliver). *(The Monitor watcher is validated for surviving turns/compaction
-  and for no-truncation; hours-long idle stability is not yet stress-tested.)*
+  periodically). One watcher per inbox is the convention, and it is now **code-backed**:
+  every claim is a single atomic `UPDATE … RETURNING`, so two consumers can never take the
+  same row (no double-delivery), and starting a fresh `watch --me B` makes any older/orphan
+  watcher of that role **self-retire** within one poll via a generation token — so a watcher
+  stranded in a dead/cleared session can't keep claiming (black-holing) the inbox. *(The
+  Monitor watcher is validated for surviving turns/compaction and for no-truncation;
+  hours-long idle stability is not yet stress-tested.)*
 - **Heartbeat liveness** — a parked `--block` watcher touches `_watcher_<me>.alive`
   every poll. `send --require-watcher` refuses to queue to a worker whose watcher
   isn't live (so tasks never vanish into a dead mailbox). A registered role does
@@ -73,6 +77,15 @@ and does not enforce it (intentional: keeps test names and future topologies ope
 - **Fan-out** — `--to B,C` dispatches to several workers; `--to ALL` broadcasts to
   every live worker. Each recipient gets its own row with its own `handled` flag,
   so a broadcast is never "consumed" by whoever reads first.
+- **Task lifecycle + weak rollback** — a dispatched message is a *task* carrying a
+  lease. If the worker's watcher dies (process gone) **or** a hard `--lease` ceiling
+  passes (alive-but-stuck — the Monitor keeps beating while a session is frozen, so the
+  ceiling is what catches "stuck"), a lazy reaper requeues the task (or marks it `failed`
+  after `--max-attempts`) — so work is never silently lost when a worker dies mid-flight,
+  with no daemon and no OS process killing. Verbs: `done` / `ack` (extend lease) / `fail`
+  / `cancel` / `reap`; `pending --detail` shows each task's derived state
+  (`QUEUED`/`IN_PROGRESS`/`STALE`/`FAILED`). Pure coordination is sent `--type note`,
+  which is exempt from the lease/reaper.
 
 ## Files
 
@@ -82,7 +95,9 @@ and does not enforce it (intentional: keeps test names and future topologies ope
 | `.claude/hooks/ipc_role.py` | `SessionStart`/`SessionEnd` hook: auto-assigns roles, injects behavior. *Claude Code integration layer.* |
 | `.claude/commands/main.md`, `ipc-recover.md` | optional slash commands: `/main` (A self-assert hub), `/ipc-recover` (rebuild role+watcher after `/clear`/compaction/hook-failure). *Claude Code only.* |
 | `CLAUDE.md` | the protocol the terminals follow (path-agnostic; Chinese) |
-| `install_ipc.py` | one-command installer into another project |
+| `install_user.py` | **recommended** installer — installs the machinery once at `~/.claude/ipc/`, registers the global `SessionStart`/`SessionEnd` hook, and gates it per project on a `.claude/ipc.enabled` file. One copy serves every opted-in project (each gets its own mailbox by launch cwd). |
+| `migrate_ipc.py` | migrate a legacy in-project mailbox to the user-level layout. |
+| `install_ipc.py` | **legacy** per-project installer (copies `ipc.py` + hook + commands into one project root). Superseded by `install_user.py`; kept for the per-project topology. |
 
 > **Two layers.** The portable, model/CLI-neutral core is `ipc.py` + the `CLAUDE.md`
 > protocol — any harness that can run python+bash can drive it. Everything else
@@ -94,18 +109,32 @@ and does not enforce it (intentional: keeps test names and future topologies ope
 
 ## Install
 
-Into an existing Claude Code project:
+**Recommended — user-level (one install serves every project):**
+
+```sh
+python install_user.py
+```
+
+Installs `ipc.py` + `ipc_role.py` once under `~/.claude/ipc/`, registers a global
+`SessionStart`/`SessionEnd` hook (merged into `~/.claude/settings.json`, preserving
+what's there), and ships the `/main` `/ipc-recover` slash commands. The machinery then
+sits idle until a project **opts in** with a gate file `.claude/ipc.enabled` — only then
+does the hook claim a role. Each opted-in project gets its **own** mailbox, resolved by
+the launch cwd (`~/.claude/projects/<key>/ipc/`), so two terminals share a mailbox iff
+they launch from the same project root. Have a legacy in-project mailbox? `python
+migrate_ipc.py` moves it to the user-level layout.
+
+**Legacy — per-project copy:**
 
 ```sh
 python install_ipc.py /path/to/your/project
 ```
 
-It copies `ipc.py` + the hook + the `/main` `/ipc-recover` slash commands, merges the
-`SessionStart`/`SessionEnd` hooks into the target's `.claude/settings.local.json`
-(preserving everything already there), and appends the protocol to the target's
-`CLAUDE.md`. It is **idempotent** and **never copies runtime state** (`_ipc.db`,
-`_watcher_*.alive`, `ipc_roles.json` are created fresh per project). Manual install:
-copy those files yourself and wire the two hooks (see `examples/settings.snippet.json`).
+Copies `ipc.py` + the hook + the slash commands into one project root and merges the
+hooks into its `.claude/settings.local.json`. Both installers are **idempotent** and
+**never copy runtime state** (`_ipc.db`, `_watcher_*.alive`, `ipc_roles.json` are created
+fresh). Manual install: copy the files yourself and wire the two hooks (see
+`examples/settings.snippet.json`).
 
 ## Usage
 
@@ -155,8 +184,12 @@ its watcher and run autonomously thereafter.
   replies means re-arming and counting. For a synchronized parallel join, use
   in-session subagents instead.
 - **Single machine.** It's a local SQLite file + heartbeat files; not networked.
-- **Conventions, not hard guards.** Star topology and "workers reply to A only" are
-  enforced by prompt discipline, not code.
+- **Mostly code-enforced now.** Star topology ("workers reply to A only") and
+  single-consumer delivery used to be prompt conventions; they are now enforced in code —
+  `send` rejects a non-hub→non-hub message (`StarViolation`), an echo ceiling (`hop > ttl`)
+  kills relay loops, and each claim is one atomic `UPDATE … RETURNING`. What stays a
+  convention is the higher-level orchestration discipline: only **A** decides whether to
+  continue, and synthesis stays with A.
 - Names (sender/recipient) must match `[A-Za-z0-9_]+` (they become heartbeat
   filenames).
 

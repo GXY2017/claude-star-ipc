@@ -36,57 +36,129 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 ROLE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # .claude/
-REGISTRY = os.path.join(ROLE_DIR, "ipc_roles.json")
+
+
+def _import_ipc():
+    """Import the ipc.py that owns this project's state, so the registry/heartbeat
+    paths and the project root all match what ipc.py computes — whether this hook
+    is the project-local copy (ipc.py in the project root) or the user-level copy
+    (ipc.py beside it in ~/.claude/ipc). Bulletproof: returns None on any failure,
+    and the caller falls back to legacy project-local paths so a hook never crashes."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    # global copy: ipc.py beside us; local copy: ipc.py in the project root, which
+    # is the parent of ROLE_DIR (.claude/) i.e. two levels up from this hook file.
+    project_root = os.path.dirname(os.path.dirname(here))
+    for cand in (here, project_root):
+        if os.path.exists(os.path.join(cand, "ipc.py")):
+            try:
+                if cand not in sys.path:
+                    sys.path.insert(0, cand)
+                import ipc  # noqa: F401
+                return ipc
+            except Exception:
+                return None
+    return None
+
+
+_IPC = _import_ipc()
+# Registry + project root come from ipc.py when available (single source of truth),
+# else legacy project-local defaults (unchanged behaviour).
+REGISTRY = _IPC._REGISTRY if _IPC else os.path.join(ROLE_DIR, "ipc_roles.json")
+PROJECT_ROOT = _IPC.PROJECT_ROOT if _IPC else os.path.dirname(ROLE_DIR)
+# Command the injected contexts tell agents to run. When ipc.py is NOT in cwd
+# (user-level install in ~/.claude/ipc), a bare `python ipc.py` fails, so inject
+# the absolute path. Legacy: still absolute (harmless, more robust).
+_IPC_CMD = f'python "{_IPC.__file__}"' if _IPC else "python ipc.py"
 LOCK = REGISTRY + ".lock"
-ROLES = ("A", "B", "C", "D")  # A = hub/master; B,C,D... = workers (extend freely)
+# Role universe + hub identity come from ipc.py — the SINGLE source of truth, so
+# this module and ipc.py can never disagree about which roles exist or which one
+# is the master/hub (the IPC_HUB-vs-hardcoded-A split-brain). Legacy fallback
+# only when ipc.py couldn't be imported.
+ROLES = _IPC.ROLES if _IPC else ("A", "B", "C", "D")  # hub + worker slots
+HUB = _IPC.HUB if _IPC else os.environ.get("IPC_HUB", "A")  # the master/hub role
+
+
+def _opted_in():
+    """Does the CURRENT project opt into IPC? Gates the user-level GLOBAL hook so
+    it stays inert in projects that don't use IPC (and never silently grabs a role
+    in a random project the user opened). Opt-in signals, any one suffices:
+      - IPC_ROLE env set (explicit launch intent)
+      - a `.claude/ipc.enabled` marker file in the project root
+      - a project-local install exists (.claude/hooks/ipc_role.py) — legacy opt-in
+      - a mailbox already exists for this project (ipc.py's DB_PATH)"""
+    if os.environ.get("IPC_ROLE"):
+        return True
+    if os.path.exists(os.path.join(PROJECT_ROOT, ".claude", "ipc.enabled")):
+        return True
+    if os.path.exists(os.path.join(PROJECT_ROOT, ".claude", "hooks", "ipc_role.py")):
+        return True
+    if _IPC and os.path.exists(_IPC.DB_PATH):
+        return True
+    return False
+
+
+def _is_redundant_global():
+    """True if I'm the user-level copy while a project-LOCAL hook also exists: defer
+    to the local one so the role isn't double-claimed during the transition window."""
+    local = os.path.join(PROJECT_ROOT, ".claude", "hooks", "ipc_role.py")
+    return (os.path.exists(local)
+            and os.path.normcase(os.path.abspath(__file__)) != os.path.normcase(os.path.abspath(local)))
 
 # Behavior injected into each session so no manual /main or /sub is needed.
-MASTER_CONTEXT = (
-    "[IPC role: you are master terminal A (master / star hub)] This project uses "
-    "ipc.py(_ipc.db) to collaborate with worker terminals B, C, D… (star topology: "
-    "you are the sole hub; workers don't talk to each other). See CLAUDE.md for the "
-    "protocol. You are the initiator/decider. Dispatch to one worker: "
-    "`python ipc.py send --from A --to B \"<task>\"`; to several at once: `--to B,C`; "
-    "broadcast to all live workers: `--to ALL`. To listen for "
-    "replies, start ONE persistent Monitor (the Monitor tool, persistent=true) running "
-    "`python ipc.py watch --me A`: each reply fires a tiny SIGNAL notification "
-    "(`NEW MSG #id from ...`, never the body — avoids notification truncation of long "
-    "messages); on the signal, read the FULL message with `python ipc.py peek --me A "
-    "--tail 3`. The watcher lives the whole session and idle costs ~zero turns (only "
-    "fires on a real message — no re-arming). Track multi-worker fan-out "
-    "completion (how many of N replied) in your harness task list (TaskCreate/TaskList), "
-    "which survives context compaction. FALLBACK if Monitor is unavailable: "
-    "`python ipc.py recv --me A --block` as a background Bash (exits 0 = message, read it; "
-    "2 = empty timeout, re-arm without reading), or `--block --count N` to barrier-collect "
-    "N replies in one call. Only use watch/recv/peek to receive; never Read the whole "
-    "_ipc.db. This role is auto-assigned; no need to type /main."
-)
+# Parameterized by the hub role so it tracks IPC_HUB (no hardcoded "A").
+def _master_context(hub):
+    return (
+        f"[IPC role: you are master terminal {hub} (master / star hub)] This project uses "
+        f"ipc.py(_ipc.db) to collaborate with worker terminals (star topology: "
+        f"you are the sole hub; workers don't talk to each other). See CLAUDE.md for the "
+        f"protocol. You are the initiator/decider. Dispatch to one worker: "
+        f"`python ipc.py send --from {hub} --to <worker> \"<task>\"`; to several at once: `--to B,C`; "
+        f"broadcast to all live workers: `--to ALL`. [LOCAL TRIAL 2026-06-27] To listen for "
+        f"replies, start ONE persistent Monitor (the Monitor tool, persistent=true) running "
+        f"`python ipc.py watch --me {hub}`: each reply fires a tiny SIGNAL notification "
+        f"(`NEW MSG #id from ...`, never the body — avoids notification truncation of long "
+        f"messages); on the signal, read the FULL message with `python ipc.py peek --me {hub} "
+        f"--tail 3`. The watcher lives the whole session and idle costs ~zero turns (only "
+        f"fires on a real message — no re-arming). Track multi-worker fan-out "
+        f"completion (how many of N replied) in your harness task list (TaskCreate/TaskList), "
+        f"which survives context compaction. FALLBACK if Monitor is unavailable: "
+        f"`python ipc.py recv --me {hub} --block` as a background Bash (exits 0 = message, read it; "
+        f"2 = empty timeout, re-arm without reading), or `--block --count N` to barrier-collect "
+        f"N replies in one call. Only use watch/recv/peek to receive; never Read the whole "
+        f"_ipc.db. This role is auto-assigned; no need to type /main."
+    )
 
 
-def _worker_context(role):
+def _worker_context(role, hub):
     return (
         f"[IPC role: you are worker terminal {role} (subordinate / worker)] This project "
-        f"uses ipc.py(_ipc.db) to collaborate with master terminal A (star topology: you "
-        f"talk only to A, never to other workers). See CLAUDE.md for the protocol. Enter "
+        f"uses ipc.py(_ipc.db) to collaborate with master terminal {hub} (star topology: you "
+        f"talk only to {hub}, never to other workers). See CLAUDE.md for the protocol. Enter "
         f"standby immediately: (1) first run `python ipc.py recv --me {role}` to drain any "
         f"backlog; if there is a task, do it and send the result back with "
-        f"`python ipc.py send --from {role} --to A \"<result summary>\"`; (2) "
-        f"start ONE persistent Monitor (the Monitor tool, persistent=true) "
+        f"`python ipc.py send --from {role} --to {hub} \"<result summary>\"`; (2) [LOCAL TRIAL "
+        f"2026-06-27] start ONE persistent Monitor (the Monitor tool, persistent=true) "
         f"running `python ipc.py watch --me {role}` as your standby watcher, then end this "
-        f"turn. Each task fires a tiny SIGNAL notification (`NEW MSG #id from ...`, never "
+        f"turn. IF Monitor is NOT in your tool list (and you have no ToolSearch to load it — "
+        f"common on non-Anthropic bridges, e.g. deepseek, which get a flattened toolset "
+        f"without the deferred-tool machinery): do NOT hunt for Monitor — go straight to the "
+        f"bash recv --block FALLBACK below; it is a first-class watcher, not a stopgap. "
+        f"Each task fires a tiny SIGNAL notification (`NEW MSG #id from ...`, never "
         f"the body — avoids truncation); on the signal, read the FULL task with `python "
-        f"ipc.py peek --me {role} --tail 3`, execute, `send` the result back to A; the same "
+        f"ipc.py peek --me {role} --tail 3`, execute, `send` the result back to {hub}; the same "
         f"Monitor keeps listening (no re-arm). It lives "
-        f"the whole session, idle costs ~zero turns. ONE watcher per inbox: while the "
-        f"Monitor runs, NEVER also `recv`/`recv --block` this inbox — they race and the same "
-        f"message double-delivers (task run twice). FALLBACK if Monitor is unavailable: "
+        f"the whole session, idle costs ~zero turns. Prefer ONE watcher per inbox for "
+        f"clarity, but it is no longer load-bearing: recv/watch claim each row with one "
+        f"atomic UPDATE...RETURNING under SQLite's write lock, so double-delivery is "
+        f"structurally impossible — a stray recv alongside the Monitor is merely wasteful, "
+        f"not corrupting. FALLBACK if Monitor is unavailable: "
         f"park `python ipc.py recv --me {role} --block` as a background Bash and re-arm each "
         f"wake (exit 0 = task/read it; exit 2 = timeout/re-arm without reading; killed = "
         f"peek --tail 3 for a missed message, then re-arm). HARD RULE: send exactly one "
-        f"reply to A for EVERY message you receive — "
+        f"reply to {hub} for EVERY message you receive — "
         f"even a test, a greeting, or 'received, no action needed'; never consume (mark "
-        f"read) a message without replying, or A's watcher waits forever. Stop when "
-        f"done; no chit-chat, don't decide on A's behalf. Only use watch/recv/peek; never "
+        f"read) a message without replying, or {hub}'s watcher waits forever. Stop when "
+        f"done; no chit-chat, don't decide on {hub}'s behalf. Only use watch/recv/peek; never "
         f"Read the whole _ipc.db. This role is auto-assigned; no need to type /sub."
     )
 
@@ -113,10 +185,10 @@ RECOVER_CONTEXT = (
 
 
 def _context_for(role):
-    if role == "A":
-        return MASTER_CONTEXT
+    if role == HUB:
+        return _master_context(HUB)
     if role:
-        return _worker_context(role)
+        return _worker_context(role, HUB)
     return NONE_CONTEXT
 
 
@@ -128,10 +200,20 @@ def _read_stdin():
         return {}
 
 
+def _ensure_registry_dir():
+    """Create the registry's dir on first use (user-level per-cwd dir may not exist
+    yet). Only ever called on a participating project, so non-IPC projects stay clean."""
+    try:
+        os.makedirs(os.path.dirname(REGISTRY), exist_ok=True)
+    except OSError:
+        pass
+
+
 def _lock():
     """Crude cross-platform lock: exclusive-create a lockfile, retry briefly.
     Breaks a stale lock (>30s old) left behind by a process killed mid-claim,
     so a leftover LOCK file can't wedge every future claim into the unlocked path."""
+    _ensure_registry_dir()
     for _ in range(50):
         try:
             fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -180,29 +262,107 @@ def _owned_role(reg, session_id):
 
 _CONTINUATION = ("clear", "resume", "compact")  # same terminal continuing, NOT a new one
 
+# Liveness reconciliation: the registry says who OWNS a slot, the heartbeat says
+# who is actually LISTENING. They drift (a claim survives /clear and hard-kills;
+# a watcher can be a ghost). These thresholds let claim() treat a registry entry
+# whose watcher is gone as reclaimable, so a dead claim (e.g. a 2-day-old A) no
+# longer permanently blocks the slot.
+WATCHER_MAX_AGE = 60     # a heartbeat older than this => the watcher is gone
+CLAIM_GRACE = 120        # a claim with NO heartbeat yet is dormant only after this
+                         # (gives a just-started owner time to park its watcher)
+
+
+def _now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _heartbeat_path(role):
+    """Heartbeat file for `role`, resolved by ipc.py (so it matches whether state
+    is project-local or in the user-level per-cwd dir); legacy fallback otherwise."""
+    if _IPC:
+        return _IPC._heartbeat_path(role)
+    return os.path.join(PROJECT_ROOT, f"_watcher_{role}.alive")
+
+
+def _watcher_age(role):
+    """Seconds since `role`'s watcher last beat, or None if there is no heartbeat."""
+    try:
+        return time.time() - os.path.getmtime(_heartbeat_path(role))
+    except OSError:
+        return None
+
+
+def _claim_age(claim):
+    try:
+        return time.time() - time.mktime(time.strptime(claim["ts"], "%Y-%m-%d %H:%M:%S"))
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def _is_dormant(reg, role, sid):
+    """True if `role` is claimed by someone OTHER than `sid` whose watcher is dead.
+    Heartbeat is the liveness truth: a fresh heartbeat => live (not dormant); a
+    stale heartbeat => dormant; no heartbeat => dormant only once the claim is old
+    enough that the owner should have parked a watcher (avoids evicting a peer that
+    just started and hasn't beaten yet)."""
+    claim = reg.get(role)
+    if not claim or claim.get("session_id") == sid:
+        return False
+    age = _watcher_age(role)
+    if age is not None:
+        return age > WATCHER_MAX_AGE
+    ca = _claim_age(claim)
+    return ca is None or ca > CLAIM_GRACE
+
+
+def _take_auto(reg, sid):
+    """Lowest truly-free slot; if none, reclaim the lowest DORMANT slot so a
+    terminal is never permanently locked out by dead claims. Does NOT auto-evict
+    a live peer (use `take` for deliberate reassignment)."""
+    for r in ROLES:
+        if not reg.get(r):
+            reg[r] = {"session_id": sid, "ts": _now()}
+            _save(reg)
+            return r
+    for r in ROLES:
+        if _is_dormant(reg, r, sid):
+            reg[r] = {"session_id": sid, "ts": _now()}
+            _save(reg)
+            return r
+    return None
+
 
 def claim():
     info = _read_stdin()
     sid = info.get("session_id") or "unknown"
     source = info.get("source", "")
+    # Gate: stay completely inert in projects that don't use IPC (lets the
+    # user-level GLOBAL hook be registered once without claiming a role in every
+    # project the user opens), and defer to a project-local hook if one also runs.
+    if not _opted_in() or _is_redundant_global():
+        return                                # inject nothing; not participating
+    want = os.environ.get("IPC_ROLE")         # explicit launch-time intent, if any
     locked = _lock()
     try:
         reg = _load()
         role = _owned_role(reg, sid)          # reuse if this session already owns a role
-        # Only a genuinely NEW terminal (startup, or unknown source on old harnesses)
-        # may take a free slot. On clear/resume/compact the terminal is CONTINUING — and
-        # /clear changes the session_id, so `role` won't match; grabbing "the lowest free
-        # slot" here is exactly the bug that turned a cleared B into D. Skip claiming;
-        # the role slot stays held under the old session_id and the worker recovers
-        # explicitly via /ipc-recover (recv/watch route by --me <role>, not the registry).
-        if role is None and source not in _CONTINUATION:
-            for r in ROLES:                    # take the lowest free slot
-                if not reg.get(r):
-                    role = r
-                    reg[r] = {"session_id": sid,
-                              "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-                    _save(reg)
-                    break
+        if role is None and want in ROLES:
+            # Explicit intent overrides launch-order roulette: this window claims
+            # exactly `want` (evicting a stale/foreign holder). The user is telling
+            # us which window is the hub; identity-stamped heartbeats + `status`
+            # surface any remaining live conflict to resolve.
+            for r in ROLES:                   # don't hold two slots
+                if reg.get(r) and reg[r].get("session_id") == sid:
+                    reg[r] = None
+            reg[want] = {"session_id": sid, "ts": _now()}
+            _save(reg)
+            role = want
+        elif role is None and source not in _CONTINUATION:
+            # Genuinely NEW terminal: lowest free slot, else reclaim a dormant one.
+            # On clear/resume/compact the terminal is CONTINUING and /clear changes
+            # the session_id, so we deliberately do NOT grab a fresh slot here (that
+            # was the bug that turned a cleared B into D); recover via /ipc-recover.
+            role = _take_auto(reg, sid)
     finally:
         if locked:
             _unlock()
@@ -220,6 +380,8 @@ def release():
     reason = info.get("reason", "")
     if reason == "clear":
         return                                 # /clear continues the session; keep role
+    if _is_redundant_global():
+        return                                 # the project-local hook owns release here
     locked = _lock()
     try:
         reg = _load()
@@ -242,13 +404,90 @@ def reset():
     print(f"OK reset {REGISTRY}")
 
 
+def take(role, sid):
+    """Deliberately (re)assign `role` to session `sid`, evicting any prior holder
+    and freeing whatever slot `sid` currently holds. This is the registry-level
+    counterpart to /main and /sub: a slash command can call it so asserting a role
+    actually updates ownership instead of only changing behaviour (the split-brain
+    that caused this round's two-A mess). `sid` should be the real session_id when
+    available (--session / CLAUDE_SESSION_ID); a 'manual' fallback still occupies
+    the slot correctly, it just won't auto-reconnect across /clear."""
+    if role not in ROLES:
+        print(f"unknown role: {role!r} (valid: {','.join(ROLES)})", file=sys.stderr)
+        sys.exit(1)
+    locked = _lock()
+    try:
+        reg = _load()
+        for r in ROLES:                       # release any slot this session holds
+            if reg.get(r) and reg[r].get("session_id") == sid:
+                reg[r] = None
+        prev = reg.get(role)
+        reg[role] = {"session_id": sid, "ts": _now()}
+        _save(reg)
+    finally:
+        if locked:
+            _unlock()
+    evicted = f" (evicted {prev['session_id'][:8]})" if prev else ""
+    print(f"OK {sid[:8]} now holds {role}{evicted}")
+
+
+def reclaim_dead():
+    """Free every slot whose watcher heartbeat is gone (dormant), so dead claims
+    stop blocking slots. Safer than `reset`: live roles are kept."""
+    locked = _lock()
+    freed = []
+    try:
+        reg = _load()
+        for r in ROLES:
+            if _is_dormant(reg, r, None):     # None never matches a real session_id
+                freed.append(r)
+                reg[r] = None
+        _save(reg)
+    finally:
+        if locked:
+            _unlock()
+    print("reclaimed dormant: " + (",".join(freed) if freed else "(none)"))
+
+
+def status_view():
+    """Reconciled view: registry ownership X heartbeat liveness, the one place
+    that shows both truths together so a ghost (heartbeat with no/old claim) or a
+    dormant claim (claim with no heartbeat) is obvious at a glance."""
+    reg = _load()
+    print(f"{'role':4} {'owner':10} {'claim-age':>9} {'watcher':>8}  state")
+    for r in ROLES:
+        claim = reg.get(r)
+        owner = (claim.get('session_id', '')[:8] if claim else '-')
+        ca = _claim_age(claim) if claim else None
+        wa = _watcher_age(r)
+        ca_s = f"{ca:.0f}s" if ca is not None else "?"
+        wa_s = f"{wa:.0f}s" if wa is not None else "none"
+        if not claim:
+            state = "FREE" if wa is None or wa > WATCHER_MAX_AGE else "SQUATTER (watcher, no claim)"
+        elif wa is not None and wa <= WATCHER_MAX_AGE:
+            state = "live"
+        else:
+            state = "DORMANT (reclaimable)"
+        print(f"{r:4} {owner:10} {ca_s:>9} {wa_s:>8}  {state}")
+
+
 def _inject(text):
+    text = text.replace("python ipc.py", _IPC_CMD)  # absolute path for user-level
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": text,
         }
     }, ensure_ascii=False))
+
+
+def _arg(flag):
+    """Return the value following `flag` in argv, or None."""
+    if flag in sys.argv:
+        i = sys.argv.index(flag)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return None
 
 
 def main():
@@ -259,6 +498,14 @@ def main():
         release()
     elif cmd == "reset":
         reset()
+    elif cmd == "take":
+        role = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("-") else ""
+        sid = _arg("--session") or os.environ.get("CLAUDE_SESSION_ID") or "manual"
+        take(role, sid)
+    elif cmd in ("reclaim-dead", "reclaim_dead"):
+        reclaim_dead()
+    elif cmd == "status":
+        status_view()
     else:
         print(f"unknown command: {cmd}", file=sys.stderr)
         sys.exit(1)
