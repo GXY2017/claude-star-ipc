@@ -43,9 +43,11 @@ A (hub) + ── C (worker)
 - **B/C/D** = workers: respond to A and stop. They talk **only to A, never to each
   other** — keeping the anti-echo invariant linear instead of N².
 
-The star rule is a **convention** carried by the role prompts injected at
-`SessionStart` + the `CLAUDE.md` protocol. `ipc.py` itself is a neutral mailbox
-and does not enforce it (intentional: keeps test names and future topologies open).
+The star rule is **code-enforced**: `send` rejects any non-hub→non-hub message
+(`StarViolation`, exit 3) and an echo ceiling (`hop > ttl`) kills relay loops — a
+worker driven by any vendor's model literally cannot message a peer. The hub is
+configurable via `IPC_HUB` (default `A`). Delivery to arbitrary *names* stays open
+(role assignment, not delivery, is what `ROLES` governs).
 
 ## How it works
 
@@ -78,14 +80,27 @@ and does not enforce it (intentional: keeps test names and future topologies ope
   every live worker. Each recipient gets its own row with its own `handled` flag,
   so a broadcast is never "consumed" by whoever reads first.
 - **Task lifecycle + weak rollback** — a dispatched message is a *task* carrying a
-  lease. If the worker's watcher dies (process gone) **or** a hard `--lease` ceiling
-  passes (alive-but-stuck — the Monitor keeps beating while a session is frozen, so the
+  lease, **counted from claim time** (reset when the worker claims the row, so queue
+  wait doesn't eat the runway and a requeued task retries under a fresh ceiling). If
+  the worker's watcher dies (process gone) **or** the hard `--lease` ceiling passes
+  (alive-but-stuck — the Monitor keeps beating while a session is frozen, so the
   ceiling is what catches "stuck"), a lazy reaper requeues the task (or marks it `failed`
   after `--max-attempts`) — so work is never silently lost when a worker dies mid-flight,
-  with no daemon and no OS process killing. Verbs: `done` / `ack` (extend lease) / `fail`
+  with no daemon and no OS process killing. Rows that already have a reply are
+  **done-dropped at claim** (claimed silently, never redelivered), so a phantom requeue
+  can't make a worker redo finished work. Verbs: `done` / `ack` (extend lease **and**
+  beat the heartbeat — the keep-alive for a watcher-less worker mid-task) / `fail`
   / `cancel` / `reap`; `pending --detail` shows each task's derived state
   (`QUEUED`/`IN_PROGRESS`/`STALE`/`FAILED`). Pure coordination is sent `--type note`,
-  which is exempt from the lease/reaper.
+  which is exempt from the lease/reaper. Discipline: **workers start the watcher
+  BEFORE doing any work** (backlog arrives as signals) — the reaper AND-joins
+  heartbeat with the ceiling, so heartbeat-less work reads as stale.
+- **Self-trimming mailbox** — past 300 rows, handled/terminal history is lazily
+  archived inside `recv`/`watch`/`pending` (newest 150 kept); `archive --keep N`
+  remains for manual trims.
+- **Shell-safe bodies** — `send --body-file <path>` reads the body in Python, never
+  the shell: required for bodies containing backticks/`$()`/quotes, which a
+  shell-argument body would mangle or even *execute*.
 
 ## Files
 
@@ -146,6 +161,10 @@ python ipc.py send --from A --to B "your task" --require-watcher
 python ipc.py send --from A --to B,C "task"
 python ipc.py send --from A --to ALL "task"
 
+# Body from a file — REQUIRED when the body contains backticks/$()/quotes
+# (a shell-argument body gets mangled or even executed by the shell):
+python ipc.py send --from A --to B --body-file task.md
+
 # A waits for replies (run in the background; it exits on the first reply):
 python ipc.py recv --me A --block
 # A waits for ALL N replies after a fan-out (BARRIER: one call collects all N):
@@ -157,20 +176,22 @@ python ipc.py recv --me A --block --count 3
 # emits a tiny "NEW MSG #id" signal per message (never the body); read full with peek:
 python ipc.py watch --me B
 
-# A worker drains its inbox / parks its watcher:
-python ipc.py recv --me B
-python ipc.py recv --me B --block
+# A worker parks its watcher FIRST (backlog arrives as signals; read via peek) —
+# working without a beating watcher reads as stale to the lease reaper:
+python ipc.py watch --me B        # under Monitor (persistent), or:
+python ipc.py recv --me B --block # bash fallback; mid-task run `ack --me B` to stay alive
 
 # Probe a worker's watcher: ALIVE (exit 0) / DOWN (exit 1)
 python ipc.py status --watch B
 
 # Look without consuming; trim old read rows:
 python ipc.py peek --me A --tail 5
-python ipc.py archive --keep 50
+python ipc.py archive --keep 50   # manual trim; auto-trims lazily past 300 rows anyway
 ```
 
-**Requirements**: all terminals must launch with `cwd` = the project root (where
-`ipc.py` lives) — that's how they share the same `_ipc.db`.
+**Requirements**: all terminals must launch with `cwd` = the same project root —
+that's how they resolve the same mailbox (user-level install: per-cwd under
+`~/.claude/projects/<key>/ipc/`; legacy local install: `_ipc.db` beside `ipc.py`).
 
 **The one manual step**: a hook can inject instructions but can't make a worker
 fire its first background command before the worker receives its first user input.

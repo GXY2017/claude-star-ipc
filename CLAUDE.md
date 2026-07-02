@@ -35,8 +35,8 @@ the user-level `ipc.py` (stdlib sqlite3), against this project's own mailbox DB
 terminals. **Workers talk only to A, never to each other** — collaboration is
 relayed through A. This keeps the anti-echo invariant (only A decides whether to
 continue) linear rather than an N² mesh (a mesh echoes and deadlocks). The number of
-workers is set by `ROLES` in `~/.claude/ipc/ipc_role.py` (currently A,B,C,D; to add
-workers, extend that tuple).
+workers is set by `_BASE_ROLES` in `~/.claude/ipc/ipc.py` — the single source of truth,
+which `ipc_role.py` imports (currently A,B,C,D; to add workers, extend that tuple).
 
 > ✅ **The star is now CODE-ENFORCED (2026-06-28).** `send()` rejects any
 > non-hub→non-hub message with `StarViolation` (`send --from B --to C` → `REJECTED`,
@@ -69,20 +69,23 @@ after the one-time `python install_user.py`.)
 python ipc.py send --from A --to B "msg"      # send to one worker
 python ipc.py send --from A --to B,C "task"   # fan out to several workers (one row each, independent read-flags)
 python ipc.py send --from A --to ALL "task"   # broadcast to every live worker (claimed roles except A)
+python ipc.py send --from A --to B --body-file task.md   # body from file — REQUIRED for bodies with backticks/$()/quotes (the shell would mangle/execute them)
 python ipc.py send --from A --to B "task" --require-watcher  # refuse (exit 3) & don't queue if the recipient's watcher isn't parked (with several recipients: judged per-recipient — live ones queued, dead ones refused, exit 3 if any refused)
 python ipc.py status --watch B                # is B's watcher parked? ALIVE(exit 0)/DOWN(exit 1)
 python ipc.py recv --me B                     # take NEW unread messages addressed to me, mark them read
 python ipc.py recv --me A --block             # block until a new message arrives (prints NONE (timeout) on timeout)
 python ipc.py recv --me A --block --count 3   # BARRIER: after fanning out to 3 workers, one call blocks until all 3 reply (timeout returns the k<3 received)
 python ipc.py peek --me A --tail 5            # view the last 5 without marking read
-python ipc.py archive --keep 50               # trim old read messages, keep the most recent 50
+python ipc.py archive --keep 50               # trim old read messages, keep the most recent 50 (also auto-trims lazily once the table exceeds 300 rows, inside recv/watch/pending)
 python ipc.py pending --hub A                 # tasks A dispatched with NO reply yet (empty=fan-out complete); replaces counting replies by hand
 python ipc.py status --watch B                # now also prints pid/session of B's watcher (ghost-detectable)
 ```
 
-**Task lifecycle + weak rollback (2026-06-30):**
+**Task lifecycle + weak rollback (2026-06-30; lease semantics updated 2026-07-02):**
 a hub→worker message defaults to `msg_type='task'` carrying a **lease** (`--lease`
-seconds, default 1800; `--lease 0` = pure heartbeat). A claimed task that goes stale —
+seconds, default 1800, **counted from CLAIM time** — the lease is reset when the worker
+claims the row, so queue wait doesn't eat the runway and a requeued task retries under
+a fresh ceiling; `--lease 0` = pure heartbeat). A claimed task that goes stale —
 the worker's watcher heartbeat dies (process gone) **or** the hard lease ceiling falls
 (alive-but-stuck) — is lazily **requeued** by a reaper (runs inside recv/watch/pending)
 and re-delivered, or marked `failed` after `--max-attempts` (default 3). Verbs:
@@ -102,9 +105,16 @@ Two disciplines this lifecycle REQUIRES (a plain prose reply is no longer enough
 - **B/C/D — close the task.** When a dispatched task is done, run
   `done --me <self> --task N` (a plain reply also marks done, but replies auto-link to
   the *oldest* unanswered task, so `done` is safer when several are open). During a long
-  task call `ack --me <self>` periodically or the 1800s ceiling reaps it as "stuck". For
+  task call `ack --me <self>` periodically or the 1800s ceiling reaps it as "stuck" —
+  `ack` also refreshes the heartbeat, so it keeps a watcher-less worker (bash-fallback
+  mid-task) alive to the reaper too. For
   a non-idempotent task A should dispatch with `--max-attempts 1` so a stuck one fails
   instead of silently re-running.
+- **Workers start the watcher BEFORE doing any work.** The reaper AND-joins heartbeat
+  with the lease ceiling, so work executed without a beating watcher reads as stale and
+  gets requeued mid-flight. (Requeued-but-already-answered rows are done-dropped at claim
+  — claimed silently, never redelivered — so the failure mode is bounded, but
+  watcher-first is still the discipline.)
 
 **Role registry management (`~/.claude/ipc/ipc_role.py`, 2026-06-28):** role
 assignment is no longer pure launch-order roulette.
@@ -190,9 +200,12 @@ assigns a role the moment a terminal enters an opted-in project, by
 `~/.claude/projects/<encoded-cwd>/ipc/`)" (the first in gets A, the rest
 take the lowest free slot B, C, D…; a lockfile guards races; `/clear` doesn't release
 the role, the same session reuses it), and injects that role's behavior (A = hub
-dispatch/synthesis; worker = `recv --me <self>` once to drain the backlog + start ONE
-persistent Monitor running `ipc.py watch --me <self>` as its watcher — **[LOCAL TRIAL
-2026-06-27]**; bash `recv --block` is the fallback) as `additionalContext`.
+dispatch/synthesis; worker = start ONE persistent Monitor running `ipc.py watch --me
+<self>` **FIRST** — any queued backlog arrives as signals within seconds, no separate
+drain step, and watcher-first keeps the lease reaper off work that would otherwise run
+heartbeat-less; bash `recv --block` is the fallback, on which a mid-task worker should
+`ack --me <self>` every few minutes since ack also beats the heartbeat) as
+`additionalContext`.
 
 > **Single-consumer is now CODE-ENFORCED (2026-06-28).** `recv`/`watch` claim each
 > row with one atomic `UPDATE ... RETURNING` under SQLite's write lock, so two
@@ -206,7 +219,7 @@ worker's first tool call for it — Claude won't auto-run a background command b
 receiving its first user input, and waking a worker depends on Claude's own
 background Bash watcher (a pure OS background process can't push-wake Claude). So
 **after opening a worker window, type any one line ("standby"/"ok" etc.) and it will
-auto-drain the backlog + park its watcher** per the injected instructions;
+park its watcher (backlog then arrives as signals)** per the injected instructions;
 "self-driving with zero keystrokes on open" is impossible — that's a harness floor,
 not a config defect. (Before dispatching, A should remind the user to type one line
 in each worker window to bring it online.)
@@ -222,16 +235,19 @@ not re-claim the role — and `recv`/`watch` only need the `--me <role>` argumen
 registry. **Do NOT rely on a bare nudge after `/clear`** — observed (2026-06-28): a cleared
 worker comes back without acting on its role (the SessionStart hook does not reliably re-inject
 on `/clear`, and even if it did, the "manual floor" means a blank `ok` won't tell the worker
-what to do). **Recover explicitly:** run **`/ipc-recover B`** (the command takes the role as
-`$ARGUMENTS`, or reads it from any injected context; it drains `recv --me <role>` then starts
-the persistent Monitor `watch --me <role>`). **孤儿盯哨现由代码处理,不靠语义提醒(2026-06-30 代际令牌):**
+what to do). **Recover explicitly:** run **`/ipc-recover B`** (a USER-LEVEL command installed to
+`~/.claude/commands/ipc-recover.md`, available in every opted-in project; it takes the role as
+`$ARGUMENTS`, or reads it from any injected context; it starts the persistent Monitor
+`watch --me <role>` FIRST — backlog arrives as signals, read via `peek`). **孤儿盯哨现由代码处理,不靠语义提醒(2026-06-30 代际令牌):**
 起新 `watch --me <role>` 时该 watcher 领一个递增代际号,使**同角色**任何旧/孤儿盯哨(如挺过 `/clear`
 仍在跑的旧进程)在下一轮 poll 自动退役(打印 `WATCHER ... retired` 后干净退出)——残留在死会话里的盯哨
 不会再黑洞本信箱,恢复时**无需手动找停同角色盯哨**。(唯一例外是代码管不到的:跑错角色——`watch --me D`
 不会被 `watch --me B` 退掉,那是两个不同信箱,仍须手动 `TaskStop` 切到对的角色。) If that slash command
 isn't loaded in the cleared session, paste the equivalent recipe instead: tell the worker its role, then
-`recv --me B` (drain) → start a persistent Monitor `watch --me B` → end turn. A (hub) needs no standby
-watcher — it just continues per its hub role (or `/main`).
+start a persistent Monitor `watch --me B` FIRST (backlog arrives as signals; read with `peek`) → end
+turn. A (hub) needs no standby
+watcher — it just continues per its hub role (or `/main`, which now also updates registry ownership
+via `ipc_role.py take A`).
 (Replaces the old `/sub`; `/main` is kept as A's optional hub self-assertion / hook-failure
 fallback. A bash `recv --block` fallback watcher, if used instead of the Monitor, must be
 re-armed each wake: exit `0`=message, `2`=empty timeout/re-arm without reading, `killed`

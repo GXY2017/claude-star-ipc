@@ -28,6 +28,12 @@ SRC = os.path.dirname(os.path.abspath(__file__))
 DST = os.path.join(os.path.expanduser("~"), ".claude", "ipc")
 USER_SETTINGS = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
 ROLE_DST = os.path.join(DST, "ipc_role.py")
+# Slash commands are USER-LEVEL too (2026-07-02): /ipc-recover must be available in
+# every opted-in project — a cleared worker recovering in project X can't rely on
+# project X having its own copy.
+CMD_SRC = os.path.join(SRC, ".claude", "commands")
+CMD_DST = os.path.join(os.path.expanduser("~"), ".claude", "commands")
+COMMANDS = ("ipc-recover.md", "main.md")
 
 # (event, command, idempotency marker substring)
 HOOK_SPECS = [
@@ -42,6 +48,12 @@ def _deploy():
     shutil.copyfile(os.path.join(SRC, ".claude", "hooks", "ipc_role.py"), ROLE_DST)
     print(f"  + {os.path.join(DST, 'ipc.py')}")
     print(f"  + {ROLE_DST}")
+    os.makedirs(CMD_DST, exist_ok=True)
+    for name in COMMANDS:
+        src = os.path.join(CMD_SRC, name)
+        if os.path.exists(src):
+            shutil.copyfile(src, os.path.join(CMD_DST, name))
+            print(f"  + {os.path.join(CMD_DST, name)}")
 
 
 def _merge_hooks():

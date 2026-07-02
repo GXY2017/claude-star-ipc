@@ -11,6 +11,7 @@ CLI:
     python ipc.py send --from A --to B "msg" # queue a message
     python ipc.py send --from A --to B,C "m" # fan out to several workers (one row each)
     python ipc.py send --from A --to ALL "m" # broadcast to every other live role
+    python ipc.py send --from A --to B --body-file m.md  # body from file (shell-metachar-safe)
     python ipc.py recv --me B                # print NEW messages for B, mark them read
     python ipc.py recv --me A --block        # wait until a message arrives, then print it
     python ipc.py recv --me A --block --count 3  # BARRIER: wait until 3 replies arrive (parallel fan-out)
@@ -240,6 +241,7 @@ def _conn():
             hop         INTEGER NOT NULL DEFAULT 0,    -- echo/relay counter
             ttl         INTEGER NOT NULL DEFAULT 4,    -- hop ceiling (see send())
             lease_until REAL,                          -- hard lease deadline (epoch s); NULL=pure-heartbeat lease
+            lease_secs  INTEGER,                       -- sender's lease duration; claim resets lease_until=now+lease_secs
             attempts    INTEGER NOT NULL DEFAULT 0,    -- claim count; caps requeue at MAX_ATTEMPTS
             tombstone   TEXT                           -- NULL=active; 'cancelled'|'failed'=terminal, excluded from active set
         )"""
@@ -253,6 +255,7 @@ def _conn():
         ("hop", "INTEGER NOT NULL DEFAULT 0"),
         ("ttl", "INTEGER NOT NULL DEFAULT 4"),
         ("lease_until", "REAL"),
+        ("lease_secs", "INTEGER"),
         ("attempts", "INTEGER NOT NULL DEFAULT 0"),
         ("tombstone", "TEXT"),
     ):
@@ -394,17 +397,21 @@ def send(sender, recipient, body, *, in_reply_to=None, msg_type=None, hop=None,
     Classifies hub->worker as 'task' and worker->hub as 'reply' by default, and
     auto-links a reply to the sender's oldest unanswered task (setting hop =
     parent.hop + 1) so fan-out completion is computable in code.
-    lease: hard lease seconds counted from NOW (send time). 0/None => pure-heartbeat
-    lease (lease_until NULL, alive iff recipient's watcher beats); >0 => lease_until
-    = now+lease, a hard ceiling that catches alive-but-stuck. Pre-stored on the row
-    so claim() need not recompute; ack() pushes it out."""
+    lease: hard lease seconds. 0/None => pure-heartbeat lease (lease_until NULL,
+    alive iff recipient's watcher beats); >0 => a hard ceiling that catches
+    alive-but-stuck. Stored as lease_secs (the sender's intent) and pre-set as
+    lease_until=now+lease for the queued phase; claim RESETS lease_until to
+    claim-time + lease_secs so the runway starts when the work starts (a task
+    that waited out its lease in the queue no longer arrives pre-expired, and a
+    requeued task retries under a fresh ceiling); ack() pushes it out."""
     if sender != HUB and recipient != HUB:
         raise StarViolation(f"star topology forbids {sender}->{recipient} "
                             f"(hub={HUB}; set IPC_HUB to change)")
     if require_watcher and not watcher_alive(recipient, max_age, verify_owner=True):
         raise WatcherDown(recipient)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    lease_until = None if (lease is None or lease <= 0) else time.time() + lease
+    lease_secs = None if (lease is None or lease <= 0) else int(lease)
+    lease_until = None if lease_secs is None else time.time() + lease_secs
     with _conn() as conn:
         if msg_type is None:
             msg_type = "reply" if (sender != HUB and recipient == HUB) else "task"
@@ -427,10 +434,10 @@ def send(sender, recipient, body, *, in_reply_to=None, msg_type=None, hop=None,
         cur = conn.execute(
             "INSERT INTO messages "
             "(ts, sender, recipient, body, in_reply_to, msg_type, status, hop, ttl, "
-            "lease_until) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "lease_until, lease_secs) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (ts, sender, recipient, body, in_reply_to, msg_type, "sent", hop, ttl,
-             lease_until),
+             lease_until, lease_secs),
         )
         return cur.lastrowid
 
@@ -493,15 +500,18 @@ def _claim_one(conn, me):
     ONE UPDATE...RETURNING runs under SQLite's write lock, so concurrent consumers
     can never both claim the same row. Used by watch(). Claim = lease: handled=1,
     status=delivered, attempts=attempts+1 in the same atomic statement; lease_until
-    is untouched (pre-set at send). Now takes the caller's conn so watch() can reap
-    and claim within one connection."""
+    is RESET to now + lease_secs (claim-time lease: the runway starts when the work
+    starts, see send()). Takes the caller's conn so watch() can reap and claim
+    within one connection."""
     return conn.execute(
-        "UPDATE messages SET handled=1, status='delivered', attempts=attempts+1 "
+        "UPDATE messages SET handled=1, status='delivered', attempts=attempts+1, "
+        "lease_until=CASE WHEN lease_secs IS NULL THEN lease_until "
+        "ELSE ? + lease_secs END "
         "WHERE id=("
         "  SELECT id FROM messages WHERE recipient=? AND handled=0 "
         "  ORDER BY id LIMIT 1"
         ") RETURNING id, ts, sender, body, msg_type, in_reply_to",
-        (me,),
+        (time.time(), me),
     ).fetchone()
 
 
@@ -527,6 +537,27 @@ def pending(hub):
         return out
 
 
+_ARCHIVE_THRESHOLD = 300   # start trimming once the table exceeds this many rows
+_ARCHIVE_KEEP = 150        # rows always kept (same guard as `archive --keep`)
+
+
+def _auto_archive(conn, threshold=_ARCHIVE_THRESHOLD, keep=_ARCHIVE_KEEP):
+    """Lazy self-trim, same philosophy as the lazy reaper: piggybacks on
+    recv/watch/pending instead of needing a cron. Once the table exceeds
+    `threshold` rows, delete handled/terminal rows older than the newest `keep`
+    (identical condition to archive(): unread requeued rows are active work and
+    are never touched). Done-dropped rows are handled=1, so they age out here."""
+    if conn.execute("SELECT count(*) FROM messages").fetchone()[0] <= threshold:
+        return
+    row = conn.execute(
+        "SELECT id FROM messages ORDER BY id DESC LIMIT 1 OFFSET ?", (keep,)
+    ).fetchone()
+    if row:
+        conn.execute(
+            "DELETE FROM messages WHERE (handled=1 OR tombstone IS NOT NULL) "
+            "AND id<=?", (row[0],))
+
+
 def _reap_stale(conn, me=None, hub=None):
     """Lazy reaper — no daemon. Callers: recv/watch (me=worker, reap that worker's
     own stale claimed tasks so a restarted worker re-exposes its orphaned work) and
@@ -545,12 +576,12 @@ def _reap_stale(conn, me=None, hub=None):
     this filter, A's already-read reply rows would be reaped+requeued at lease
     expiry and redelivered to A's watcher as phantom "NEW MSG" — breaking the
     "history doesn't re-enter the inbox" invariant. Only tasks are reapable.
-    NB on requeue dropping lease_until -> NULL: a requeued task loses its hard
-    ceiling on retry (claim doesn't reset lease_until), so a --lease task that
-    stuck once is re-tried under pure-heartbeat (no hard ceiling) on the next
-    round. Acceptable for idempotent read-only tasks (death is caught by
-    heartbeat anyway); for non-idempotent tasks use --max-attempts 1 (first
-    stick -> failed, no retry) so this path is never taken."""
+    Requeue drops lease_until -> NULL only transiently: the next claim resets it
+    to claim-time + lease_secs (see _claim_one/recv), so a retried --lease task
+    runs under a FRESH hard ceiling instead of the old pre-expired one. For
+    non-idempotent tasks still use --max-attempts 1 (first stick -> failed).
+    Finishes with the lazy auto-archive (size-gated) so the DB self-trims
+    without a maintenance cron."""
     if me is not None:
         rows = conn.execute(
             "SELECT id, recipient, lease_until, attempts FROM messages "
@@ -577,6 +608,7 @@ def _reap_stale(conn, me=None, hub=None):
         else:
             conn.execute("UPDATE messages SET tombstone='failed' WHERE id=?", (rid,))
             failed.append(rid)
+    _auto_archive(conn)
     return requeued, failed
 
 
@@ -589,16 +621,25 @@ def recv(me):
     Lifecycle: lazily reaps this inbox's stale claimed tasks first (so a worker
     that died and came back re-exposes its own orphaned work and can re-claim it),
     then claims unhandled rows as a LEASE — handled=1, status=delivered,
-    attempts=attempts+1, all in the same atomic UPDATE (single-consumer invariant
-    preserved). lease_until was pre-set at send() time and is NOT touched here."""
+    attempts=attempts+1, lease_until reset to now + lease_secs (claim-time lease,
+    see send()), all in the same atomic UPDATE (single-consumer invariant
+    preserved). Rows that already have a reply/ack linked (finished work the
+    reaper requeued while the worker executed watcher-less) are claimed but NOT
+    returned — redelivering them would redo a completed task."""
     with _conn() as conn:
         _reap_stale(conn, me=me)
         rows = conn.execute(
-            "UPDATE messages SET handled=1, status='delivered', attempts=attempts+1 "
+            "UPDATE messages SET handled=1, status='delivered', attempts=attempts+1, "
+            "lease_until=CASE WHEN lease_secs IS NULL THEN lease_until "
+            "ELSE ? + lease_secs END "
             "WHERE recipient=? AND handled=0 "
             "RETURNING id, ts, sender, body",
-            (me,),
+            (time.time(), me),
         ).fetchall()
+        # Done-drop: claimed (handled=1, so archive can sweep it) but not handed
+        # to the caller. task_done is False for ordinary replies in a hub's inbox
+        # (nothing links to a reply), so only requeued-done tasks are dropped.
+        rows = [r for r in rows if not task_done(conn, r[0])]
     return sorted(rows, key=lambda r: r[0])  # RETURNING order is unspecified
 
 
@@ -749,6 +790,11 @@ def watch(me, interval):
                     if row is None:
                         break
                     mid, ts, sender, body, mtype, in_reply_to = row
+                    if task_done(conn, mid):
+                        # Done-drop (same as recv): a requeued-but-already-
+                        # answered task is finished work; claim it silently,
+                        # never re-announce it.
+                        continue
                     try:
                         # SIGNAL ONLY (never the body): a tiny line that can never be
                         # truncated by the harness notification layer. Read the full
@@ -764,9 +810,13 @@ def watch(me, interval):
                                 flush=True,
                             )
                             continue
+                        # Absolute path in the hint: under the user-level install
+                        # a bare `python ipc.py` copy-pasted from this signal
+                        # fails (ipc.py is not in the project cwd).
                         print(
                             f"NEW MSG #{mid} from {sender} ({len(body)} chars) "
-                            f"— read full: python ipc.py peek --me {me} --tail 3",
+                            f'— read full: python "{os.path.abspath(__file__)}" '
+                            f"peek --me {me} --tail 3",
                             flush=True,
                         )
                     except Exception as e:  # noqa: BLE001 — never kill the loop
@@ -815,7 +865,13 @@ def main():
     s = sub.add_parser("send")
     s.add_argument("--from", dest="sender", required=True)
     s.add_argument("--to", dest="recipient", required=True)
-    s.add_argument("body")
+    s.add_argument("body", nargs="?", default=None)
+    s.add_argument("--body-file", dest="body_file", default=None,
+                   help="read the message body from this file (UTF-8). Use for "
+                        "bodies containing backticks/$()/quotes: a body passed "
+                        "as a shell argument gets expanded/mangled by the shell "
+                        "(observed twice in practice); a file never touches the "
+                        "shell")
     s.add_argument("--require-watcher", action="store_true",
                    help="refuse to queue unless the recipient's --block watcher "
                         "is parked & listening (use for A->B task dispatch)")
@@ -912,6 +968,19 @@ def main():
         print(f"OK  db={DB_PATH}")
     elif args.cmd == "send":
         _require_valid(args.sender, "--from")
+        if args.body_file is not None:
+            if args.body is not None:
+                print("BODY  pass either a positional body or --body-file, not both")
+                sys.exit(2)
+            try:
+                with open(args.body_file, encoding="utf-8") as f:
+                    args.body = f.read().strip()
+            except OSError as e:
+                print(f"BODY  cannot read --body-file: {e}")
+                sys.exit(2)
+        elif args.body is None:
+            print("BODY  missing: pass a positional body or --body-file")
+            sys.exit(2)
         targets = expand_recipients(args.recipient, args.sender, args.max_age)
         if not targets:
             print("NO RECIPIENTS  (--to ALL matched no other live role, "
@@ -1009,6 +1078,12 @@ def main():
             sys.exit(1)  # non-empty => incomplete, usable in scripts
     elif args.cmd == "ack":
         _require_valid(args.me, "--me")
+        # ack also beats the heartbeat: _lease_alive AND-joins heartbeat with the
+        # lease ceiling, so a watcher-less worker mid-task (the bash-fallback
+        # recv --block exits on delivery and removes its heartbeat) would read as
+        # stale no matter how it renewed the lease. Beating here makes periodic
+        # `ack` a genuine keep-alive for that path.
+        _beat(args.me)
         new_lease = time.time() + DEFAULT_LEASE
         with _conn() as conn:
             if args.task is not None:
