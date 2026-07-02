@@ -55,8 +55,9 @@ protocol is auto-loaded only when cwd = this project. A terminal started from a
 different directory resolves a different mailbox, so the two can never connect.
 Confirm the cwd matches, and that `.claude/ipc.enabled` exists (the opt-in gate),
 before opening a terminal. (This section onward is path-agnostic and applies to any
-opted-in project; enable a new project by creating its `.claude/ipc.enabled` gate
-after the one-time `python install_user.py`.)
+opted-in project; enable a new project with `python ~/.claude/ipc/ipc_role.py enable`
+run from its root — validates the install, refuses the home dir, creates the
+`.claude/ipc.enabled` gate — after the one-time `python install_user.py`.)
 
 **Fixed master/worker roles, to avoid echo loops:**
 - **A = master terminal (hub)**: initiator/decider. Only A decides whether to

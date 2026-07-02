@@ -109,6 +109,7 @@ configurable via `IPC_HUB` (default `A`). Delivery to arbitrary *names* stays op
 | `ipc.py` | the mailbox CLI (send/recv/watch/peek/archive/status) — stdlib only. **Neutral core: any CLI that runs python+bash can use it.** |
 | `.claude/hooks/ipc_role.py` | `SessionStart`/`SessionEnd` hook: auto-assigns roles, injects behavior. *Claude Code integration layer.* |
 | `.claude/commands/main.md`, `ipc-recover.md` | optional slash commands: `/main` (A self-assert hub), `/ipc-recover` (rebuild role+watcher after `/clear`/compaction/hook-failure). *Claude Code only.* |
+| `skills/multi-terminal-ipc/SKILL.md` | the operating + onboarding skill (mental model, command surface, enable-in-a-new-project, recovery, cautions). Installed to `~/.claude/skills/` by `install_user.py`. *Claude Code only.* |
 | `CLAUDE.md` | the protocol the terminals follow (path-agnostic; Chinese) |
 | `install_user.py` | **recommended** installer — installs the machinery once at `~/.claude/ipc/`, registers the global `SessionStart`/`SessionEnd` hook, and gates it per project on a `.claude/ipc.enabled` file. One copy serves every opted-in project (each gets its own mailbox by launch cwd). |
 | `migrate_ipc.py` | migrate a legacy in-project mailbox to the user-level layout. |
@@ -132,9 +133,16 @@ python install_user.py
 
 Installs `ipc.py` + `ipc_role.py` once under `~/.claude/ipc/`, registers a global
 `SessionStart`/`SessionEnd` hook (merged into `~/.claude/settings.json`, preserving
-what's there), and ships the `/main` `/ipc-recover` slash commands. The machinery then
+what's there), and ships the `/main` `/ipc-recover` slash commands plus the
+`multi-terminal-ipc` skill. The machinery then
 sits idle until a project **opts in** with a gate file `.claude/ipc.enabled` — only then
-does the hook claim a role. Each opted-in project gets its **own** mailbox, resolved by
+does the hook claim a role. Enable a project with one command (validates the install,
+refuses the home dir, creates the gate; idempotent):
+
+```sh
+cd /path/to/your/project
+python ~/.claude/ipc/ipc_role.py enable
+``` Each opted-in project gets its **own** mailbox, resolved by
 the launch cwd (`~/.claude/projects/<key>/ipc/`), so two terminals share a mailbox iff
 they launch from the same project root. Have a legacy in-project mailbox? `python
 migrate_ipc.py` moves it to the user-level layout.

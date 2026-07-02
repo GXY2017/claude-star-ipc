@@ -16,6 +16,9 @@ CLAUDE.md, NOT enforced by ipc.py (a neutral mailbox). A tiny on-disk registry
 tracks who owns what, keyed by Claude's session_id. To add more worker slots,
 extend ROLES below.
 
+  python ipc_role.py enable   # onboard the CURRENT project: validate the
+                              # user-level install + create .claude/ipc.enabled
+                              # (refuses home dir / ~/.claude)
   python ipc_role.py reset    # wipe the registry (use after a hard-killed
                               # terminal left a stale claim)
 
@@ -110,8 +113,9 @@ def _master_context(hub):
     return (
         f"[IPC role: you are master terminal {hub} (master / star hub)] This project uses "
         f"ipc.py(_ipc.db) to collaborate with worker terminals (star topology: "
-        f"you are the sole hub; workers don't talk to each other). See CLAUDE.md for the "
-        f"protocol. You are the initiator/decider. Dispatch to one worker: "
+        f"you are the sole hub; workers don't talk to each other). Protocol details: the "
+        f"project CLAUDE.md's IPC section if present, else the multi-terminal-ipc skill. "
+        f"You are the initiator/decider. Dispatch to one worker: "
         f"`python ipc.py send --from {hub} --to <worker> \"<task>\"`; to several at once: `--to B,C`; "
         f"broadcast to all live workers: `--to ALL`. [LOCAL TRIAL 2026-06-27] To listen for "
         f"replies, start ONE persistent Monitor (the Monitor tool, persistent=true) running "
@@ -133,7 +137,8 @@ def _worker_context(role, hub):
     return (
         f"[IPC role: you are worker terminal {role} (subordinate / worker)] This project "
         f"uses ipc.py(_ipc.db) to collaborate with master terminal {hub} (star topology: you "
-        f"talk only to {hub}, never to other workers). See CLAUDE.md for the protocol. Enter "
+        f"talk only to {hub}, never to other workers). Protocol details: the project "
+        f"CLAUDE.md's IPC section if present, else the multi-terminal-ipc skill. Enter "
         f"standby immediately — WATCHER FIRST, then work: (1) start ONE persistent Monitor "
         f"(the Monitor tool, persistent=true) running `python ipc.py watch --me {role}` as "
         f"your standby watcher, then end this turn. Starting the watcher BEFORE touching any "
@@ -435,6 +440,57 @@ def take(role, sid):
     print(f"OK {sid[:8]} now holds {role}{evicted}")
 
 
+def enable():
+    """One-command project onboarding: create the `.claude/ipc.enabled` opt-in
+    gate for the CURRENT project (cwd-derived root) after validating the
+    user-level install. The gate is the ONLY per-project artifact — machinery
+    stays at ~/.claude/ipc, per-project state auto-creates on first use. Refuses
+    the home dir and ~/.claude (every launch dir becomes a registered project;
+    user config must never be one — same guard as ipc.py's _project_root)."""
+    root = os.path.abspath(PROJECT_ROOT)
+    home = os.path.normcase(os.path.abspath(os.path.expanduser("~")))
+    user_claude = os.path.normcase(os.path.join(home, ".claude"))
+    rn = os.path.normcase(root)
+    if rn == home or rn == user_claude or rn.startswith(user_claude + os.sep):
+        print(f"REFUSED  {root} is the home dir / user config, never a project "
+              f"root. cd into the real project root and re-run.")
+        sys.exit(2)
+    warn = []
+    if _IPC is None:
+        warn.append("ipc.py not importable beside this hook — user-level install "
+                    "incomplete? (fix: python install_user.py from the repo)")
+    settings = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+    try:
+        # Parse, don't grep raw text: inside the JSON file quotes are escaped
+        # (ipc_role.py\" claim), so a raw substring probe false-warns.
+        with open(settings, encoding="utf-8") as f:
+            cfg = json.load(f)
+        cmds = [h.get("command", "")
+                for g in (cfg.get("hooks", {}).get("SessionStart") or [])
+                for h in g.get("hooks", [])]
+        if not any("ipc_role.py" in c and "claim" in c for c in cmds):
+            warn.append(f"claim hook not registered in {settings} — roles won't "
+                        "auto-assign (fix: python install_user.py)")
+    except (OSError, ValueError, AttributeError):
+        warn.append(f"{settings} unreadable — hook registration unverified")
+    gate = os.path.join(root, ".claude", "ipc.enabled")
+    if os.path.exists(gate):
+        print(f"ALREADY ENABLED  {gate}")
+    else:
+        os.makedirs(os.path.dirname(gate), exist_ok=True)
+        with open(gate, "w", encoding="utf-8") as f:
+            f.write("IPC opt-in gate — presence turns on the multi-terminal "
+                    "mailbox for this project. See the multi-terminal-ipc skill "
+                    "or the claude-star-ipc CLAUDE.md for the protocol.\n")
+        print(f"ENABLED  {gate}")
+    for w in warn:
+        print(f"  ! {w}")
+    print("Next: open terminals with cwd = this project root (first in = hub, "
+          "rest = workers; pin with IPC_ROLE=X). Type one line in each worker "
+          "window to park its watcher. Verify: ipc_role.py status, then one "
+          "hub->worker round-trip.")
+
+
 def reclaim_dead():
     """Free every slot whose watcher heartbeat is gone (dormant), so dead claims
     stop blocking slots. Safer than `reset`: live roles are kept."""
@@ -506,6 +562,8 @@ def main():
         role = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("-") else ""
         sid = _arg("--session") or os.environ.get("CLAUDE_SESSION_ID") or "manual"
         take(role, sid)
+    elif cmd == "enable":
+        enable()
     elif cmd in ("reclaim-dead", "reclaim_dead"):
         reclaim_dead()
     elif cmd == "status":

@@ -34,6 +34,11 @@ ROLE_DST = os.path.join(DST, "ipc_role.py")
 CMD_SRC = os.path.join(SRC, ".claude", "commands")
 CMD_DST = os.path.join(os.path.expanduser("~"), ".claude", "commands")
 COMMANDS = ("ipc-recover.md", "main.md")
+# The operating skill ships with the kit (2026-07-02): onboarding + operations
+# reference that stays version-locked to the code instead of drifting on one machine.
+SKILL_SRC = os.path.join(SRC, "skills", "multi-terminal-ipc", "SKILL.md")
+SKILL_DST = os.path.join(os.path.expanduser("~"), ".claude", "skills",
+                         "multi-terminal-ipc", "SKILL.md")
 
 # (event, command, idempotency marker substring)
 HOOK_SPECS = [
@@ -54,6 +59,10 @@ def _deploy():
         if os.path.exists(src):
             shutil.copyfile(src, os.path.join(CMD_DST, name))
             print(f"  + {os.path.join(CMD_DST, name)}")
+    if os.path.exists(SKILL_SRC):
+        os.makedirs(os.path.dirname(SKILL_DST), exist_ok=True)
+        shutil.copyfile(SKILL_SRC, SKILL_DST)
+        print(f"  + {SKILL_DST}")
 
 
 def _merge_hooks():
