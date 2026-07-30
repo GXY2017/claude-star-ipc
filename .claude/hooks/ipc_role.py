@@ -313,7 +313,14 @@ def _is_dormant(reg, role, sid):
     Heartbeat is the liveness truth: a fresh heartbeat => live (not dormant); a
     stale heartbeat => dormant; no heartbeat => dormant only once the claim is old
     enough that the owner should have parked a watcher (avoids evicting a peer that
-    just started and hasn't beaten yet)."""
+    just started and hasn't beaten yet).
+    The HUB slot is NEVER dormant: the hub runs no persistent watcher by design
+    (it dispatches and collects on demand), so a dead heartbeat says nothing about
+    whether the hub is alive. Auto-reclaiming it hands the hub role out by
+    launch-order roulette — hub identity must change only deliberately
+    (`take <hub>` / /main / IPC_ROLE)."""
+    if role == HUB:
+        return False
     claim = reg.get(role)
     if not claim or claim.get("session_id") == sid:
         return False
@@ -322,6 +329,17 @@ def _is_dormant(reg, role, sid):
         return age > WATCHER_MAX_AGE
     ca = _claim_age(claim)
     return ca is None or ca > CLAIM_GRACE
+
+
+def _sweep_dormant(reg, sid):
+    """Lazy registry GC: null EVERY dormant slot (dead worker claims; the hub is
+    exempt via _is_dormant), not just the one a claimer needs — so ghost residue
+    never outlives the next claim(). Mutates `reg`; returns the freed roles
+    (caller saves iff non-empty)."""
+    freed = [r for r in ROLES if _is_dormant(reg, r, sid)]
+    for r in freed:
+        reg[r] = None
+    return freed
 
 
 def _take_auto(reg, sid):
@@ -354,6 +372,8 @@ def claim():
     locked = _lock()
     try:
         reg = _load()
+        if _sweep_dormant(reg, sid):          # lazy GC: ghost claims die at the
+            _save(reg)                        # next claim, whoever it's from
         role = _owned_role(reg, sid)          # reuse if this session already owns a role
         if role is None and want in ROLES:
             # Explicit intent overrides launch-order roulette: this window claims
@@ -492,17 +512,17 @@ def enable():
 
 
 def reclaim_dead():
-    """Free every slot whose watcher heartbeat is gone (dormant), so dead claims
-    stop blocking slots. Safer than `reset`: live roles are kept."""
+    """Free every WORKER slot whose watcher heartbeat is gone (dormant), so dead
+    claims stop blocking slots. Safer than `reset`: live roles are kept, and the
+    hub slot is exempt (no persistent watcher by design — a dead heartbeat proves
+    nothing; reassign the hub deliberately via `take <hub> --session <sid>` or
+    /main). Safe to run any time."""
     locked = _lock()
-    freed = []
     try:
         reg = _load()
-        for r in ROLES:
-            if _is_dormant(reg, r, None):     # None never matches a real session_id
-                freed.append(r)
-                reg[r] = None
-        _save(reg)
+        freed = _sweep_dormant(reg, None)     # None never matches a real session_id
+        if freed:
+            _save(reg)
     finally:
         if locked:
             _unlock()
@@ -526,6 +546,8 @@ def status_view():
             state = "FREE" if wa is None or wa > WATCHER_MAX_AGE else "SQUATTER (watcher, no claim)"
         elif wa is not None and wa <= WATCHER_MAX_AGE:
             state = "live"
+        elif r == HUB:
+            state = "hub (watcher-less by design)"
         else:
             state = "DORMANT (reclaimable)"
         print(f"{r:4} {owner:10} {ca_s:>9} {wa_s:>8}  {state}")

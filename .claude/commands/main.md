@@ -5,19 +5,19 @@ description: 把本终端设为主终端 A(hub),更新注册表归属,按需派�
 你现在是**主终端 A(星型 hub)**,是发起方/决策方。IPC 协议见项目 `CLAUDE.md`。
 
 > 本文所有 `ipc.py` / `ipc_role.py` 均指用户级安装:
-> `python "~/.claude/ipc/ipc.py"` / `python "~/.claude/ipc/ipc_role.py"`(shell 不展开 `~` 时写绝对路径)。
+> `python "C:\Users\gxy49\.claude\ipc\ipc.py"` / `python "C:\Users\gxy49\.claude\ipc\ipc_role.py"`。
 
 **第 1 步——核对项目**:cwd 必须是启用了 IPC 的项目根(存在 `.claude/ipc.enabled`;遗留本地安装则看项目根有无 `ipc.py`)。不符则停止并提示用户:"各终端必须在同一项目根启动,请在正确目录重开本终端",不要继续。
 
 **第 2 步——把 A 的注册表归属落到本会话**(不只是行为自称,防 two-A split-brain):
 ```
-python "~/.claude/ipc/ipc_role.py" take A
+python "C:\Users\gxy49\.claude\ipc\ipc_role.py" take A
 ```
 (`take` 自动用 `CLAUDE_SESSION_ID` 作会话标识;会驱逐前任持有者并释放本会话原持的其他槽。)随后可用
-`ipc_role.py status` 确认 A=live 归本会话。
+`python "C:\Users\gxy49\.claude\ipc\ipc_role.py" status` 确认 A=live 归本会话。
 
 **第 3 步——若 `$ARGUMENTS` 非空**,把它作为第一条任务派给 B:
-`python "~/.claude/ipc/ipc.py" send --from A --to B --require-watcher "$ARGUMENTS"`,确认已发出(REFUSED=B 的盯哨没挂,先提醒用户去 B 窗口敲一行唤醒)。
+`python "C:\Users\gxy49\.claude\ipc\ipc.py" send --from A --to B --require-watcher "$ARGUMENTS"`,确认已发出(REFUSED=B 的盯哨没挂,先提醒用户去 B 窗口敲一行唤醒)。
 
 之后按 hub 职责协作:
 - **派活**:`send --from A --to B "<任务>"`;多 worker 一次派 `--to B,C`;广播活 worker `--to ALL`。派活默认加 `--require-watcher`(防黑洞)。任务正文含反引号/`$`/引号时**用 `--body-file <文件>`**,别走 shell 参数。

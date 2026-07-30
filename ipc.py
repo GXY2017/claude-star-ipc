@@ -23,8 +23,17 @@ CLI:
                                              # truncation); read full content with `peek`. One long-lived
                                              # watcher, ~zero idle turns, survives turns/user input (TRIAL)
     python ipc.py send --from A --to B "msg" --require-watcher  # refuse if B not listening
+    python ipc.py send --from A --to B "msg" --submit-id fx7    # idempotent: same key never double-queues (safe re-dispatch)
+    python ipc.py send --from A --to B "msg" --no-requeue       # fail-closed: stale lease parks as NEEDS-REVIEW, never auto-requeued
     python ipc.py status --watch B           # is B's --block watcher parked? ALIVE/DOWN
     python ipc.py peek --me B [--tail 5]     # show recent thread WITHOUT marking read
+    python ipc.py recv/peek/pending ... --json  # NDJSON envelopes instead of text lines:
+                                             # recv/peek {id,ts,from,type,task,session,body};
+                                             # pending {id,to,ts,state,attempts}. Machine-
+                                             # readable outcome (type/state) + session echo
+                                             # (grok-build headless-envelope + sessionId ideas:
+                                             # reply session != task claimant => worker
+                                             # /clear-ed, its context is gone, re-brief)
     python ipc.py archive [--keep 50]        # trim handled rows, keep the last N
 
 Topology: STAR with A at the hub is a CONVENTION, not enforced by this script.
@@ -243,7 +252,10 @@ def _conn():
             lease_until REAL,                          -- hard lease deadline (epoch s); NULL=pure-heartbeat lease
             lease_secs  INTEGER,                       -- sender's lease duration; claim resets lease_until=now+lease_secs
             attempts    INTEGER NOT NULL DEFAULT 0,    -- claim count; caps requeue at MAX_ATTEMPTS
-            tombstone   TEXT                           -- NULL=active; 'cancelled'|'failed'=terminal, excluded from active set
+            tombstone   TEXT,                          -- NULL=active; 'cancelled'|'failed'=terminal, excluded from active set
+            submit_id   TEXT,                          -- idempotent dispatch key: same (sender,recipient,submit_id) never double-queues (tutti clientSubmitID idea)
+            no_requeue  INTEGER NOT NULL DEFAULT 0,    -- 1 = fail-closed task: reaper never requeues/fails it, stale => NEEDS-REVIEW (tutti fail-closed idea)
+            session     TEXT                           -- sender's CLAUDE_SESSION_ID at send time (grok-build sessionId-echo idea): reply session == original claimant => worker still holds task context (terse follow-up OK); differs => /clear happened, re-brief
         )"""
     )
     # Idempotent migration for a pre-existing DB created before these columns.
@@ -258,9 +270,21 @@ def _conn():
         ("lease_secs", "INTEGER"),
         ("attempts", "INTEGER NOT NULL DEFAULT 0"),
         ("tombstone", "TEXT"),
+        ("submit_id", "TEXT"),
+        ("no_requeue", "INTEGER NOT NULL DEFAULT 0"),
+        ("session", "TEXT"),
     ):
         if col not in have:
             conn.execute(f"ALTER TABLE messages ADD COLUMN {col} {ddl}")
+    # Race-free idempotency: the partial UNIQUE index makes the duplicate check a
+    # DB invariant, not a SELECT-then-INSERT convention two concurrent senders
+    # could slip past. Tombstoned rows leave the index, so an explicit
+    # cancel/fail re-opens the key for a deliberate retry.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_submit_id "
+        "ON messages(sender, recipient, submit_id) "
+        "WHERE submit_id IS NOT NULL AND tombstone IS NULL"
+    )
     # Generation tokens for orphan-watcher retirement (#3): each watch() startup
     # bumps its role's gen; a superseded watcher reads a higher gen next poll and
     # retires itself — no pid-kill (avoids Windows os.kill(pid,0) mis-fire), no
@@ -351,12 +375,18 @@ def task_done(conn, tid):
     ).fetchone() is not None
 
 
-def task_state(conn, tid, recipient, handled, lease_until, tombstone):
+def task_state(conn, tid, recipient, handled, lease_until, tombstone,
+               no_requeue=0):
     """Derive the lifecycle state of a task row. No state column — everything is
     computed from (handled, lease_until, attempts, tombstone, in_reply_to, now,
     heartbeat). tombstone takes precedence over done/in_progress so cancelled/failed
     display correctly even if a stray late reply lands. Order matters:
-        CANCELLED > FAILED > DONE > QUEUED(handled=0) > IN_PROGRESS(lease alive) > STALE."""
+        CANCELLED > FAILED > DONE > QUEUED(handled=0) > IN_PROGRESS(lease alive)
+        > NEEDS-REVIEW(no_requeue) > STALE.
+    NEEDS-REVIEW is the fail-closed terminal-of-attention for --no-requeue tasks:
+    lease dead but the reaper deliberately leaves the claim in place (tutti:
+    'the Run remains running and reconciliation is scheduled'). Exits via hub
+    cancel, worker done/fail, or worker ack (revives to IN_PROGRESS)."""
     if tombstone == "cancelled":
         return "CANCELLED"
     if tombstone == "failed":
@@ -367,7 +397,7 @@ def task_state(conn, tid, recipient, handled, lease_until, tombstone):
         return "QUEUED"  # attempts>0 means requeued; caller shows attempts separately
     if _lease_alive(recipient, lease_until):
         return "IN_PROGRESS"
-    return "STALE"
+    return "NEEDS-REVIEW" if no_requeue else "STALE"
 
 
 def _oldest_unanswered_task(conn, hub, worker):
@@ -389,9 +419,20 @@ def _oldest_unanswered_task(conn, hub, worker):
     return None
 
 
+def _dup_by_submit_id(conn, sender, recipient, submit_id):
+    """Newest non-terminal row for this idempotency key, or None."""
+    return conn.execute(
+        "SELECT id FROM messages WHERE sender=? AND recipient=? AND submit_id=? "
+        "AND tombstone IS NULL ORDER BY id DESC LIMIT 1",
+        (sender, recipient, submit_id)).fetchone()
+
+
 def send(sender, recipient, body, *, in_reply_to=None, msg_type=None, hop=None,
-         ttl=4, require_watcher=False, max_age=8.0, lease=DEFAULT_LEASE):
-    """Insert one message for a SINGLE recipient.
+         ttl=4, require_watcher=False, max_age=8.0, lease=DEFAULT_LEASE,
+         submit_id=None, no_requeue=False):
+    """Insert one message for a SINGLE recipient. Returns (id, created):
+    created=False means submit_id matched an existing non-terminal row, which was
+    reused instead of queued again (idempotent resend, tutti clientSubmitID idea).
     - StarViolation if a non-hub addresses another non-hub, or hop > ttl.
     - WatcherDown if require_watcher is set and the recipient isn't parked.
     Classifies hub->worker as 'task' and worker->hub as 'reply' by default, and
@@ -403,10 +444,26 @@ def send(sender, recipient, body, *, in_reply_to=None, msg_type=None, hop=None,
     lease_until=now+lease for the queued phase; claim RESETS lease_until to
     claim-time + lease_secs so the runway starts when the work starts (a task
     that waited out its lease in the queue no longer arrives pre-expired, and a
-    requeued task retries under a fresh ceiling); ack() pushes it out."""
+    requeued task retries under a fresh ceiling); ack() pushes it out.
+    submit_id: idempotency key scoped to (sender, recipient). A resend with the
+    same key is a no-op returning the existing row — this is what makes
+    re-dispatch after a barrier timeout SAFE instead of a double-run risk. The
+    dup fast-path runs BEFORE the watcher gate: an already-queued task must not
+    be refused (or double-queued) just because the watcher blinked. Enforced by
+    a partial UNIQUE index, so two racing senders can't both insert; an explicit
+    cancel/fail tombstones the row out of the index and re-opens the key.
+    no_requeue: fail-closed task (see _reap_stale): a stale claim is NEVER
+    auto-requeued or auto-failed — it parks as NEEDS-REVIEW in pending until the
+    hub cancels or the worker done/fail/ack-revives it. Use for non-idempotent
+    work where a phantom second run is worse than waiting."""
     if sender != HUB and recipient != HUB:
         raise StarViolation(f"star topology forbids {sender}->{recipient} "
                             f"(hub={HUB}; set IPC_HUB to change)")
+    if submit_id is not None:
+        with _conn() as conn:
+            dup = _dup_by_submit_id(conn, sender, recipient, submit_id)
+        if dup:
+            return dup[0], False
     if require_watcher and not watcher_alive(recipient, max_age, verify_owner=True):
         raise WatcherDown(recipient)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -431,15 +488,23 @@ def send(sender, recipient, body, *, in_reply_to=None, msg_type=None, hop=None,
         if hop > ttl:
             raise StarViolation(f"echo ceiling hit: hop {hop} > ttl {ttl} "
                                 f"({sender}->{recipient})")
+        # OR IGNORE closes the fast-path TOCTOU: if a racing sender inserted the
+        # same submit_id between our check and here, the unique index swallows
+        # this insert and we return the winner's row.
         cur = conn.execute(
-            "INSERT INTO messages "
+            "INSERT OR IGNORE INTO messages "
             "(ts, sender, recipient, body, in_reply_to, msg_type, status, hop, ttl, "
-            "lease_until, lease_secs) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "lease_until, lease_secs, submit_id, no_requeue, session) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (ts, sender, recipient, body, in_reply_to, msg_type, "sent", hop, ttl,
-             lease_until, lease_secs),
+             lease_until, lease_secs, submit_id, 1 if no_requeue else 0,
+             os.environ.get("CLAUDE_SESSION_ID") or None),
         )
-        return cur.lastrowid
+        if cur.rowcount == 0 and submit_id is not None:
+            dup = _dup_by_submit_id(conn, sender, recipient, submit_id)
+            if dup:
+                return dup[0], False
+        return cur.lastrowid, True
 
 
 # Star-topology fan-out: A may address several workers at once. Recipients can be
@@ -525,20 +590,34 @@ def pending(hub):
         _reap_stale(conn, hub=hub)
         rows = conn.execute(
             "SELECT t.id, t.recipient, t.ts, t.handled, t.lease_until, t.tombstone, "
-            "t.attempts FROM messages t "
+            "t.attempts, t.no_requeue FROM messages t "
             "WHERE t.sender=? AND t.msg_type='task' AND t.tombstone IS NULL "
             "ORDER BY t.id", (hub,)).fetchall()
         out = []
-        for rid, recipient, ts, handled, lease_until, tombstone, attempts in rows:
+        for rid, recipient, ts, handled, lease_until, tombstone, attempts, norq in rows:
             if task_done(conn, rid):
                 continue
-            st = task_state(conn, rid, recipient, handled, lease_until, tombstone)
+            st = task_state(conn, rid, recipient, handled, lease_until, tombstone,
+                            norq)
             out.append((rid, recipient, ts, st, attempts))
         return out
 
 
 _ARCHIVE_THRESHOLD = 300   # start trimming once the table exceeds this many rows
 _ARCHIVE_KEEP = 150        # rows always kept (same guard as `archive --keep`)
+
+# Shared delete condition for archive()/_auto_archive so the two can't drift.
+# handled=1 normally means history, but an UNRESOLVED --no-requeue task is
+# handled=1 too (the fail-closed claim stays in place while it awaits review) —
+# active work, never archivable. The NOT EXISTS mirrors task_done()'s
+# reply/ack predicate in SQL (kept adjacent by this comment: change both
+# together) so a RESOLVED no-requeue task does age out normally.
+_ARCHIVE_DELETE = (
+    "DELETE FROM messages WHERE (handled=1 OR tombstone IS NOT NULL) AND id<=? "
+    "AND NOT (no_requeue=1 AND tombstone IS NULL AND msg_type='task' "
+    "AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.in_reply_to=messages.id "
+    "AND r.msg_type IN ('reply','ack')))"
+)
 
 
 def _auto_archive(conn, threshold=_ARCHIVE_THRESHOLD, keep=_ARCHIVE_KEEP):
@@ -553,9 +632,7 @@ def _auto_archive(conn, threshold=_ARCHIVE_THRESHOLD, keep=_ARCHIVE_KEEP):
         "SELECT id FROM messages ORDER BY id DESC LIMIT 1 OFFSET ?", (keep,)
     ).fetchone()
     if row:
-        conn.execute(
-            "DELETE FROM messages WHERE (handled=1 OR tombstone IS NOT NULL) "
-            "AND id<=?", (row[0],))
+        conn.execute(_ARCHIVE_DELETE, (row[0],))
 
 
 def _reap_stale(conn, me=None, hub=None):
@@ -579,28 +656,39 @@ def _reap_stale(conn, me=None, hub=None):
     Requeue drops lease_until -> NULL only transiently: the next claim resets it
     to claim-time + lease_secs (see _claim_one/recv), so a retried --lease task
     runs under a FRESH hard ceiling instead of the old pre-expired one. For
-    non-idempotent tasks still use --max-attempts 1 (first stick -> failed).
+    non-idempotent tasks use send --no-requeue (stale claim parks as NEEDS-REVIEW,
+    never auto-requeued; there is no per-message --max-attempts flag).
     Finishes with the lazy auto-archive (size-gated) so the DB self-trims
     without a maintenance cron."""
     if me is not None:
         rows = conn.execute(
-            "SELECT id, recipient, lease_until, attempts FROM messages "
+            "SELECT id, recipient, lease_until, attempts, no_requeue FROM messages "
             "WHERE recipient=? AND handled=1 AND tombstone IS NULL "
             "AND msg_type='task'", (me,)).fetchall()
     elif hub is not None:
         rows = conn.execute(
-            "SELECT id, recipient, lease_until, attempts FROM messages "
+            "SELECT id, recipient, lease_until, attempts, no_requeue FROM messages "
             "WHERE sender=? AND handled=1 AND tombstone IS NULL "
             "AND msg_type='task'", (hub,)).fetchall()
     else:
         rows = conn.execute(
-            "SELECT id, recipient, lease_until, attempts FROM messages "
+            "SELECT id, recipient, lease_until, attempts, no_requeue FROM messages "
             "WHERE handled=1 AND tombstone IS NULL AND msg_type='task'").fetchall()
-    requeued, failed = [], []
-    for rid, recipient, lease_until, attempts in rows:
+    requeued, failed, review = [], [], []
+    for rid, recipient, lease_until, attempts, norq in rows:
         if task_done(conn, rid):
             continue
         if _lease_alive(recipient, lease_until):
+            continue
+        if norq:
+            # Fail-closed (--no-requeue): NEVER auto-requeue or auto-fail a
+            # non-idempotent task on a stale lease — a phantom second run (or a
+            # premature 'failed' while the worker is still mid-write) is worse
+            # than waiting. The claim stays in place; pending shows NEEDS-REVIEW
+            # until the hub cancels or the worker done/fail/ack-revives it.
+            # (tutti issue-execution.md: ambiguous identity is fail-closed —
+            # 'the Run remains running and reconciliation is scheduled'.)
+            review.append(rid)
             continue
         if attempts < MAX_ATTEMPTS:
             conn.execute("UPDATE messages SET handled=0, lease_until=NULL WHERE id=?", (rid,))
@@ -609,7 +697,7 @@ def _reap_stale(conn, me=None, hub=None):
             conn.execute("UPDATE messages SET tombstone='failed' WHERE id=?", (rid,))
             failed.append(rid)
     _auto_archive(conn)
-    return requeued, failed
+    return requeued, failed, review
 
 
 def recv(me):
@@ -633,7 +721,7 @@ def recv(me):
             "lease_until=CASE WHEN lease_secs IS NULL THEN lease_until "
             "ELSE ? + lease_secs END "
             "WHERE recipient=? AND handled=0 "
-            "RETURNING id, ts, sender, body",
+            "RETURNING id, ts, sender, body, msg_type, in_reply_to, session",
             (time.time(), me),
         ).fetchall()
         # Done-drop: claimed (handled=1, so archive can sweep it) but not handed
@@ -643,7 +731,7 @@ def recv(me):
     return sorted(rows, key=lambda r: r[0])  # RETURNING order is unspecified
 
 
-def recv_block(me, timeout, interval, count=1):
+def recv_block(me, timeout, interval, count=1, keep_heartbeat=False):
     """Like recv(), but if fewer than `count` messages are waiting, poll until
     `count` messages for `me` have arrived (accumulated across polls) or
     `timeout` seconds elapse. Returns the rows (fewer than `count`, possibly
@@ -680,13 +768,30 @@ def recv_block(me, timeout, interval, count=1):
             # Sleep, but never overshoot the deadline.
             time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
     finally:
-        # Best-effort cleanup on normal exit/timeout so the heartbeat goes stale
-        # immediately rather than waiting out max_age. A killed watcher skips
-        # this, but staleness still ages it out.
-        try:
-            os.remove(_heartbeat_path(me))
-        except OSError:
-            pass
+        if keep_heartbeat:
+            # Smooth handoff for a supervisor that re-arms recv immediately (the
+            # Codex receiver loop: it can only start the next recv AFTER this one
+            # returns). Deleting the beat here opens a TOCTOU window in which
+            # status --watch reports DOWN, ipc_role reports DORMANT, and
+            # send --require-watcher REFUSES a worker that is in fact alive.
+            # Measured on the Codex bridge (2026-07-28, 10ms sampling): the
+            # re-arm gap runs 2.7-5.6s (median 3.7s), i.e. seconds, not
+            # sub-second — well inside max_age but far too long to sample past.
+            # Refreshing AT the return boundary (rather than merely skipping the
+            # delete) hands the successor a full max_age window instead of
+            # whatever was left of the last ordinary beat.
+            # Failure mode is bounded and already part of the protocol: if the
+            # supervisor dies right here, this beat ages out under the same
+            # max_age as a watcher killed immediately after its last beat.
+            _beat(me)
+        else:
+            # Best-effort cleanup on normal exit/timeout so the heartbeat goes
+            # stale immediately rather than waiting out max_age. A killed watcher
+            # skips this, but staleness still ages it out.
+            try:
+                os.remove(_heartbeat_path(me))
+            except OSError:
+                pass
 
 
 def _bump_gen(conn, role):
@@ -710,6 +815,62 @@ def _current_gen(conn, role):
         "SELECT gen FROM watcher_gen WHERE role=?", (role,)
     ).fetchone()
     return row[0] if row else 0
+
+
+# Liveness anchors (#4, orphan prevention): a watcher must die with whatever
+# launched it. Harness-managed watchers are killed by the Monitor, and a NEW
+# same-role watcher retires the old one via gen tokens — but a manually launched
+# watcher whose role nobody re-takes had NO anchor and could squat "live" for
+# days (seen 2026-07-03: a bare `watch --me A` beat for 20h after its purpose
+# ended). Two cheap per-poll checks close that class:
+#   * parent death — at startup grab a SYNCHRONIZE handle to the parent process
+#     (the handle pins the process object, immune to PID reuse); each poll a
+#     0-timeout wait tells us if it exited. POSIX fallback: getppid() changed
+#     (reparented to init/subreaper). Parent gone -> retire.
+#   * registry owner change — snapshot this role's owner in ipc_roles.json at
+#     startup; if a later poll sees a DIFFERENT owner (another session took the
+#     role, or SessionEnd released it), this watcher is obsolete -> retire.
+#     Read errors return _REG_ERR and skip the check (never retire on a
+#     transient failure; missing registry = anchor off).
+
+_REG_ERR = object()  # sentinel: registry unreadable this poll (skip, don't retire)
+
+_WAIT_OBJECT_0 = 0
+_SYNCHRONIZE = 0x00100000
+
+
+def _parent_anchor():
+    """(handle, ppid) pinning the parent process for death-detection.
+    Windows: a SYNCHRONIZE handle (or None if OpenProcess failed -> anchor off).
+    POSIX: (None, ppid) — death detected by getppid() changing."""
+    ppid = os.getppid()
+    if os.name != "nt":
+        return None, ppid
+    import ctypes
+    h = ctypes.windll.kernel32.OpenProcess(_SYNCHRONIZE, False, ppid)
+    return (h or None), ppid
+
+
+def _parent_dead(handle, start_ppid):
+    """Has the process that launched us exited?"""
+    if os.name == "nt":
+        if handle is None:
+            return False  # couldn't pin the parent; anchor off, never false-fire
+        import ctypes
+        return (ctypes.windll.kernel32.WaitForSingleObject(handle, 0)
+                == _WAIT_OBJECT_0)
+    return os.getppid() != start_ppid
+
+
+def _registry_owner(role):
+    """session_id owning `role` in the registry: a string, None (unclaimed /
+    role absent), or _REG_ERR (registry unreadable — treat as no-signal)."""
+    try:
+        with open(_REGISTRY, encoding="utf-8") as f:
+            v = json.load(f).get(role)
+        return v.get("session_id") if isinstance(v, dict) else None
+    except (OSError, ValueError):
+        return _REG_ERR
 
 
 def watch(me, interval):
@@ -761,7 +922,13 @@ def watch(me, interval):
     stops touching it and the new watcher's _beat owns its mtime."""
     with _conn() as conn:
         my_gen = _bump_gen(conn, me)
-    print(f"WATCHER #{my_gen} for {me} online", flush=True)
+    parent_h, parent_pid = _parent_anchor()
+    owner0 = _registry_owner(me)  # snapshot; owner drift => this watcher is obsolete
+    anchors = (
+        f"anchors: parent={'on' if (parent_h or os.name != 'nt') else 'off'}, "
+        f"registry={'off' if owner0 is _REG_ERR else 'on'}"
+    )
+    print(f"WATCHER #{my_gen} for {me} online ({anchors})", flush=True)
     while True:
         try:
             with _conn() as conn:
@@ -773,6 +940,22 @@ def watch(me, interval):
                         flush=True,
                     )
                     return  # clean exit; the Monitor task ends — no orphan black hole
+                if _parent_dead(parent_h, parent_pid):
+                    print(
+                        f"WATCHER for {me} retired: parent process gone "
+                        f"(was #{my_gen})",
+                        flush=True,
+                    )
+                    return
+                owner = _registry_owner(me)
+                if (owner0 is not _REG_ERR and owner is not _REG_ERR
+                        and owner != owner0):
+                    print(
+                        f"WATCHER for {me} retired: registry owner changed "
+                        f"{owner0!r} -> {owner!r} (was #{my_gen})",
+                        flush=True,
+                    )
+                    return
                 _beat(me)
                 _reap_stale(conn, me=me)  # re-expose this worker's orphaned claims first
                 while True:
@@ -831,7 +1014,7 @@ def peek(me, tail):
     with _conn() as conn:
         rows = conn.execute(
             "SELECT id, ts, sender, recipient, body, handled, msg_type, "
-            "in_reply_to FROM messages "
+            "in_reply_to, session FROM messages "
             "WHERE recipient=? OR sender=? ORDER BY id DESC LIMIT ?",
             (me, me, tail),
         ).fetchall()
@@ -842,16 +1025,15 @@ def archive(keep):
     """Delete terminal/handled messages except the most recent `keep` rows.
     Condition is (handled=1 OR tombstone IS NOT NULL) so failed/cancelled rows are
     reaped even when handled=1; requeued rows (handled=0, tombstone NULL) are
-    protected — they're active work, not history. R2 line."""
+    protected — they're active work, not history. R2 line. Unresolved
+    --no-requeue tasks are likewise protected (see _ARCHIVE_DELETE): their claim
+    is handled=1 by design while they await review, but they're active work."""
     with _conn() as conn:
         row = conn.execute(
             "SELECT id FROM messages ORDER BY id DESC LIMIT 1 OFFSET ?", (keep,)
         ).fetchone()
         if row:
-            conn.execute(
-                "DELETE FROM messages WHERE (handled=1 OR tombstone IS NOT NULL) "
-                "AND id<=?", (row[0],)
-            )
+            conn.execute(_ARCHIVE_DELETE, (row[0],))
             return conn.total_changes
     return 0
 
@@ -888,6 +1070,16 @@ def main():
                    help="hard lease seconds from send time; 0=pure-heartbeat lease "
                         f"(default {DEFAULT_LEASE}). Two independent staleness "
                         "signals: heartbeat-death vs lease-ceiling (stuck).")
+    s.add_argument("--submit-id", dest="submit_id", default=None,
+                   help="idempotency key scoped to (sender, recipient): a resend "
+                        "with the same key reuses the existing row (prints DUP) "
+                        "instead of queuing a duplicate. Makes re-dispatch after "
+                        "a barrier timeout safe. cancel/fail re-opens the key.")
+    s.add_argument("--no-requeue", dest="no_requeue", action="store_true",
+                   help="fail-closed task: on a dead lease the reaper neither "
+                        "requeues nor fails it — it parks as NEEDS-REVIEW in "
+                        "pending until the hub cancels or the worker "
+                        "done/fail/ack-revives it. Use for non-idempotent work.")
 
     r = sub.add_parser("recv")
     r.add_argument("--me", required=True)
@@ -897,12 +1089,26 @@ def main():
                    help="max seconds to wait in --block mode (stay under bash's 600s cap)")
     r.add_argument("--interval", type=float, default=2.0,
                    help="seconds between polls in --block mode")
+    r.add_argument("--keep-heartbeat", action="store_true",
+                   help="on return, refresh the heartbeat instead of deleting it, "
+                        "so a supervisor that immediately re-arms recv does not "
+                        "flicker to DOWN/DORMANT in between. ONLY use it when the "
+                        "caller really does re-arm at once (the Codex receiver "
+                        "loop); a bare one-shot recv must NOT set it, or the role "
+                        "reads alive for up to max_age after you stopped listening.")
     r.add_argument("--count", type=int, default=1,
                    help="BARRIER: in --block mode, wait until this many messages "
                         "have arrived (accumulated) before returning. Use after a "
                         "fan-out (--to B,C,D) so one blocking call collects all N "
                         "replies; the tally lives in the process, not across A's "
                         "context. On timeout returns however many arrived (k<N).")
+    r.add_argument("--json", action="store_true",
+                   help="emit one JSON envelope per message (NDJSON) instead of "
+                        "the plain text line: id/ts/from/type/task/session/body. "
+                        "type is the machine-readable outcome (reply|ack|fail|"
+                        "task|note); task echoes the in_reply_to link; session "
+                        "identifies the sender session (differs from the task's "
+                        "claimant => the worker /clear-ed, context is gone).")
 
     w = sub.add_parser("watch")
     w.add_argument("--me", required=True)
@@ -914,6 +1120,9 @@ def main():
     k = sub.add_parser("peek")
     k.add_argument("--me", required=True)
     k.add_argument("--tail", type=int, default=5)
+    k.add_argument("--json", action="store_true",
+                   help="emit one JSON envelope per message (NDJSON): "
+                        "id/ts/from/to/type/task/session/unread/body")
 
     a = sub.add_parser("archive")
     a.add_argument("--keep", type=int, default=50)
@@ -930,6 +1139,10 @@ def main():
                     help=f"hub whose outstanding dispatches to list (default {HUB})")
     pd.add_argument("--detail", action="store_true",
                     help="show attempts per task alongside the lifecycle state")
+    pd.add_argument("--json", action="store_true",
+                    help="emit one JSON envelope per outstanding task (NDJSON): "
+                         "id/to/ts/state/attempts — state is machine-readable "
+                         "(QUEUED|IN_PROGRESS|STALE|NEEDS-REVIEW|...)")
 
     # --- task lifecycle verbs (core round: lifecycle + weak-rollback lease) ---
     ak = sub.add_parser("ack",
@@ -991,11 +1204,19 @@ def main():
         any_refused = False
         for tgt in targets:
             try:
-                mid = send(args.sender, tgt, args.body,
-                           in_reply_to=args.in_reply_to, msg_type=args.msg_type,
-                           require_watcher=args.require_watcher, max_age=args.max_age,
-                           lease=args.lease)
-                print(f"SENT #{mid}  {args.sender}->{tgt}")
+                mid, created = send(
+                    args.sender, tgt, args.body,
+                    in_reply_to=args.in_reply_to, msg_type=args.msg_type,
+                    require_watcher=args.require_watcher, max_age=args.max_age,
+                    lease=args.lease, submit_id=args.submit_id,
+                    no_requeue=args.no_requeue)
+                if created:
+                    print(f"SENT #{mid}  {args.sender}->{tgt}")
+                else:
+                    print(f"DUP #{mid}  {args.sender}->{tgt}  "
+                          f"(submit-id {args.submit_id!r} already queued/answered; "
+                          f"not re-queued — check `pending`, or cancel/fail #{mid} "
+                          f"first to force a true retry)")
             except StarViolation as e:
                 any_refused = True
                 print(f"REJECTED  {e}")
@@ -1012,11 +1233,13 @@ def main():
     elif args.cmd == "recv":
         _require_valid(args.me, "--me")
         if args.block:
-            rows = recv_block(args.me, args.timeout, args.interval, args.count)
+            rows = recv_block(args.me, args.timeout, args.interval, args.count,
+                              keep_heartbeat=args.keep_heartbeat)
         else:
             rows = recv(args.me)
         if not rows:
-            print("NONE (timeout)" if args.block else "NONE")
+            if not args.json:  # --json: empty output = nothing; exit code unchanged
+                print("NONE (timeout)" if args.block else "NONE")
             if args.block:
                 # Two-state exit code for the backgrounded watcher: exit 2 on an
                 # empty timeout, exit 0 when messages were returned (the else
@@ -1031,8 +1254,14 @@ def main():
                 # barrier could add exit 4; 3 stays reserved for send REFUSED.)
                 sys.exit(2)
         else:
-            for mid, ts, sender, body in rows:
-                print(f"#{mid} [{ts}] {sender}: {body}")
+            for mid, ts, sender, body, mtype, irt, sess in rows:
+                if args.json:
+                    print(json.dumps(
+                        {"id": mid, "ts": ts, "from": sender, "type": mtype,
+                         "task": irt, "session": sess, "body": body},
+                        ensure_ascii=False))
+                else:
+                    print(f"#{mid} [{ts}] {sender}: {body}")
     elif args.cmd == "watch":
         _require_valid(args.me, "--me")
         watch(args.me, args.interval)  # never returns; Monitor owns the lifetime
@@ -1040,9 +1269,18 @@ def main():
         _require_valid(args.me, "--me")
         rows = peek(args.me, args.tail)
         if not rows:
-            print("NONE")
+            if not args.json:
+                print("NONE")
         else:
-            for mid, ts, sender, recipient, body, handled, mtype, in_reply_to in rows:
+            for (mid, ts, sender, recipient, body, handled, mtype, in_reply_to,
+                 sess) in rows:
+                if args.json:
+                    print(json.dumps(
+                        {"id": mid, "ts": ts, "from": sender, "to": recipient,
+                         "type": mtype, "task": in_reply_to, "session": sess,
+                         "unread": not handled, "body": body},
+                        ensure_ascii=False))
+                    continue
                 flag = "" if handled else "  (unread)"
                 # A bodyless done-ack is a lifecycle marker; show what it marks
                 # instead of a blank body. Display-layer only.
@@ -1067,10 +1305,16 @@ def main():
         _require_valid(args.hub, "--hub")
         rows = pending(args.hub)
         if not rows:
-            print(f"NONE  (every task {args.hub} dispatched is done/cancelled/failed "
-                  f"— fan-out complete)")
+            if not args.json:
+                print(f"NONE  (every task {args.hub} dispatched is done/cancelled/"
+                      f"failed — fan-out complete)")
         else:
             for tid, recipient, ts, state, attempts in rows:
+                if args.json:
+                    print(json.dumps(
+                        {"id": tid, "to": recipient, "ts": ts, "state": state,
+                         "attempts": attempts}, ensure_ascii=False))
+                    continue
                 line = f"#{tid} [{ts}] {args.hub}->{recipient}  [{state}]"
                 if args.detail:
                     line += f"  attempts={attempts}"
@@ -1167,18 +1411,18 @@ def main():
         if args.me:
             _require_valid(args.me, "--me")
             with _conn() as conn:
-                rq, fl = _reap_stale(conn, me=args.me)
+                rq, fl, rv = _reap_stale(conn, me=args.me)
         elif args.hub:
             _require_valid(args.hub, "--hub")
             with _conn() as conn:
-                rq, fl = _reap_stale(conn, hub=args.hub)
+                rq, fl, rv = _reap_stale(conn, hub=args.hub)
         else:
             with _conn() as conn:
-                rq, fl = _reap_stale(conn)
-        if not rq and not fl:
+                rq, fl, rv = _reap_stale(conn)
+        if not rq and not fl and not rv:
             print("REAP  nothing stale")
         else:
-            print(f"REAP  requeued={rq}  failed={fl}")
+            print(f"REAP  requeued={rq}  failed={fl}  needs-review={rv}")
 
 
 if __name__ == "__main__":

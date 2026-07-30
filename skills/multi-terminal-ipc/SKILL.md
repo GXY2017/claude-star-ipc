@@ -60,7 +60,7 @@ the opt-in gate file. One command creates it, with guards:
 
 ```
 cd <the new project root>
-python "~/.claude/ipc/ipc_role.py" enable
+python ~/.claude/ipc/ipc_role.py enable   # write the expanded path on Windows/PowerShell — a quoted "~" is never expanded
 ```
 
 `enable` validates the user-level install (ipc.py importable, claim hook
@@ -112,11 +112,16 @@ ipc.py send --from A --to B,C "task"                  # fan out (one row each)
 ipc.py send --from A --to ALL "task"                  # broadcast to every live worker
 ipc.py send --from A --to B --body-file task.md       # body from file — REQUIRED for bodies with backticks/$()/quotes (shell mangles them)
 ipc.py send --from A --to B "task" --require-watcher  # refuse (exit 3), don't queue, if B's watcher isn't parked
+ipc.py send --from A --to B "task" --submit-id fx7    # idempotency key: a resend with the same key prints DUP and reuses the row — re-dispatch after a barrier timeout is SAFE
+ipc.py send --from A --to B "task" --no-requeue       # fail-closed non-idempotent task: stale lease parks as NEEDS-REVIEW (never auto-requeued/auto-failed)
 ipc.py recv --me A                                    # take unread replies (NONE = nothing yet)
 ipc.py recv --me A --block                            # block until a reply arrives
 ipc.py recv --me A --block --count 3                  # BARRIER: after fanning to 3, wait for all 3
+ipc.py recv --me A --json                             # NDJSON envelopes {id,ts,from,type,task,session,body}: type is the machine-readable outcome (reply|ack|fail), task echoes in_reply_to, session identifies the sender session — reply session ≠ the task claimant's => that worker /clear-ed, its context is gone, re-brief before a follow-up (grok-build envelope + sessionId-echo ideas)
 ipc.py peek --me A --tail 5                            # review last 5 WITHOUT marking read
+ipc.py peek --me A --tail 5 --json                     # same, as NDJSON (adds to/unread fields)
 ipc.py pending --hub A [--detail]                     # tasks dispatched with no reply yet (empty = done)
+ipc.py pending --hub A --json                         # NDJSON {id,to,ts,state,attempts} — state machine-readable (QUEUED|IN_PROGRESS|STALE|NEEDS-REVIEW); empty --json output = fan-out complete
 ipc.py cancel --task N --by A                          # retract a dispatched task
 ```
 
@@ -129,11 +134,11 @@ ipc.py ack  --me B [--task N]       # extend lease on a long task (no --task = a
 ipc.py fail --me B --task N [--reason ...]   # mark failed (won't requeue)
 ```
 
-### Role registry (`.claude/hooks/ipc_role.py` or `~/.claude/ipc/ipc_role.py`)
+### Role registry (`~/.claude/ipc/ipc_role.py`; legacy project-local installs used `.claude/hooks/ipc_role.py`)
 ```
 ipc_role.py status                 # reconciled view: ownership × heartbeat liveness
 ipc_role.py take A --session <sid> # (re)assign a role to this session
-ipc_role.py reclaim-dead           # free slots whose watcher heartbeat is gone
+ipc_role.py reclaim-dead           # free WORKER slots whose watcher heartbeat is gone (hub exempt — watcher-less by design; blind-safe. Rarely needed: claim() sweeps all ghost slots on every SessionStart)
 ipc.py status --watch B            # is B's watcher parked right now? ALIVE(0)/DOWN(1) + pid/session
 ```
 
@@ -145,8 +150,12 @@ worker claims the row, so queue wait doesn't eat the runway and a requeued task
 retries under a fresh ceiling). A stale claimed task — worker's heartbeat dies
 (process gone) **or** the hard lease ceiling passes (alive-but-stuck) — is lazily
 **requeued** by a reaper (runs inside recv/watch/pending) and re-delivered, or
-marked `failed` after `--max-attempts` (default 3, a `pending`/reaper concept —
-**not** a `send` flag). Requeued rows that already have a reply/ack are
+marked `failed` once `attempts` hits the requeue cap (`MAX_ATTEMPTS`, default 3 —
+a module-level constant in `ipc.py`, overridable only per-process via env
+`IPC_MAX_ATTEMPTS`; there is **no** per-message flag). A `--no-requeue` task is exempt from both outcomes:
+its stale claim parks as **NEEDS-REVIEW** in `pending` (fail-closed) until the
+hub `cancel`s or the worker `done`/`fail`s it (`ack` revives it to
+IN_PROGRESS); unresolved NEEDS-REVIEW rows are also never auto-archived. Requeued rows that already have a reply/ack are
 **done-dropped at claim** (claimed silently, never redelivered), so a phantom
 requeue can't make a worker redo finished work. The mailbox also self-trims:
 past 300 rows, handled/terminal history is lazily archived inside
@@ -199,13 +208,16 @@ watcher, **not** re-claim the role.
    task or the 1800s ceiling reaps it as "stuck" — `ack` also beats the heartbeat,
    so it is the keep-alive for a watcher-less worker mid-task (bash-fallback mode,
    whose heartbeat dies the moment a task is delivered). For a **non-idempotent**
-   task, A should keep attempts to 1 (via the reaper's `--max-attempts`, not on
-   `send`).
+   task, A dispatches with `--no-requeue`: a stale claim then parks as
+   NEEDS-REVIEW instead of being auto-requeued or auto-failed — A decides
+   (cancel / probe the worker), the reaper never re-runs it.
 7. **Synthesis stays with A.** Reconciliation, coverage check, final call are the
    hub's. On a barrier timeout returning k<N, diff senders got vs dispatched-to,
    probe the absent (`status --watch X`), re-dispatch ≤2 tries, then `log` the
-   slice failed. **Don't blind-re-dispatch on timeout** — a second copy of a
-   non-idempotent task running in parallel is worse than waiting.
+   slice failed. **Dispatch with `--submit-id` so re-dispatch is idempotent** —
+   a resend with the same key prints DUP and reuses the queued row instead of
+   double-running; without a key, don't blind-re-dispatch a non-idempotent task
+   (a second parallel copy is worse than waiting).
 8. **Fold bare acks into substantive replies.** Don't send a message just to say
    "收到" — save tokens.
 9. **Cross-vendor is the point, but the invariant is in code, not prose.** Don't
@@ -215,15 +227,18 @@ watcher, **not** re-claim the role.
 
 ## Deployment topologies (where state lives)
 
-- **Project-local install** (state IN the project): `ipc.py` at project root,
+- **User-level shared install (CURRENT default)**: machinery once at
+  `~/.claude/ipc/`, per-project state (mailbox, registry, heartbeats) under
+  `~/.claude/projects/<encoded-cwd>/ipc/`, opt-in via `.claude/ipc.enabled`.
+- **Project-local install (LEGACY — superseded)**: `ipc.py` at project root,
   role hook `.claude/hooks/ipc_role.py`, mailbox `./_ipc.db` (+ `-wal`/`-shm`),
   registry `.claude/ipc_roles.json`, heartbeats `_watcher_*.alive` — all
   co-located. SessionStart claim is the project-local hook; the user-level global
   hook auto-defers (`_is_redundant_global`), so no double-claim. Two terminals
-  share this mailbox iff both cwd = project root.
-- **User-level shared install**: state under `~/.claude/ipc/`. Migrate between the
-  two with the project's `migrate_ipc.py`; never rename/move a whole state
-  directory by hand.
+  share this mailbox iff both cwd = project root. Migrate a legacy project to
+  user-level with `migrate_ipc.py` (already run everywhere here; archived under
+  `_archive/2026-07-02-ipc/` in the origin repo); never rename/move a whole
+  state directory by hand.
 
 Confirm which topology a project uses from its `CLAUDE.md` Deployment note before
 assuming where `_ipc.db` and the registry live.

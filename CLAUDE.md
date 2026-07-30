@@ -16,13 +16,13 @@
 > sqlite DB is resolved by the launch cwd — each enabled project gets its own
 > mailbox under `~/.claude/projects/<encoded-cwd>/ipc/`, so two terminals share a
 > mailbox iff they launch from the same project root. A project opts in with a gate
-> file `.claude/ipc.enabled` (present in this project); the global SessionStart hook
+> file `.claude/ipc.enabled`; the global SessionStart hook
 > only claims a role when that gate exists. Install the user-level machinery once
 > with `python install_user.py`; migrate a legacy in-project mailbox with
-> `migrate_ipc.py`. (The old per-project installer `install_ipc.py`, which copied
-> `ipc.py` into each project root, is the LEGACY local-install topology — superseded
-> and archived under `_archive/`.) In the command examples below, `ipc.py` is
-> shorthand for `python ~/.claude/ipc/ipc.py`.
+> `migrate_ipc.py`. (The old per-project installer
+> `install_ipc.py`, which copied `ipc.py` into each project root, is the LEGACY
+> local-install topology — superseded and archived under `_archive/`.) In the command
+> examples below, `ipc.py` is shorthand for `python ~/.claude/ipc/ipc.py`.
 
 ## Multi-Terminal IPC Protocol (star topology)
 
@@ -57,7 +57,7 @@ Confirm the cwd matches, and that `.claude/ipc.enabled` exists (the opt-in gate)
 before opening a terminal. (This section onward is path-agnostic and applies to any
 opted-in project; enable a new project with `python ~/.claude/ipc/ipc_role.py enable`
 run from its root — validates the install, refuses the home dir, creates the
-`.claude/ipc.enabled` gate — after the one-time `python install_user.py`.)
+`.claude/ipc.enabled` gate; the user-level machinery is already installed.)
 
 **Fixed master/worker roles, to avoid echo loops:**
 - **A = master terminal (hub)**: initiator/decider. Only A decides whether to
@@ -70,8 +70,10 @@ run from its root — validates the install, refuses the home dir, creates the
 python ipc.py send --from A --to B "msg"      # send to one worker
 python ipc.py send --from A --to B,C "task"   # fan out to several workers (one row each, independent read-flags)
 python ipc.py send --from A --to ALL "task"   # broadcast to every live worker (claimed roles except A)
-python ipc.py send --from A --to B --body-file task.md   # body from file — REQUIRED for bodies with backticks/$()/quotes (the shell would mangle/execute them)
+python ipc.py send --from A --to B --body-file task.md   # body from file — REQUIRED for bodies with backticks/$()/quotes (shell would mangle/execute them; see memory ipc-send-backtick-trap)
 python ipc.py send --from A --to B "task" --require-watcher  # refuse (exit 3) & don't queue if the recipient's watcher isn't parked (with several recipients: judged per-recipient — live ones queued, dead ones refused, exit 3 if any refused)
+python ipc.py send --from A --to B "task" --no-requeue     # fail-closed: a dead lease parks the row as NEEDS-REVIEW in pending instead of requeueing — use for NON-IDEMPOTENT work (writes/sends), see lifecycle below
+python ipc.py send --from A --to B "task" --submit-id K    # idempotency key scoped to (sender,recipient): resending the same key reuses the existing row (prints DUP) instead of duplicating — makes re-dispatch after a barrier timeout safe; cancel/fail reopens the key
 python ipc.py status --watch B                # is B's watcher parked? ALIVE(exit 0)/DOWN(exit 1)
 python ipc.py recv --me B                     # take NEW unread messages addressed to me, mark them read
 python ipc.py recv --me A --block             # block until a new message arrives (prints NONE (timeout) on timeout)
@@ -80,16 +82,19 @@ python ipc.py peek --me A --tail 5            # view the last 5 without marking 
 python ipc.py archive --keep 50               # trim old read messages, keep the most recent 50 (also auto-trims lazily once the table exceeds 300 rows, inside recv/watch/pending)
 python ipc.py pending --hub A                 # tasks A dispatched with NO reply yet (empty=fan-out complete); replaces counting replies by hand
 python ipc.py status --watch B                # now also prints pid/session of B's watcher (ghost-detectable)
+python ipc.py recv --me A --json              # NDJSON envelope per message {id,ts,from,type,task,session,body}: type (reply|ack|fail) = machine-readable outcome, task echoes in_reply_to, session = sender's CLAUDE_SESSION_ID — reply session ≠ the task claimant's => that worker /clear-ed in between, its context is gone, re-brief before a follow-up. Also on peek (--json adds to/unread) and pending (--json = {id,to,ts,state,attempts}). Empty --json output prints nothing; exit codes unchanged. (2026-07-30, grok-build headless-envelope + sessionId-echo ideas, see memory grok-build-evaluation)
 ```
 
-**Task lifecycle + weak rollback (2026-06-30; lease semantics updated 2026-07-02):**
+**Task lifecycle + weak rollback (2026-06-30, see memory `ipc-task-lifecycle-lease`):**
 a hub→worker message defaults to `msg_type='task'` carrying a **lease** (`--lease`
 seconds, default 1800, **counted from CLAIM time** — the lease is reset when the worker
 claims the row, so queue wait doesn't eat the runway and a requeued task retries under
 a fresh ceiling; `--lease 0` = pure heartbeat). A claimed task that goes stale —
 the worker's watcher heartbeat dies (process gone) **or** the hard lease ceiling falls
 (alive-but-stuck) — is lazily **requeued** by a reaper (runs inside recv/watch/pending)
-and re-delivered, or marked `failed` after `--max-attempts` (default 3). Verbs:
+and re-delivered, or marked `failed` once `attempts` hits the requeue cap (`MAX_ATTEMPTS`,
+default 3 — a **module-level constant** in `ipc.py`, overridable only per-process via env
+`IPC_MAX_ATTEMPTS`; there is **no** per-message `--max-attempts` flag). Verbs:
 ```
 python ipc.py done --me B --task N            # register task N done (bodyless ack reply)
 python ipc.py ack  --me B [--task N]          # extend the lease on a long task (no --task = renew all my claimed)
@@ -109,8 +114,10 @@ Two disciplines this lifecycle REQUIRES (a plain prose reply is no longer enough
   task call `ack --me <self>` periodically or the 1800s ceiling reaps it as "stuck" —
   `ack` also refreshes the heartbeat, so it keeps a watcher-less worker (bash-fallback
   mid-task) alive to the reaper too. For
-  a non-idempotent task A should dispatch with `--max-attempts 1` so a stuck one fails
-  instead of silently re-running.
+  a non-idempotent task A should dispatch with **`send --no-requeue`**: on a dead lease the
+  reaper neither requeues nor fails it — the row parks as **NEEDS-REVIEW** in `pending` until
+  the hub `cancel`s it or the worker `done`/`fail`/`ack`-revives it. That is fail-closed, so a
+  stuck non-idempotent task never silently re-runs.
 - **Workers start the watcher BEFORE doing any work.** The reaper AND-joins heartbeat
   with the lease ceiling, so work executed without a beating watcher reads as stale and
   gets requeued mid-flight. (Requeued-but-already-answered rows are done-dropped at claim
@@ -123,11 +130,11 @@ assignment is no longer pure launch-order roulette.
 IPC_ROLE=A claude ...                              # designate THIS window's role at launch (overrides launch order)
 python ~/.claude/ipc/ipc_role.py status           # reconciled view: registry ownership X heartbeat liveness (FREE/live/DORMANT/SQUATTER)
 python ~/.claude/ipc/ipc_role.py take A --session <sid>   # registry-level (re)assign a role to this session (what /main should call; evicts prior holder)
-python ~/.claude/ipc/ipc_role.py reclaim-dead     # free slots whose watcher heartbeat is gone (safer than reset; keeps live roles)
+python ~/.claude/ipc/ipc_role.py reclaim-dead     # free WORKER slots whose watcher heartbeat is gone (hub exempt — watcher-less by design; safe to run blind, 2026-07-03)
 ```
 `claim()` now reclaims a DORMANT slot (stale/absent heartbeat) instead of being
 blocked forever by a dead claim. Heartbeats carry `{ts,pid,session}` so a ghost
-watcher is identifiable.
+watcher is identifiable. See memory `ipc-role-assignment-fixes`.
 
 **Watcher liveness (heartbeat):** each poll of `recv --block` (default every 2s)
 touches a `_watcher_<me>.alive` heartbeat file, removed on exit/timeout; killed by
@@ -167,7 +174,9 @@ reply shouldn't be blocked even when A isn't watching).
    (`status --watch X`, or a `--require-watcher` ping) and re-dispatches — but cap
    re-dispatch (≤2 tries) and then `log` the slice as failed rather than looping.
    Don't blind-re-dispatch on timeout alone: a worker may just be slow, and a second
-   copy of a non-idempotent task running in parallel is worse than waiting (current
+   copy of a non-idempotent task running in parallel is worse than waiting — when you do
+   re-dispatch, reuse the original `--submit-id` so the resend collapses onto the same row
+   (prints `DUP`) instead of queueing a duplicate (current
    read-only data pulls are idempotent, so the risk is low — but keep it in mind if
    parallel work ever extends to writes). Synthesis (reconciliation, coverage check,
    final call) always stays with A, never delegated to workers.
@@ -204,9 +213,9 @@ the role, the same session reuses it), and injects that role's behavior (A = hub
 dispatch/synthesis; worker = start ONE persistent Monitor running `ipc.py watch --me
 <self>` **FIRST** — any queued backlog arrives as signals within seconds, no separate
 drain step, and watcher-first keeps the lease reaper off work that would otherwise run
-heartbeat-less; bash `recv --block` is the fallback, on which a mid-task worker should
-`ack --me <self>` every few minutes since ack also beats the heartbeat) as
-`additionalContext`.
+heartbeat-less — **[LOCAL TRIAL 2026-06-27]**; bash `recv --block` is the fallback, on
+which a mid-task worker should `ack --me <self>` every few minutes since ack now also
+beats the heartbeat) as `additionalContext`.
 
 > **Single-consumer is now CODE-ENFORCED (2026-06-28).** `recv`/`watch` claim each
 > row with one atomic `UPDATE ... RETURNING` under SQLite's write lock, so two
@@ -236,7 +245,7 @@ not re-claim the role — and `recv`/`watch` only need the `--me <role>` argumen
 registry. **Do NOT rely on a bare nudge after `/clear`** — observed (2026-06-28): a cleared
 worker comes back without acting on its role (the SessionStart hook does not reliably re-inject
 on `/clear`, and even if it did, the "manual floor" means a blank `ok` won't tell the worker
-what to do). **Recover explicitly:** run **`/ipc-recover B`** (a USER-LEVEL command installed to
+what to do). **Recover explicitly:** run **`/ipc-recover B`** (a USER-LEVEL command at
 `~/.claude/commands/ipc-recover.md`, available in every opted-in project; it takes the role as
 `$ARGUMENTS`, or reads it from any injected context; it starts the persistent Monitor
 `watch --me <role>` FIRST — backlog arrives as signals, read via `peek`). **孤儿盯哨现由代码处理,不靠语义提醒(2026-06-30 代际令牌):**

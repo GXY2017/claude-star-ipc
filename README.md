@@ -95,6 +95,22 @@ configurable via `IPC_HUB` (default `A`). Delivery to arbitrary *names* stays op
   which is exempt from the lease/reaper. Discipline: **workers start the watcher
   BEFORE doing any work** (backlog arrives as signals) — the reaper AND-joins
   heartbeat with the ceiling, so heartbeat-less work reads as stale.
+- **Idempotent dispatch + fail-closed tasks** — `send --submit-id K` makes
+  re-dispatch after a barrier timeout safe: the same key reuses the queued row
+  (prints `DUP`) instead of double-running, enforced by a partial UNIQUE index
+  (`cancel`/`fail` reopens the key). `send --no-requeue` marks non-idempotent work
+  fail-closed: a stale lease parks the task as `NEEDS-REVIEW` in `pending` — never
+  auto-requeued, never auto-failed — until the hub cancels or the worker
+  `done`/`fail`/`ack`-revives it. (Adopted from tutti's clientSubmitID +
+  fail-closed reconciliation ideas, 2026-07-26.)
+- **Machine-readable envelopes + session echo** — `recv`/`peek`/`pending --json`
+  emit NDJSON (`{id,ts,from,type,task,session,body}`; pending:
+  `{id,to,ts,state,attempts}`): `type` (`reply|ack|fail`) and `state` make outcomes
+  parseable without regexing prose, and every row carries the sender's
+  `CLAUDE_SESSION_ID` — a reply session that differs from the task claimant's means
+  the worker `/clear`-ed in between and its context is gone, so re-brief before a
+  follow-up. Plain-text output is unchanged. (Adopted from grok-build's headless
+  JSON envelope + sessionId echo, 2026-07-30.)
 - **Self-trimming mailbox** — past 300 rows, handled/terminal history is lazily
   archived inside `recv`/`watch`/`pending` (newest 150 kept); `archive --keep N`
   remains for manual trims.
