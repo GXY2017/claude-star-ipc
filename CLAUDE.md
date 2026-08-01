@@ -71,10 +71,10 @@ python ipc.py send --from A --to B "msg"      # send to one worker
 python ipc.py send --from A --to B,C "task"   # fan out to several workers (one row each, independent read-flags)
 python ipc.py send --from A --to ALL "task"   # broadcast to every live worker (claimed roles except A)
 python ipc.py send --from A --to B --body-file task.md   # body from file — REQUIRED for bodies with backticks/$()/quotes (shell would mangle/execute them; see memory ipc-send-backtick-trap)
-python ipc.py send --from A --to B "task" --require-watcher  # refuse (exit 3) & don't queue if the recipient's watcher isn't parked (with several recipients: judged per-recipient — live ones queued, dead ones refused, exit 3 if any refused)
+python ipc.py send --from A --to B "task" --require-watcher  # tri-state: watcher parked=SENT; not parked but busy heartbeat fresh (mid-task)=QUEUED-BUSY, queued for delivery when the worker finishes, exit 0; neither=REFUSED, not queued, exit 3 (several recipients: judged per-recipient, exit 3 if any refused)
 python ipc.py send --from A --to B "task" --no-requeue     # fail-closed: a dead lease parks the row as NEEDS-REVIEW in pending instead of requeueing — use for NON-IDEMPOTENT work (writes/sends), see lifecycle below
 python ipc.py send --from A --to B "task" --submit-id K    # idempotency key scoped to (sender,recipient): resending the same key reuses the existing row (prints DUP) instead of duplicating — makes re-dispatch after a barrier timeout safe; cancel/fail reopens the key
-python ipc.py status --watch B                # is B's watcher parked? ALIVE(exit 0)/DOWN(exit 1)
+python ipc.py status --watch B                # ALIVE(parked, exit 0) / BUSY(executing a claimed task, exit 1 — alive, don't re-dispatch) / DOWN(exit 1)
 python ipc.py recv --me B                     # take NEW unread messages addressed to me, mark them read
 python ipc.py recv --me A --block             # block until a new message arrives (prints NONE (timeout) on timeout)
 python ipc.py recv --me A --block --count 3   # BARRIER: after fanning out to 3 workers, one call blocks until all 3 reply (timeout returns the k<3 received)
@@ -118,11 +118,24 @@ Two disciplines this lifecycle REQUIRES (a plain prose reply is no longer enough
   reaper neither requeues nor fails it — the row parks as **NEEDS-REVIEW** in `pending` until
   the hub `cancel`s it or the worker `done`/`fail`/`ack`-revives it. That is fail-closed, so a
   stuck non-idempotent task never silently re-runs.
-- **Workers start the watcher BEFORE doing any work.** The reaper AND-joins heartbeat
-  with the lease ceiling, so work executed without a beating watcher reads as stale and
-  gets requeued mid-flight. (Requeued-but-already-answered rows are done-dropped at claim
-  — claimed silently, never redelivered — so the failure mode is bounded, but
-  watcher-first is still the discipline.)
+- **"Alive while working" is now CODE-GUARANTEED (heartbeat split, two files).** The
+  single `.alive` file used to answer two different questions — "is a consumer parked?"
+  and "is the worker alive?" — which are OPPOSITE states for a worker that is correctly
+  busy (the bash-fallback `recv --block` deletes the heartbeat on delivery). Now:
+  `_watcher_<X>.alive` = a consumer is parked; `_worker_<X>.busy` = the worker claimed a
+  task and is executing, beaten by a detached daemon that `recv` forks automatically at
+  CLAIM time and that exits at done/fail/cancel or the lease ceiling. The reaper's
+  liveness test is `alive OR busy` — workers no longer need to remember to `ack` for
+  liveness (cross-vendor workers' behaviour is exactly what can't be relied on). The hard
+  lease ceiling is unchanged and remains the only detector of alive-but-stuck.
+  `send --require-watcher` accepts a fresh busy heartbeat as liveness evidence too: the
+  message queues (printed `QUEUED-BUSY`, exit 0) and delivers when the worker next
+  parks/recvs — a mid-task worker is reachable for new dispatch instead of REFUSED.
+  Caveats: the reaper does NOT touch unclaimed rows, so a queued task waits for the
+  worker's next recv (visible in `pending` the whole time); `--type note` QUEUED-BUSY has
+  no tracking at all (notes are outside `pending` and the reaper) — fire-and-forget; an
+  orphan busy daemon whose session died can hold the gate open until its lease ceiling
+  falls (bounded, self-healing window).
 
 **Role registry management (`~/.claude/ipc/ipc_role.py`, 2026-06-28):** role
 assignment is no longer pure launch-order roulette.
@@ -143,9 +156,13 @@ actually listening right now — note the role registry (`ipc_roles.json`, under
 project's user-level mailbox dir `~/.claude/projects/<encoded-cwd>/ipc/`)
 **cannot** be used as the criterion (the role survives `/clear` while the watcher
 process is dead). **A always dispatches to a worker with `send --require-watcher`**:
-if the watcher isn't parked it is refused (exit 3) and not queued, avoiding sending a
-task into a black hole; on refusal, nudge that worker's window to re-park its watcher,
-then resend. A worker replies to A with plain `send` (no `--require-watcher` — A's
+if the worker is neither parked nor busy it is refused (exit 3) and not queued, avoiding
+sending a task into a black hole; a mid-task worker (busy heartbeat fresh) gets the
+message QUEUED (printed QUEUED-BUSY, exit 0) for delivery when it finishes and re-parks.
+Don't re-dispatch a QUEUED-BUSY task while the worker stays BUSY — the row is in the
+mailbox and visible in `pending`; if its busy beat expires without it ever re-parking,
+probe `status --watch X` and nudge its window. On refusal, nudge that worker's window to
+re-park its watcher, then resend. A worker replies to A with plain `send` (no `--require-watcher` — A's
 reply shouldn't be blocked even when A isn't watching).
 
 **Rules for Claude:**

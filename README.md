@@ -68,10 +68,15 @@ configurable via `IPC_HUB` (default `A`). Delivery to arbitrary *names* stays op
   stranded in a dead/cleared session can't keep claiming (black-holing) the inbox. *(The
   Monitor watcher is validated for surviving turns/compaction and for no-truncation;
   hours-long idle stability is not yet stress-tested.)*
-- **Heartbeat liveness** — a parked `--block` watcher touches `_watcher_<me>.alive`
-  every poll. `send --require-watcher` refuses to queue to a worker whose watcher
-  isn't live (so tasks never vanish into a dead mailbox). A registered role does
-  **not** prove liveness — staleness of the heartbeat file is the signal.
+- **Heartbeat liveness, split two ways** — a parked `--block` watcher touches
+  `_watcher_<me>.alive` every poll; claiming a task auto-forks a detached daemon that
+  beats `_worker_<me>.busy` until done/fail/cancel or the lease ceiling, so "alive
+  while working" is a code side-effect of taking work, not worker discipline.
+  `send --require-watcher` is tri-state: parked → SENT; mid-task (busy fresh) →
+  QUEUED-BUSY, queued for delivery when the worker finishes; neither → REFUSED, not
+  queued (tasks never vanish into a dead mailbox, and a busy worker stays reachable).
+  `status --watch X` reports ALIVE / BUSY / DOWN. A registered role does **not**
+  prove liveness — heartbeat freshness is the signal.
 - **Auto role assignment** — a `SessionStart` hook (`ipc_role.py`) claims the
   lowest free role (A, then B, C, D…), first-come-first-served, keyed by Claude's
   `session_id`, and injects that role's behavior as context. `/clear` keeps the

@@ -22,7 +22,7 @@ CLI:
                                              # per new message (never the body — avoids notification
                                              # truncation); read full content with `peek`. One long-lived
                                              # watcher, ~zero idle turns, survives turns/user input (TRIAL)
-    python ipc.py send --from A --to B "msg" --require-watcher  # refuse if B not listening
+    python ipc.py send --from A --to B "msg" --require-watcher  # refuse if B neither parked nor busy; QUEUED-BUSY if mid-task
     python ipc.py send --from A --to B "msg" --submit-id fx7    # idempotent: same key never double-queues (safe re-dispatch)
     python ipc.py send --from A --to B "msg" --no-requeue       # fail-closed: stale lease parks as NEEDS-REVIEW, never auto-requeued
     python ipc.py status --watch B           # is B's --block watcher parked? ALIVE/DOWN
@@ -56,6 +56,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -231,6 +232,224 @@ def watcher_identity(who):
         return None
 
 
+# ---- worker-busy heartbeat: "alive and executing a claimed task" ------------
+# Deliberately a SECOND file, not a reuse of _watcher_<who>.alive. The two answer
+# different questions, and for a worker that is correctly busy they are OPPOSITE
+# states:
+#   _watcher_<who>.alive : a consumer is PARKED, ready to receive new work
+#                          (gates send --require-watcher and --to ALL)
+#   _worker_<who>.busy   : the worker is ALIVE and executing a claimed task
+#                          (feeds the reaper's liveness test, _lease_alive)
+# Conflating them is what let a worker doing 11 minutes of real work read as dead
+# and have its in-flight task requeued underneath it (2026-07-31 incident: the
+# bash-fallback `recv --block` deletes the heartbeat on delivery, the worker acked
+# once and then executed heartbeat-less). The 2026-07-28 `--keep-heartbeat` patch
+# closed the narrow version of this seam (a sub-8s re-arm gap); this closes the
+# wide one (minutes of actual work).
+# require-watcher gates on .alive first; since 2026-08-01 a fresh .busy is an
+# accepted SECOND form of liveness evidence — the message is then QUEUED (printed
+# as QUEUED-BUSY) instead of refused, because the busy beater is code-forked at
+# claim and expires at done/fail/cancel/lease-ceiling, so it cannot lie about the
+# worker existing. Refusal (WatcherDown) is reserved for neither-parked-nor-busy:
+# no code-knowable evidence the recipient exists => still don't queue into a
+# black hole. (Previously busy ALSO refused, which made a mid-task worker
+# unreachable for new dispatch and forced the hub into poll-retry loops.)
+_BUSY_DAEMON_MAX = 4 * 3600  # runaway guard; the daemon normally exits far sooner
+_BUSY_POLL = 2.0
+# Freshness window for "is a beater already running?". MUST be a small multiple of
+# the poll interval, NOT the daemon lifetime: a beater that died (killed, machine
+# slept) leaves a stale .busy behind, and if this guard were generous the next
+# claim would decline to spawn a replacement while _lease_alive — which judges on
+# _LEASE_MARGIN, 24s — has long since called the worker dead. The task would then
+# be requeued with nothing beating for it. Two beaters racing into existence is
+# harmless (both beat the same file, both exit when the tasks close); a missing
+# beater is not, so this errs toward spawning.
+_BUSY_FRESH = 3 * _BUSY_POLL
+# Consecutive DB read failures after which the beater stops asserting liveness.
+# Beating through a transient lock is right; beating forever on the strength of an
+# error we cannot interpret is not — that would hide a dead worker indefinitely.
+_BUSY_DB_ERR_LIMIT = 5
+
+
+def _busy_path(who):
+    return os.path.join(_STATE_DIR, f"_worker_{who}.busy")
+
+
+def worker_busy(who, max_age):
+    """True if a busy-beater refreshed `who`'s task heartbeat within max_age."""
+    try:
+        return (time.time() - os.path.getmtime(_busy_path(who))) <= max_age
+    except OSError:
+        return False
+
+
+def _beat_busy(who):
+    """Refresh `who`'s busy heartbeat. Same JSON shape as _beat, separate file."""
+    try:
+        _ensure_state_dir()
+        with open(_busy_path(who), "w") as f:
+            f.write(json.dumps({
+                "ts": time.time(),
+                "pid": os.getpid(),
+                "session": os.environ.get("CLAUDE_SESSION_ID", ""),
+            }))
+    except OSError:
+        pass  # best-effort, exactly like _beat
+
+
+def _busy_identity(who):
+    """{'ts','pid','session'} of the process beating `who`'s busy heartbeat, or
+    None. Concurrent beaters can interleave writes here, so treat a malformed
+    payload as 'unknown pid' rather than an error — liveness itself never depends
+    on this file's CONTENT, only on its mtime (see worker_busy)."""
+    try:
+        with open(_busy_path(who)) as f:
+            d = json.loads(f.read().strip())
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _clear_busy(who):
+    try:
+        os.remove(_busy_path(who))
+    except OSError:
+        pass
+
+
+def _spawn_busy_beater(me):
+    """Detach a child that beats _worker_<me>.busy until `me` has no open claimed
+    task left. Spawned at CLAIM time by recv(), so liveness-while-working is a
+    CONSEQUENCE of taking the work rather than something the worker must remember
+    to do. That distinction is the whole point: this protocol exists to drive
+    workers on other vendors' harnesses, whose behaviour is precisely what cannot
+    be relied upon. No-op if a beater is already live for this role."""
+    if worker_busy(me, _BUSY_FRESH):
+        return
+    _beat_busy(me)  # take the slot synchronously; the child refreshes from here
+    argv = [sys.executable, os.path.abspath(__file__), "busy-daemon", "--me", me]
+    kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+          "stderr": subprocess.DEVNULL, "close_fds": True}
+    if os.name == "nt":
+        kw["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | NEW_GROUP
+    else:
+        kw["start_new_session"] = True
+    try:
+        subprocess.Popen(argv, **kw)
+    except OSError:
+        pass  # worst case we degrade to the pre-fix behaviour, never break recv
+
+
+def _busy_daemon(me):
+    """The detached beater. Beats while `me` holds work that is still within its
+    lease, and exits otherwise. Four exit conditions, each closing a distinct hole
+    found in worker B's review of the split (2026-07-31):
+
+    (a) no open claimed task           -> the worker finished (done/fail) or the
+        task was cancelled/requeued; stop looking busy within a poll or two.
+    (b) every open task's hard ceiling has already fallen (M2) -> the reaper has
+        judged them stale anyway, so continuing to beat would only disguise a DEAD
+        worker as a live one and delay redelivery. Bounds the orphan window to the
+        lease instead of to the runaway cap.
+    (c) runaway cap reached AND nothing has runway left (M1) -> the cap must NOT
+        kill a legitimately long task, so it is extended while some open task is
+        still inside its lease. Tasks sent with `--lease 0` (lease_until NULL)
+        have no runway to check and so stay bounded by the cap: that is the
+        deliberate trade-off, since an unbounded beater on a lease-less task is a
+        permanent black hole, which is strictly worse than a late requeue.
+    (d) the DB stays unreadable -> a transient lock must not false-kill live work,
+        but claiming liveness forever on the strength of an error is worse: after
+        _BUSY_DB_ERR_LIMIT consecutive failures we stop asserting it.
+
+    Ordering is beat -> evaluate -> sleep, and a quiescent round must be seen
+    TWICE before exiting (M3): a task claimed in the gap between "no open tasks"
+    and _clear_busy would otherwise find a still-fresh .busy, have its spawn
+    suppressed by the freshness guard, and end up with no beater at all."""
+    hard_cap = time.monotonic() + _BUSY_DAEMON_MAX
+    errors = 0
+    quiet_rounds = 0
+    try:
+        while True:
+            _beat_busy(me)  # beat FIRST: never leave a gap before evaluating
+            conn = None
+            open_tasks = None
+            try:
+                conn = _conn()
+                rows = conn.execute(
+                    "SELECT id, lease_until FROM messages WHERE recipient=? "
+                    "AND handled=1 AND tombstone IS NULL AND msg_type='task'",
+                    (me,)).fetchall()
+                open_tasks = [(r[0], r[1]) for r in rows if not task_done(conn, r[0])]
+                errors = 0
+            except sqlite3.Error:
+                errors += 1
+                if errors >= _BUSY_DB_ERR_LIMIT:
+                    break                                   # (d)
+            finally:
+                # MUST close explicitly: `with conn:` is a TRANSACTION context
+                # manager in sqlite3, not a closing one. Harmless everywhere else
+                # in this file (short-lived CLI processes exit at once); in a loop
+                # that can run for hours it would leak one connection per poll and
+                # hold the DB file open against cleanup.
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except sqlite3.Error:
+                        pass
+
+            if open_tasks is not None:
+                if not open_tasks:
+                    quiet_rounds += 1
+                    if quiet_rounds >= 2:
+                        break                               # (a)
+                else:
+                    quiet_rounds = 0
+                    now = time.time()
+                    if all(lu is not None and now >= lu for _tid, lu in open_tasks):
+                        break                               # (b)
+                    if time.monotonic() >= hard_cap:
+                        if any(lu is not None and now < lu for _tid, lu in open_tasks):
+                            hard_cap = time.monotonic() + _BUSY_DAEMON_MAX
+                        else:
+                            break                           # (c)
+            elif time.monotonic() >= hard_cap:
+                break
+            time.sleep(_BUSY_POLL)
+    finally:
+        _clear_busy(me)
+        # Close the residual window worker C found (finding C1): between this
+        # daemon's last "no open tasks" read and the _clear_busy above, a task can
+        # be claimed. That claim's _spawn_busy_beater would have seen a .busy file
+        # still fresh from our final beat, suppressed itself — and then we deleted
+        # the file, leaving the new task with no beater at all. The reaper's 24s
+        # backstop would recover it, but by requeueing work mid-flight, which is
+        # the exact disease this whole mechanism exists to cure. Now that the file
+        # is gone the guard cannot misfire, so re-check and hand over.
+        # The handover condition must mirror this daemon's OWN exit conditions,
+        # not merely "a task row is open". Handing over on any open task respawns
+        # a successor that immediately re-evaluates, stands down for the same
+        # reason, hands over again... — a spawn loop every poll until the reaper
+        # requeues the row. (Caught by test 8's stand-down time moving from 22s to
+        # 48s while the assertion still passed.) Only work that still has runway
+        # deserves a beater; a task whose ceiling has already fallen is exactly
+        # what we just, deliberately, stopped beating for.
+        try:
+            conn = _conn()
+            try:
+                now = time.time()
+                rows = conn.execute(
+                    "SELECT id, lease_until FROM messages WHERE recipient=? "
+                    "AND handled=1 AND tombstone IS NULL AND msg_type='task'",
+                    (me,)).fetchall()
+                if any(not task_done(conn, tid) and (lu is None or now < lu)
+                       for tid, lu in rows):
+                    _spawn_busy_beater(me)
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            pass  # best-effort handover; the reaper remains the backstop
+
+
 def _conn():
     _ensure_state_dir()  # lazy: create the per-cwd dir only when actually used
     conn = sqlite3.connect(DB_PATH, timeout=10)
@@ -351,8 +570,16 @@ def _lease_alive(recipient, lease_until, margin=_LEASE_MARGIN):
     For pure-heartbeat tasks (lease_until None) the ceiling term is vacuously True,
     so alive reduces to watcher_alive — unchanged from pre-lifecycle behavior.
     margin=3x max_age guards the heartbeat poll race so an alive worker whose beat
-    lands between polls isn't mis-reaped. See DEFAULT_LEASE comment."""
-    if not watcher_alive(recipient, margin):
+    lands between polls isn't mis-reaped. See DEFAULT_LEASE comment.
+
+    The liveness term is an OR over the two heartbeats (see the worker-busy block
+    above): a worker PARKED on a watcher and a worker BUSY executing the claimed
+    task are both alive, but they are mutually exclusive on the bash-fallback path
+    — `recv --block` deletes .alive the moment it hands the task over. ANDing on
+    .alive alone therefore declared a correctly-working worker dead and requeued
+    its task mid-flight. The hard ceiling below is untouched and remains the only
+    detector of alive-but-stuck, so this loosening cannot mask a frozen session."""
+    if not (watcher_alive(recipient, margin) or worker_busy(recipient, margin)):
         return False
     if lease_until is not None and time.time() >= lease_until:
         return False  # hard ceiling fell: alive-but-stuck
@@ -430,11 +657,19 @@ def _dup_by_submit_id(conn, sender, recipient, submit_id):
 def send(sender, recipient, body, *, in_reply_to=None, msg_type=None, hop=None,
          ttl=4, require_watcher=False, max_age=8.0, lease=DEFAULT_LEASE,
          submit_id=None, no_requeue=False):
-    """Insert one message for a SINGLE recipient. Returns (id, created):
+    """Insert one message for a SINGLE recipient. Returns (id, created, queued_busy):
     created=False means submit_id matched an existing non-terminal row, which was
     reused instead of queued again (idempotent resend, tutti clientSubmitID idea).
+    queued_busy=True means require_watcher was set, the recipient's watcher was
+    NOT parked, but its busy heartbeat (_worker_<who>.busy, beaten by the
+    code-forked claim daemon) was fresh — the recipient is provably alive and
+    executing, so the message was QUEUED for delivery when it next parks/recvs
+    (2026-08-01: previously this case was REFUSED, which made a busy worker
+    unreachable for new work and forced the hub into poll-retry loops).
     - StarViolation if a non-hub addresses another non-hub, or hop > ttl.
-    - WatcherDown if require_watcher is set and the recipient isn't parked.
+    - WatcherDown if require_watcher is set and the recipient is neither parked
+      nor busy (no code-knowable evidence it exists => don't queue into a black
+      hole; that remains this flag's job).
     Classifies hub->worker as 'task' and worker->hub as 'reply' by default, and
     auto-links a reply to the sender's oldest unanswered task (setting hop =
     parent.hop + 1) so fan-out completion is computable in code.
@@ -463,9 +698,23 @@ def send(sender, recipient, body, *, in_reply_to=None, msg_type=None, hop=None,
         with _conn() as conn:
             dup = _dup_by_submit_id(conn, sender, recipient, submit_id)
         if dup:
-            return dup[0], False
+            return dup[0], False, False
+    queued_busy = False
     if require_watcher and not watcher_alive(recipient, max_age, verify_owner=True):
-        raise WatcherDown(recipient)
+        # Not parked. A fresh busy heartbeat is code-forked at claim time and
+        # expires at done/fail/cancel/lease-ceiling, so it is strong (not
+        # perfect: an orphan daemon whose session died keeps beating until the
+        # lease ceiling — a BOUNDED window, C review B-2 2026-08-01) evidence
+        # the worker exists — queue instead of refusing. Only
+        # neither-parked-nor-busy (provably absent) still refuses.
+        # Same max_age as the .alive check, NOT _BUSY_FRESH: status --watch
+        # judges busy on max_age too, and the two gates disagreeing (status
+        # says BUSY, send says REFUSED) is observable boundary jitter (C review
+        # B-1). _BUSY_FRESH stays what it was built for: the spawn guard.
+        if worker_busy(recipient, max_age):
+            queued_busy = True
+        else:
+            raise WatcherDown(recipient)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lease_secs = None if (lease is None or lease <= 0) else int(lease)
     lease_until = None if lease_secs is None else time.time() + lease_secs
@@ -503,8 +752,8 @@ def send(sender, recipient, body, *, in_reply_to=None, msg_type=None, hop=None,
         if cur.rowcount == 0 and submit_id is not None:
             dup = _dup_by_submit_id(conn, sender, recipient, submit_id)
             if dup:
-                return dup[0], False
-        return cur.lastrowid, True
+                return dup[0], False, False
+        return cur.lastrowid, True, queued_busy
 
 
 # Star-topology fan-out: A may address several workers at once. Recipients can be
@@ -548,8 +797,13 @@ def expand_recipients(recipient, sender, max_age=8.0):
     the caller named those roles deliberately, and --require-watcher is the right
     per-recipient gate there (a dead one is REFUSED, not silently dropped)."""
     if recipient.strip().upper() == "ALL":
+        # parked OR busy both count as live: a worker mid-task has no parked
+        # watcher but its code-forked busy beater proves it exists; excluding it
+        # would silently drop it from broadcasts (2026-08-01, same rationale as
+        # the send --require-watcher busy-queue path).
         raw = [r for r in _claimed_roles()
-               if r != sender and watcher_alive(r, max_age)]
+               if r != sender and (watcher_alive(r, max_age)
+                                   or worker_busy(r, max_age))]
     else:
         raw = [x.strip() for x in recipient.split(",")]
     seen, out = set(), []
@@ -728,6 +982,13 @@ def recv(me):
         # to the caller. task_done is False for ordinary replies in a hub's inbox
         # (nothing links to a reply), so only requeued-done tasks are dropped.
         rows = [r for r in rows if not task_done(conn, r[0])]
+    # Handing over a task starts the busy heartbeat. Placed here (the claim path
+    # used by one-shot recv AND by the bash-fallback recv --block) rather than in
+    # watch(), which never returns and therefore never stops beating .alive — the
+    # Monitor path was never exposed to this failure. msg_type is column 4 of the
+    # RETURNING tuple.
+    if any(r[4] == "task" for r in rows):
+        _spawn_busy_beater(me)
     return sorted(rows, key=lambda r: r[0])  # RETURNING order is unspecified
 
 
@@ -1174,9 +1435,18 @@ def main():
     rp.add_argument("--me", default=None, help="reap only this worker's stale tasks")
     rp.add_argument("--hub", default=None, help="reap all tasks this hub dispatched")
 
+    # Internal: spawned detached by recv() at task-claim time. Not for humans —
+    # it is the mechanism that makes "working without a heartbeat" impossible.
+    bd = sub.add_parser("busy-daemon",
+                        help=argparse.SUPPRESS)
+    bd.add_argument("--me", required=True)
+
     args = p.parse_args()
 
-    if args.cmd == "init":
+    if args.cmd == "busy-daemon":
+        _require_valid(args.me, "--me")
+        _busy_daemon(args.me)
+    elif args.cmd == "init":
         _conn().close()
         print(f"OK  db={DB_PATH}")
     elif args.cmd == "send":
@@ -1204,13 +1474,27 @@ def main():
         any_refused = False
         for tgt in targets:
             try:
-                mid, created = send(
+                mid, created, queued_busy = send(
                     args.sender, tgt, args.body,
                     in_reply_to=args.in_reply_to, msg_type=args.msg_type,
                     require_watcher=args.require_watcher, max_age=args.max_age,
                     lease=args.lease, submit_id=args.submit_id,
                     no_requeue=args.no_requeue)
-                if created:
+                if created and queued_busy and args.msg_type == "note":
+                    print(f"QUEUED-BUSY #{mid}  {args.sender}->{tgt}  "
+                          f"({tgt} is executing a claimed task; the note delivers "
+                          f"when it next parks/recvs. CAUTION: notes are NOT in "
+                          f"`pending` and exempt from the reaper — fire-and-forget "
+                          f"FYI; use a task if delivery must be guaranteed.)")
+                elif created and queued_busy:
+                    print(f"QUEUED-BUSY #{mid}  {args.sender}->{tgt}  "
+                          f"({tgt} is executing a claimed task — busy heartbeat "
+                          f"fresh; the row stays QUEUED in `pending` until {tgt} "
+                          f"next parks/recvs, the reaper does not touch unclaimed "
+                          f"rows. Don't re-dispatch while BUSY — probe with "
+                          f"`status --watch {tgt}` first; if {tgt}'s busy beat "
+                          f"expired and it never re-parked, nudge its window.)")
+                elif created:
                     print(f"SENT #{mid}  {args.sender}->{tgt}")
                 else:
                     print(f"DUP #{mid}  {args.sender}->{tgt}  "
@@ -1222,9 +1506,10 @@ def main():
                 print(f"REJECTED  {e}")
             except WatcherDown:
                 any_refused = True
-                print(f"REFUSED  {tgt}'s watcher is not listening "
-                      f"(no fresh heartbeat <{args.max_age:g}s). NOT queued to {tgt}. "
-                      f"Nudge {tgt} to park its recv --block watcher first.")
+                print(f"REFUSED  {tgt} is neither parked nor busy "
+                      f"(no fresh watcher heartbeat <{args.max_age:g}s AND no fresh "
+                      f"busy heartbeat). NOT queued to {tgt}. "
+                      f"Nudge {tgt} to park its watcher first.")
             except (sqlite3.Error, OSError) as e:  # DB lock / disk full: skip, keep rest
                 any_refused = True
                 print(f"ERROR  could not queue to {tgt}: {type(e).__name__}: {e}")
@@ -1294,13 +1579,29 @@ def main():
     elif args.cmd == "status":
         _require_valid(args.watch, "--watch")
         alive = watcher_alive(args.watch, args.max_age)
+        busy = worker_busy(args.watch, args.max_age)
         ident = watcher_identity(args.watch)
         who = ""
         if ident and (ident.get("pid") or ident.get("session")):
             sess = (ident.get("session") or "")[:8]
             who = f"  [pid={ident.get('pid')} session={sess or '?'}]"
-        print(f"{args.watch} watcher: {'ALIVE' if alive else 'DOWN'}{who}")
-        sys.exit(0 if alive else 1)
+        # Three states, not two. BUSY is the one the old two-state view could not
+        # express, and it is exactly the state A most needs to tell apart from
+        # DOWN: the worker is alive and working, but is NOT parked to accept new
+        # work — so do not re-dispatch, and do not treat it as a black hole.
+        state = "ALIVE" if alive else ("BUSY" if busy else "DOWN")
+        if alive and busy:
+            state = "ALIVE+BUSY"
+        # Show WHICH process is beating .busy. Without this the identity shown is
+        # always the parked watcher's, so an orphaned beater — a detached process
+        # outliving a dead session, the one failure mode that can disguise a dead
+        # worker as a live one — could not be traced back to a pid to kill.
+        if busy:
+            bident = _busy_identity(args.watch) or {}
+            if bident.get("pid"):
+                who += f"  [busy-beater pid={bident['pid']}]"
+        print(f"{args.watch} watcher: {state}{who}")
+        sys.exit(0 if alive else 1)  # exit code unchanged: gates "can I dispatch?"
     elif args.cmd == "pending":
         _require_valid(args.hub, "--hub")
         rows = pending(args.hub)
@@ -1327,7 +1628,11 @@ def main():
         # recv --block exits on delivery and removes its heartbeat) would read as
         # stale no matter how it renewed the lease. Beating here makes periodic
         # `ack` a genuine keep-alive for that path.
+        # Also beats the busy heartbeat, so a manual `ack` still rescues a worker
+        # whose spawned beater died (or never spawned, e.g. an older client) —
+        # belt and braces, since the beater is now the primary mechanism.
         _beat(args.me)
+        _beat_busy(args.me)
         new_lease = time.time() + DEFAULT_LEASE
         with _conn() as conn:
             if args.task is not None:

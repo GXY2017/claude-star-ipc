@@ -111,7 +111,7 @@ ipc.py send --from A --to B "task"                    # one worker
 ipc.py send --from A --to B,C "task"                  # fan out (one row each)
 ipc.py send --from A --to ALL "task"                  # broadcast to every live worker
 ipc.py send --from A --to B --body-file task.md       # body from file — REQUIRED for bodies with backticks/$()/quotes (shell mangles them)
-ipc.py send --from A --to B "task" --require-watcher  # refuse (exit 3), don't queue, if B's watcher isn't parked
+ipc.py send --from A --to B "task" --require-watcher  # tri-state: parked=SENT; mid-task (busy fresh)=QUEUED-BUSY exit 0, delivers when B finishes; neither=REFUSED exit 3, not queued
 ipc.py send --from A --to B "task" --submit-id fx7    # idempotency key: a resend with the same key prints DUP and reuses the row — re-dispatch after a barrier timeout is SAFE
 ipc.py send --from A --to B "task" --no-requeue       # fail-closed non-idempotent task: stale lease parks as NEEDS-REVIEW (never auto-requeued/auto-failed)
 ipc.py recv --me A                                    # take unread replies (NONE = nothing yet)
@@ -139,7 +139,7 @@ ipc.py fail --me B --task N [--reason ...]   # mark failed (won't requeue)
 ipc_role.py status                 # reconciled view: ownership × heartbeat liveness
 ipc_role.py take A --session <sid> # (re)assign a role to this session
 ipc_role.py reclaim-dead           # free WORKER slots whose watcher heartbeat is gone (hub exempt — watcher-less by design; blind-safe. Rarely needed: claim() sweeps all ghost slots on every SessionStart)
-ipc.py status --watch B            # is B's watcher parked right now? ALIVE(0)/DOWN(1) + pid/session
+ipc.py status --watch B            # ALIVE(parked, 0) / BUSY(executing, 1 — alive, don't re-dispatch) / DOWN(1) + pid/session
 ```
 
 ## Task lifecycle
@@ -200,8 +200,13 @@ watcher, **not** re-claim the role.
    reply.
 5. **A dispatches with `--require-watcher`.** The role registry survives `/clear`
    while the watcher process is dead, so registry ≠ "listening now". Without the
-   flag a task can drop into a black hole. On refusal (exit 3), nudge the worker
-   window to re-park its watcher, then resend.
+   flag a task can drop into a black hole. The gate is tri-state: a mid-task worker
+   (busy heartbeat fresh) gets QUEUED-BUSY (exit 0) — the row waits in the mailbox,
+   visible in `pending`, and delivers when the worker next parks/recvs; don't
+   re-dispatch while it stays BUSY. Only neither-parked-nor-busy is refused
+   (exit 3) — then nudge the worker window to re-park its watcher and resend.
+   (`--type note` to a busy worker is fire-and-forget: notes are outside `pending`
+   and the reaper — use a task if delivery must be guaranteed.)
 6. **Workers close tasks explicitly.** `done --me <self> --task N` when finished
    (a plain reply also marks done, but auto-links to the *oldest* open task, so
    `done --task N` is safer with several open). Call `ack` periodically on a long

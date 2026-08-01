@@ -276,6 +276,11 @@ _CONTINUATION = ("clear", "resume", "compact")  # same terminal continuing, NOT 
 # a watcher can be a ghost). These thresholds let claim() treat a registry entry
 # whose watcher is gone as reclaimable, so a dead claim (e.g. a 2-day-old A) no
 # longer permanently blocks the slot.
+# Placeholder identity used when a terminal has no CLAUDE_SESSION_ID in its tool
+# shell (the common case for a manually-issued take/claim). It is NOT an identity:
+# several unrelated terminals can carry it at once, so anything that reasons about
+# "the same session" must special-case it — see take().
+MANUAL_SID = "manual"
 WATCHER_MAX_AGE = 60     # a heartbeat older than this => the watcher is gone
 CLAIM_GRACE = 120        # a claim with NO heartbeat yet is dormant only after this
                          # (gives a just-started owner time to park its watcher)
@@ -293,12 +298,56 @@ def _heartbeat_path(role):
     return os.path.join(PROJECT_ROOT, f"_watcher_{role}.alive")
 
 
-def _watcher_age(role):
-    """Seconds since `role`'s watcher last beat, or None if there is no heartbeat."""
+def _busy_path(role):
+    """Path of `role`'s worker-busy heartbeat, or None on an ipc.py too old to
+    have the split (in which case liveness degrades to .alive only — the
+    pre-2026-07-31 behaviour, never worse)."""
+    if _IPC and hasattr(_IPC, "_busy_path"):
+        return _IPC._busy_path(role)
+    return None
+
+
+def _fresh(path):
+    """Has `path` been touched within WATCHER_MAX_AGE? False for absent/None."""
+    if not path:
+        return False
     try:
-        return time.time() - os.path.getmtime(_heartbeat_path(role))
+        return (time.time() - os.path.getmtime(path)) <= WATCHER_MAX_AGE
     except OSError:
-        return None
+        return False
+
+
+def _liveness_age(role):
+    """Seconds since `role` last showed ANY sign of life, or None if it showed none.
+
+    Since the 2026-07-31 heartbeat split there are TWO files, and this module must
+    honour both or it will evict people who are working:
+      _watcher_<role>.alive : a consumer is parked, waiting for new messages
+      _worker_<role>.busy   : the worker is executing a claimed task
+    A worker on the bash-fallback path has only the SECOND one — `recv --block`
+    deletes .alive the moment it hands the task over. Judging liveness on .alive
+    alone therefore reads a busy worker as DORMANT once its claim passes
+    CLAIM_GRACE (120s), and _sweep_dormant (which runs on EVERY new terminal's
+    claim()) or `reclaim-dead` then hands its role to someone else while it is
+    still mid-task — two sessions on one inbox, messages claimed by the wrong one.
+    Found by worker B's review of the split (finding H1); the pre-existing warning
+    that ipc.py and ipc_role.py judge liveness on different criteria is exactly
+    the trap this walked into.
+    Returns the age of the FRESHER of the two, so either signal keeps a role alive."""
+    ages = []
+    for path in (_heartbeat_path(role), _busy_path(role)):
+        if not path:
+            continue
+        try:
+            ages.append(time.time() - os.path.getmtime(path))
+        except OSError:
+            pass
+    return min(ages) if ages else None
+
+
+# Back-compat alias: this used to be the only liveness probe and is referenced by
+# name in notes and older recipes.
+_watcher_age = _liveness_age
 
 
 def _claim_age(claim):
@@ -447,9 +496,22 @@ def take(role, sid):
     locked = _lock()
     try:
         reg = _load()
-        for r in ROLES:                       # release any slot this session holds
-            if reg.get(r) and reg[r].get("session_id") == sid:
-                reg[r] = None
+        # Release any slot this session already holds — "one session, one role".
+        # That invariant may only be enforced on a REAL identity. MANUAL_SID is a
+        # shared placeholder used by every terminal whose CLAUDE_SESSION_ID is not
+        # exported into its tool shell, so two unrelated terminals both carrying it
+        # are not the same session and must not evict each other.
+        # Observed 2026-07-31: the hub held A as "manual"; a worker then ran
+        # `take B --session manual`; this loop matched and nulled A out from under
+        # a live hub, whose watcher correctly retired itself on the ownership
+        # change — leaving the hub deaf. Skipping the sweep for the placeholder
+        # costs only a stale duplicate claim (visible in `status`, cleared by
+        # reclaim-dead once the heartbeat dies), which is far cheaper than
+        # silently unseating a working terminal.
+        if sid != MANUAL_SID:
+            for r in ROLES:
+                if reg.get(r) and reg[r].get("session_id") == sid:
+                    reg[r] = None
         prev = reg.get(role)
         reg[role] = {"session_id": sid, "ts": _now()}
         _save(reg)
@@ -534,23 +596,32 @@ def status_view():
     that shows both truths together so a ghost (heartbeat with no/old claim) or a
     dormant claim (claim with no heartbeat) is obvious at a glance."""
     reg = _load()
-    print(f"{'role':4} {'owner':10} {'claim-age':>9} {'watcher':>8}  state")
+    print(f"{'role':4} {'owner':10} {'claim-age':>9} {'alive':>8} {'via':>6}  state")
     for r in ROLES:
         claim = reg.get(r)
         owner = (claim.get('session_id', '')[:8] if claim else '-')
         ca = _claim_age(claim) if claim else None
-        wa = _watcher_age(r)
+        wa = _liveness_age(r)
+        # Which of the two heartbeats is carrying this role right now. Without
+        # this the age column is ambiguous after the split, and "parked" vs
+        # "working" is precisely the distinction an operator needs before
+        # deciding whether a quiet worker is stuck or busy.
+        bp = _busy_path(r)
+        parked = _fresh(_heartbeat_path(r))
+        busy = _fresh(bp) if bp else False
+        via = "park+busy" if (parked and busy) else ("park" if parked
+              else ("busy" if busy else "-"))
         ca_s = f"{ca:.0f}s" if ca is not None else "?"
         wa_s = f"{wa:.0f}s" if wa is not None else "none"
         if not claim:
             state = "FREE" if wa is None or wa > WATCHER_MAX_AGE else "SQUATTER (watcher, no claim)"
         elif wa is not None and wa <= WATCHER_MAX_AGE:
-            state = "live"
+            state = "live (working)" if (busy and not parked) else "live"
         elif r == HUB:
             state = "hub (watcher-less by design)"
         else:
             state = "DORMANT (reclaimable)"
-        print(f"{r:4} {owner:10} {ca_s:>9} {wa_s:>8}  {state}")
+        print(f"{r:4} {owner:10} {ca_s:>9} {wa_s:>8} {via:>6}  {state}")
 
 
 def _inject(text):
@@ -582,7 +653,7 @@ def main():
         reset()
     elif cmd == "take":
         role = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("-") else ""
-        sid = _arg("--session") or os.environ.get("CLAUDE_SESSION_ID") or "manual"
+        sid = _arg("--session") or os.environ.get("CLAUDE_SESSION_ID") or MANUAL_SID
         take(role, sid)
     elif cmd == "enable":
         enable()
