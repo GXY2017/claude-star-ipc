@@ -150,8 +150,13 @@ Two disciplines this lifecycle REQUIRES (a plain prose reply is no longer enough
   with a read-only tool allowlist), replies `send --body-file --in-reply-to <id>` (the
   reply link marks the task done) and `fail`s loudly on every error path — one receipt per
   message, never silent. This is how a non-Claude harness (e.g. Codex CLI) participates as
-  a truly unattended worker. Launch it from the project root or pass `-WorkRoot` (the
-  script pins cwd — the mailbox resolves by cwd); auto-start via Startup folder/scheduler.
+  a truly unattended worker. Launch it from the project root or pass `-WorkRoot` — the
+  script pins cwd because the mailbox resolves by cwd, and at BOOT that matters: a
+  Startup-folder launch starts in System32, where the upward project-marker walk falls
+  back to cwd and the daemon silently beats a stray mailbox (every slot DOWN after
+  reboot, daemon looking healthy). Auto-start via the Startup folder — see
+  `examples/ipc-keepalive.cmd`, which also shows how to verify the boot chain without
+  rebooting (`Start-Process -UseNewEnvironment` + System32 cwd).
   Deploy-time one-off: give a daemon-kept channel its registry placeholder owner ONCE
   (`ipc_role.py take CODEX --session keepalive-codex`) so the SessionStart hook never
   hands the channel to a random window; the daemon itself only beats heartbeats and never

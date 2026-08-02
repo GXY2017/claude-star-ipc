@@ -85,6 +85,9 @@ configurable via `IPC_HUB` (default `A`). Delivery to arbitrary *names* stays op
   allowlist), replying or failing loudly with exactly one receipt per message.
   Role names allow `[A-Za-z0-9_]+`, so dedicated model queues get self-describing
   names (`send --to CODEX`) while the letters stay free for interactive windows.
+  Boot autostart: `examples/ipc-keepalive.cmd` (Startup folder; explains why the
+  daemon's cwd pin is load-bearing at boot, and how to test the chain without
+  rebooting).
 - **Auto role assignment** — a `SessionStart` hook (`ipc_role.py`) claims the
   lowest free role (A, then B, C, D…), first-come-first-served, keyed by Claude's
   `session_id`, and injects that role's behavior as context. `/clear` keeps the

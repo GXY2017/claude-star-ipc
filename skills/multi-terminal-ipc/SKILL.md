@@ -204,7 +204,12 @@ loop, `codex_ipc_worker.ps1` (repo root; Windows/pwsh), keeps them alive:
   with a read-only tool allowlist), the reply's `--in-reply-to` link marks the task
   done, and every error path emits a loud `fail` receipt.
 - **Launch from the project root** (or pass `-WorkRoot`): the script pins cwd, and
-  the mailbox resolves by cwd — a stray cwd means a silent wrong mailbox.
+  the mailbox resolves by cwd — a stray cwd means a silent wrong mailbox. This is
+  exactly what happens at BOOT (Startup-folder items start in System32), so boot
+  autostart REQUIRES the pin: copy `examples/ipc-keepalive.cmd` into the Startup
+  folder with `-WorkRoot` set. Verify without rebooting: launch the cmd with
+  `Start-Process -UseNewEnvironment -WorkingDirectory C:\Windows\System32`
+  (clean registry env ≈ logon env), then `status --watch <role>` from the project.
 - **Deploy-time one-off**: `ipc_role.py take CODEX --session keepalive-codex`
   placeholder-owns the channel in the registry (see Role registry above); neither
   the daemon nor `/ipc-recover` ever re-takes.
