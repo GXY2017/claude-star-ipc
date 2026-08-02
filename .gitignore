@@ -3,6 +3,7 @@ _ipc.db
 _ipc.db-wal
 _ipc.db-shm
 _watcher_*.alive
+_worker_*.busy
 .claude/ipc_roles.json
 .claude/ipc_roles.json.lock
 .claude/ipc_roles.json.tmp

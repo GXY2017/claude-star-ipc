@@ -540,7 +540,11 @@ HUB = os.environ.get("IPC_HUB", "A")
 # does NOT reject names outside ROLES (by design — keeps test names / ad-hoc
 # topologies open, see module docstring); ROLES governs role ASSIGNMENT, not
 # delivery.
-_BASE_ROLES = ("A", "B", "C", "D")  # extend to add worker slots (E, F, ...)
+# Letters = generic interactive model windows (hook assigns lowest free, in order).
+# Named slots = daemon-kept dedicated channels (keepalive beats them; a model's
+# interactive window claims the slot to drain its queue). Letters FIRST so the
+# hook never hands a named channel to a random new window.
+_BASE_ROLES = ("A", "B", "C", "D", "CODEX", "DS")
 ROLES = _BASE_ROLES if HUB in _BASE_ROLES else (HUB,) + _BASE_ROLES
 
 
@@ -1441,11 +1445,33 @@ def main():
                         help=argparse.SUPPRESS)
     bd.add_argument("--me", required=True)
 
+    ka = sub.add_parser("keepalive",
+                        help="park liveness only: keep the watcher heartbeat fresh "
+                             "WITHOUT consuming messages, so the hub can dispatch "
+                             "(require-watcher passes) and rows queue unclaimed until "
+                             "a real consumer parks recv/watch. For daemon-kept slots "
+                             "whose executor is an interactive window opened later.")
+    ka.add_argument("--me", required=True)
+    ka.add_argument("--interval", type=float, default=3.0,
+                    help="seconds between heartbeat touches (default 3.0; "
+                         "require-watcher freshness window is 8s)")
+
     args = p.parse_args()
 
     if args.cmd == "busy-daemon":
         _require_valid(args.me, "--me")
         _busy_daemon(args.me)
+    elif args.cmd == "keepalive":
+        ka_roles = [r.strip() for r in args.me.split(",") if r.strip()]
+        for r in ka_roles:
+            _require_valid(r, "--me")
+        print(f"KEEPALIVE {','.join(ka_roles)} beating every {args.interval}s "
+              f"(pid {os.getpid()}); messages queue for a later consumer",
+              flush=True)
+        while True:
+            for r in ka_roles:
+                _beat(r)
+            time.sleep(args.interval)
     elif args.cmd == "init":
         _conn().close()
         print(f"OK  db={DB_PATH}")

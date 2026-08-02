@@ -114,6 +114,7 @@ ipc.py send --from A --to B --body-file task.md       # body from file — REQUI
 ipc.py send --from A --to B "task" --require-watcher  # tri-state: parked=SENT; mid-task (busy fresh)=QUEUED-BUSY exit 0, delivers when B finishes; neither=REFUSED exit 3, not queued
 ipc.py send --from A --to B "task" --submit-id fx7    # idempotency key: a resend with the same key prints DUP and reuses the row — re-dispatch after a barrier timeout is SAFE
 ipc.py send --from A --to B "task" --no-requeue       # fail-closed non-idempotent task: stale lease parks as NEEDS-REVIEW (never auto-requeued/auto-failed)
+ipc.py keepalive --me CODEX,DS                        # liveness-only: beat watcher heartbeat(s) WITHOUT consuming — slot stays dispatchable, rows queue for a window opened later (codex_ipc_worker.ps1 wraps this)
 ipc.py recv --me A                                    # take unread replies (NONE = nothing yet)
 ipc.py recv --me A --block                            # block until a reply arrives
 ipc.py recv --me A --block --count 3                  # BARRIER: after fanning to 3, wait for all 3
@@ -139,6 +140,7 @@ ipc.py fail --me B --task N [--reason ...]   # mark failed (won't requeue)
 ipc_role.py status                 # reconciled view: ownership × heartbeat liveness
 ipc_role.py take A --session <sid> # (re)assign a role to this session
 ipc_role.py reclaim-dead           # free WORKER slots whose watcher heartbeat is gone (hub exempt — watcher-less by design; blind-safe. Rarely needed: claim() sweeps all ghost slots on every SessionStart)
+ipc_role.py take CODEX --session keepalive-codex   # deploy-time ONE-OFF: placeholder-own a daemon-kept channel so the hook never hands it to a random new window (the daemon itself never re-takes)
 ipc.py status --watch B            # ALIVE(parked, 0) / BUSY(executing, 1 — alive, don't re-dispatch) / DOWN(1) + pid/session
 ```
 
@@ -177,10 +179,37 @@ watcher, **not** re-claim the role.
 - Worker: run **`/ipc-recover B`** (real letter; a user-level command in
   `~/.claude/commands/`, available in every opted-in project) — starts the
   persistent Monitor `watch --me B` FIRST; backlog arrives as signals, read via
-  `peek` (watcher-first keeps the lease reaper off heartbeat-less work).
+  `peek` (watcher-first keeps the lease reaper off heartbeat-less work). Optional
+  second token `daemon[=<comma-list>]` also starts the keepalive daemon guarding
+  those slots (checks for a live one first) — so the slot survives the window
+  closing again.
 - Hub: you are A — continue as hub (or `/main`). A needs no standby watcher.
 - **Don't claim a different role** after /clear — the slot is still held under
   the old session; a wrong self-claim is how a cleared B wrong-turns into D.
+
+## Daemon-kept slots / named channels (unattended & queued workers)
+
+Role names allow `[A-Za-z0-9_]+` — beyond the letters, define **named channels**
+(e.g. `CODEX`, `DS`) as dedicated model queues, added to `_BASE_ROLES` in `ipc.py`
+(letters first, so a random new window never lands on a channel). An external OS
+loop, `codex_ipc_worker.ps1` (repo root; Windows/pwsh), keeps them alive:
+
+- **keepalive mode (default)** — loops `ipc.py keepalive --me <Role[,Role]>`:
+  heartbeats beat, `--require-watcher` passes, rows queue UNCLAIMED (the reaper
+  ignores unclaimed rows) until the model's interactive window opens and drains
+  the backlog with full context (`/ipc-recover CODEX`). ALIVE then means "will be
+  read when a window opens", not "attended now".
+- **execute mode** (`-Mode execute -Executor codex|claude|claude-ds`) — fully
+  unattended: each task runs headless (`codex exec` read-only sandbox / `claude -p`
+  with a read-only tool allowlist), the reply's `--in-reply-to` link marks the task
+  done, and every error path emits a loud `fail` receipt.
+- **Launch from the project root** (or pass `-WorkRoot`): the script pins cwd, and
+  the mailbox resolves by cwd — a stray cwd means a silent wrong mailbox.
+- **Deploy-time one-off**: `ipc_role.py take CODEX --session keepalive-codex`
+  placeholder-owns the channel in the registry (see Role registry above); neither
+  the daemon nor `/ipc-recover` ever re-takes.
+- **On demand**: `/ipc-recover <role> daemon[=<comma-list>]` checks for a live
+  keepalive covering each slot and hidden-starts the ps1 for any gap.
 
 ## 注意事项 (the cautions that actually bite)
 

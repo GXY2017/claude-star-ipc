@@ -77,6 +77,14 @@ configurable via `IPC_HUB` (default `A`). Delivery to arbitrary *names* stays op
   queued (tasks never vanish into a dead mailbox, and a busy worker stays reachable).
   `status --watch X` reports ALIVE / BUSY / DOWN. A registered role does **not**
   prove liveness — heartbeat freshness is the signal.
+- **Daemon-kept slots / named channels** — an external OS loop
+  (`codex_ipc_worker.ps1`) keeps a slot dispatchable with **no window open**:
+  keepalive mode beats the heartbeat while rows queue unclaimed for an interactive
+  window to drain later with full context; execute mode runs each task fully
+  unattended via headless `codex exec` or `claude -p` (read-only sandbox / tool
+  allowlist), replying or failing loudly with exactly one receipt per message.
+  Role names allow `[A-Za-z0-9_]+`, so dedicated model queues get self-describing
+  names (`send --to CODEX`) while the letters stay free for interactive windows.
 - **Auto role assignment** — a `SessionStart` hook (`ipc_role.py`) claims the
   lowest free role (A, then B, C, D…), first-come-first-served, keyed by Claude's
   `session_id`, and injects that role's behavior as context. `/clear` keeps the
@@ -128,6 +136,7 @@ configurable via `IPC_HUB` (default `A`). Delivery to arbitrary *names* stays op
 | File | Role |
 |---|---|
 | `ipc.py` | the mailbox CLI (send/recv/watch/peek/archive/status) — stdlib only. **Neutral core: any CLI that runs python+bash can use it.** |
+| `codex_ipc_worker.ps1` | external worker daemon (pwsh): keepalive mode keeps slots dispatchable while tasks queue; execute mode runs tasks headless via `codex exec` / `claude -p` — the bridge that lets a non-Claude CLI act as an unattended worker. |
 | `.claude/hooks/ipc_role.py` | `SessionStart`/`SessionEnd` hook: auto-assigns roles, injects behavior. *Claude Code integration layer.* |
 | `.claude/commands/main.md`, `ipc-recover.md` | optional slash commands: `/main` (A self-assert hub), `/ipc-recover` (rebuild role+watcher after `/clear`/compaction/hook-failure). *Claude Code only.* |
 | `skills/multi-terminal-ipc/SKILL.md` | the operating + onboarding skill (mental model, command surface, enable-in-a-new-project, recovery, cautions). Installed to `~/.claude/skills/` by `install_user.py`. *Claude Code only.* |
@@ -141,8 +150,9 @@ configurable via `IPC_HUB` (default `A`). Delivery to arbitrary *names* stays op
 > (the `SessionStart` hook, `/main` `/ipc-recover`, the Monitor watcher, the
 > background-bash push-wake) is **Claude Code harness integration**; it makes the kit
 > ergonomic under Claude Code (any model backend) but does **not** port to a different
-> CLI. "Cross-vendor" here means different *models* under the same Claude Code harness,
-> not different harnesses.
+> CLI. "Cross-vendor" here means different *models* under the same Claude Code harness —
+> plus, via `codex_ipc_worker.ps1` execute mode, a second harness (Codex CLI headless)
+> driven by an OS loop rather than by the protocol prose.
 
 ## Install
 
@@ -210,8 +220,12 @@ python ipc.py watch --me B
 python ipc.py watch --me B        # under Monitor (persistent), or:
 python ipc.py recv --me B --block # bash fallback; mid-task run `ack --me B` to stay alive
 
-# Probe a worker's watcher: ALIVE (exit 0) / DOWN (exit 1)
+# Probe a worker's watcher: ALIVE (parked) / BUSY (executing — alive, don't re-dispatch) / DOWN
 python ipc.py status --watch B
+
+# Keep a slot dispatchable with no window open (rows queue unclaimed;
+# codex_ipc_worker.ps1 wraps this with auto-restart, or runs tasks headless):
+python ipc.py keepalive --me CODEX,DS
 
 # Look without consuming; trim old read rows:
 python ipc.py peek --me A --tail 5

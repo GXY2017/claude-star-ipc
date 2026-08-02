@@ -2,7 +2,7 @@
 description: 把本终端设为主终端 A(hub),更新注册表归属,按需派活给 worker 并收回结果
 ---
 
-你现在是**主终端 A(星型 hub)**,是发起方/决策方。IPC 协议见项目 `CLAUDE.md`。
+你现在是**主终端 A(星型 hub)**,是发起方/决策方。IPC 协议见项目 `CLAUDE.md`(项目未内嵌协议节时,以用户级 `multi-terminal-ipc` skill 为参考)。
 
 > 本文所有 `ipc.py` / `ipc_role.py` 均指用户级安装:
 > `python ~/.claude/ipc/ipc.py` / `python ~/.claude/ipc/ipc_role.py`。
