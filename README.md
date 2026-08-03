@@ -33,10 +33,16 @@ mid-flight, and worker liveness is a heartbeat file, not a promise.
 - **Python 3.8+** — the mailbox (`ipc.py`) is stdlib-only (`sqlite3`); no pip installs.
 - **Claude Code CLI** — for the hub and any Claude-harness workers (role
   auto-assignment uses its `SessionStart` hook; watchers use its background tools).
-- **Windows + PowerShell 7 (`pwsh`)** — only for the optional scripts
-  (`ipc_wezterm_*.ps1`, `codex_ipc_worker.ps1`). The Python core is OS-neutral.
-- **WezTerm** *(optional)* — for the fleet scripts that launch/reset all role
-  windows as panes in one WezTerm window.
+- **Windows + PowerShell 7 (`pwsh`)** — for the fleet scripts
+  (`ipc_wezterm_*.ps1`). The Python core is OS-neutral.
+- **WezTerm** *(required)* — all role terminals live as panes in one WezTerm
+  window, launched/reset by the fleet scripts. WezTerm is what makes the fleet
+  **AI-operable**: `wezterm cli` gives stable pane ids at spawn, keystroke
+  injection into any pane (`send-text`, no focus needed), and full screen
+  readback (`get-text`) — so one AI terminal can drive every other terminal
+  and verify each step. On Windows use a **nightly** build (the 2024-02 stable
+  CLI cannot reach the GUI socket from an external process; the scripts apply
+  the `WEZTERM_UNIX_SOCKET` workaround automatically).
 - **Worker CLIs** *(your choice)* — any Claude Code-compatible launch (Kimi,
   GLM, DeepSeek endpoints…) and/or the Codex CLI.
 
@@ -83,7 +89,12 @@ window** — a hook can inject instructions but can't fire the first tool call; 
 that one keystroke the worker parks its watcher and runs autonomously.
 
 With WezTerm, one command does all of this — spawns one pane per role with
-`IPC_ROLE` preset and each role's own launch command:
+`IPC_ROLE` preset and each role's own launch command. You don't have to run it
+yourself: **an AI terminal can operate WezTerm** — ask any agent session (e.g.
+Claude Code) to run the launcher, and it can then drive the panes over
+`wezterm cli` (inject a wake line into a DOWN worker, read a pane's screen to
+diagnose it, batch-reset the fleet between task cycles), verifying every step
+via screen readback:
 
 ```powershell
 pwsh ~/.claude/ipc/ipc_wezterm_launch.ps1 -Roles A,B,C,D,E
@@ -138,7 +149,7 @@ themselves.
 |---|---|
 | `ipc.py` | the mailbox CLI — stdlib only, harness-neutral core |
 | `.claude/hooks/ipc_role.py` | `SessionStart`/`SessionEnd` hook: auto-assigns roles, injects behavior |
-| `ipc_wezterm_launch.ps1` / `ipc_newcycle.ps1` / `ipc_wezterm_common.ps1` | optional WezTerm fleet control: spawn one pane per role, batch-reset between tasks |
+| `ipc_wezterm_launch.ps1` / `ipc_newcycle.ps1` / `ipc_wezterm_common.ps1` | WezTerm fleet control: spawn one pane per role, batch-reset between tasks |
 | `.claude/commands/main.md`, `ipc-recover.md` | slash commands: `/main` (assert hub), `/ipc-recover` (rebuild watcher after `/clear`) |
 | `skills/multi-terminal-ipc/SKILL.md` | operating + onboarding skill |
 | `CLAUDE.md` | the protocol the terminals follow |
