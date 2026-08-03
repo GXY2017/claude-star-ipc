@@ -47,13 +47,14 @@ $LaunchCmd = @{
 # sync with $LaunchCmd when rebinding a role; a role without a tag falls back to
 # the bare letter.
 $ModelTag = @{
-    A     = 'Claude'     # generic — the hub's model is switched in-session (/model), a version tag would go stale
-    B     = 'kimi-k3'
-    C     = 'glm5.2'
-    D     = 'deepseek'
-    E     = 'codex'
-    CODEX = 'codex'
-    DS    = 'deepseek'
+    # Vendor names only, no version — models get switched/upgraded, version tags go stale.
+    A     = 'Claude'
+    B     = 'Kimi'
+    C     = 'GLM'
+    D     = 'DeepSeek'
+    E     = 'Codex'
+    CODEX = 'Codex'
+    DS    = 'DeepSeek'
 }
 # Roles running the codex CLI, not the claude harness: no IPC_ROLE/SessionStart
 # hook (registry needs a one-time placeholder take), different TUI (skip the
