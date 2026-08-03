@@ -43,6 +43,18 @@ $LaunchCmd = @{
     CODEX = 'codex'      # legacy named channel, redundant with E since 2026-08-03
     DS    = 'claude-ds'  # legacy named channel, redundant with D since 2026-08-03
 }
+# Per-role model tag for the tab title: "<role>-<tag>" (e.g. A-opus5). Keep in
+# sync with $LaunchCmd when rebinding a role; a role without a tag falls back to
+# the bare letter.
+$ModelTag = @{
+    A     = 'opus5'
+    B     = 'kimi-k3'
+    C     = 'glm5.2'
+    D     = 'deepseek'
+    E     = 'codex'
+    CODEX = 'codex'
+    DS    = 'deepseek'
+}
 # Roles running the codex CLI, not the claude harness: no IPC_ROLE/SessionStart
 # hook (registry needs a one-time placeholder take), different TUI (skip the
 # claude readiness probe and the standby wake).
@@ -65,7 +77,8 @@ if ($DryRun) {
     Write-Host "  project: $Project"
     foreach ($r in $Roles) {
         $envPrefix = if ($r -ne 'CODEX') { "`$env:IPC_ROLE='$r'; " } else { '' }
-        Write-Host "  [$r] spawn pane (cwd=$Project), type: $envPrefix$($LaunchCmd[$r])"
+        $title = if ($ModelTag[$r]) { "$r-$($ModelTag[$r])" } else { $r }
+        Write-Host "  [$r] spawn pane (tab '$title', cwd=$Project), type: $envPrefix$($LaunchCmd[$r])"
     }
     return
 }
@@ -94,7 +107,8 @@ foreach ($r in $Roles) {
         if ($LASTEXITCODE -ne 0) { throw "cli spawn failed for role $r" }
         $paneId = [int]($out | Select-Object -Last 1).Trim()
     }
-    & $script:WeztermExe cli set-tab-title --pane-id $paneId "IPC-$r" *> $null
+    $title = if ($ModelTag[$r]) { "$r-$($ModelTag[$r])" } else { $r }
+    & $script:WeztermExe cli set-tab-title --pane-id $paneId $title *> $null
 
     $envPrefix = if ($CodexRoles -notcontains $r) { "`$env:IPC_ROLE='$r'; " } else { '' }
     Submit-PaneText $paneId "$envPrefix$($LaunchCmd[$r])"
