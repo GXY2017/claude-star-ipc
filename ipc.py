@@ -541,10 +541,13 @@ HUB = os.environ.get("IPC_HUB", "A")
 # topologies open, see module docstring); ROLES governs role ASSIGNMENT, not
 # delivery.
 # Letters = generic interactive model windows (hook assigns lowest free, in order).
-# Named slots = daemon-kept dedicated channels (keepalive beats them; a model's
-# interactive window claims the slot to drain its queue). Letters FIRST so the
-# hook never hands a named channel to a random new window.
-_BASE_ROLES = ("A", "B", "C", "D", "CODEX", "DS")
+# Letters FIRST so the hook never hands a named channel to a random new window.
+# E = codex CLI slot since 2026-08-03 (registry placeholder-owned — codex has no
+# SessionStart hook to claim it; keep the one-time `ipc_role.py take E` in place
+# or the hook hands E to the 5th random interactive window). CODEX/DS named
+# channels predate the WezTerm lineup (B=kimi C=glm D=ds E=codex) and are
+# redundant since the 2026-08-03 daemon decommission — kept only for old queues.
+_BASE_ROLES = ("A", "B", "C", "D", "E", "CODEX", "DS")
 ROLES = _BASE_ROLES if HUB in _BASE_ROLES else (HUB,) + _BASE_ROLES
 
 

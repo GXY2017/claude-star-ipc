@@ -1,5 +1,5 @@
 ---
-description: 恢复本终端的 IPC 待命(/clear、上下文压缩或 SessionStart 钩子失效后,重建角色盯哨);可带 daemon 参数同步拉起 keepalive 守护进程
+description: 恢复本终端的 IPC 待命(/clear、上下文压缩或 SessionStart 钩子失效后,重建角色盯哨);daemon 参数已退役(2026-08-03),仅在用户明确要求时重启守护进程
 ---
 
 你在**恢复本终端的 IPC 待命状态**(用于 `/clear`、上下文压缩、或 SessionStart 钩子没跑起来之后)。
@@ -33,6 +33,8 @@ description: 恢复本终端的 IPC 待命(/clear、上下文压缩或 SessionSt
 4. **A(hub)角色**:A 不需常驻盯哨(按需用 Monitor `watch --me A` 或后台 `recv --me A --block` 收回复)。确认自己是 A、按 CLAUDE.md hub 职责继续即可,跳过第 3 步。(A 也可用 `/main` 自声明 hub 身份——它会同步更新注册表归属。)
 
 5. **可选:同步拉起 keepalive daemon**(仅当 `$ARGUMENTS` 带 `daemon` 令牌;没带则跳过本步)——让指定槽位在交互窗口关闭/休眠后仍可被派单(hub `--require-watcher` 得 QUEUED 而非 REFUSED,任务排队等窗口回来消化):
+
+   > **⚠ 已退役(2026-08-03,用户决策"最简洁原则"):** keepalive daemon 已停用——常驻进程已杀、Startup cmd 已移入 `~\.claude\ipc\decommissioned-2026-08-03\`。现行做法:派单前 `ipc.py status --watch <角色>` 判活,DOWN 就在 WezTerm 对应 pane 里手动敲一行唤醒(或 `ipc_wezterm_launch.ps1` 重拉),再派。本步仅当用户明确要求重启 daemon 时才执行(脚本仍在原位可用)。
    - **守护对象** = `daemon=<逗号表>` 指定的角色(如 `daemon=CODEX,DS`);裸 `daemon` 默认守护第 1 步定下的本终端角色。
    - **先查活再启动**(重复 keepalive 无害——心跳 last-writer-wins——但白费进程):
      ```powershell

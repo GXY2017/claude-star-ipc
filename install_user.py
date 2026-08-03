@@ -39,6 +39,10 @@ COMMANDS = ("ipc-recover.md", "main.md")
 SKILL_SRC = os.path.join(SRC, "skills", "multi-terminal-ipc", "SKILL.md")
 SKILL_DST = os.path.join(os.path.expanduser("~"), ".claude", "skills",
                          "multi-terminal-ipc", "SKILL.md")
+# Optional WezTerm fleet-control scripts (2026-08-03): launch all role windows as
+# panes in one WezTerm window, batch /clear + /ipc-recover them between projects.
+WEZTERM_SCRIPTS = ("ipc_wezterm_common.ps1", "ipc_wezterm_launch.ps1",
+                   "ipc_newcycle.ps1")
 
 # (event, command, idempotency marker substring)
 HOOK_SPECS = [
@@ -63,6 +67,11 @@ def _deploy():
         os.makedirs(os.path.dirname(SKILL_DST), exist_ok=True)
         shutil.copyfile(SKILL_SRC, SKILL_DST)
         print(f"  + {SKILL_DST}")
+    for name in WEZTERM_SCRIPTS:
+        src = os.path.join(SRC, name)
+        if os.path.exists(src):
+            shutil.copyfile(src, os.path.join(DST, name))
+            print(f"  + {os.path.join(DST, name)}")
 
 
 def _merge_hooks():

@@ -6,7 +6,7 @@ description: >-
   models, e.g. an Anthropic hub A + a Zhipu/GLM worker B) collaborating as peers
   through a file-based sqlite mailbox (`ipc.py`). Use whenever the user wants to
   ENABLE this collaboration in a new project (onboarding), dispatch work to
-  another terminal, coordinate a hub/worker (A/B/C/D) setup, fan out a task to
+  another terminal, coordinate a hub/worker (A/B/C/D/E) setup, fan out a task to
   workers and collect replies, bring a worker online, recover an IPC role after
   /clear, or asks about the multi-terminal / 多终端 / 多大模型 互通 / 派活给 B /
   主终端从终端 / 星型拓扑 / 信箱 mailbox protocol. Triggers on "在新项目启用/
@@ -103,6 +103,22 @@ window.
 
 Force a specific role at launch: `IPC_ROLE=A claude …` (overrides launch order).
 
+**Preferred since 2026-08-03 — WezTerm pane fleet (automates all of the above):**
+terminals live as panes in one WezTerm window, launched and batch-controlled by
+two user-level scripts (role→pane-id map, no window guessing, no hand-typing):
+
+```powershell
+pwsh ~/.claude/ipc/ipc_wezterm_launch.ps1 -Roles A,B,C,D,E -Project <root>  # spawn lineup, claim roles, park watchers
+pwsh ~/.claude/ipc/ipc_newcycle.ps1                                         # new task cycle: /clear + /ipc-recover per pane
+```
+
+Role→model bindings (A=claude hub, B=kimi, C=glm via ollama, D=deepseek,
+E=codex) are a table at the top of the launch script. The old keepalive daemon
+is DECOMMISSIONED (same date): before dispatching, check `status --watch <role>`
+and wake a DOWN worker by typing into (or relaunching) its pane. Full findings,
+traps, and per-bridge caveats: project-lib memory `wezterm-pane-injection-verified`
+(AI 财务分析 repo, `.claude/memory/`).
+
 ## Command surface (run from project root)
 
 ### Hub A — dispatch & collect
@@ -114,10 +130,9 @@ ipc.py send --from A --to B --body-file task.md       # body from file — REQUI
 ipc.py send --from A --to B "task" --require-watcher  # tri-state: parked=SENT; mid-task (busy fresh)=QUEUED-BUSY exit 0, delivers when B finishes; neither=REFUSED exit 3, not queued
 ipc.py send --from A --to B "task" --submit-id fx7    # idempotency key: a resend with the same key prints DUP and reuses the row — re-dispatch after a barrier timeout is SAFE
 ipc.py send --from A --to B "task" --no-requeue       # fail-closed non-idempotent task: stale lease parks as NEEDS-REVIEW (never auto-requeued/auto-failed)
-ipc.py keepalive --me CODEX,DS                        # liveness-only: beat watcher heartbeat(s) WITHOUT consuming — slot stays dispatchable, rows queue for a window opened later (codex_ipc_worker.ps1 wraps this)
 ipc.py recv --me A                                    # take unread replies (NONE = nothing yet)
 ipc.py recv --me A --block                            # block until a reply arrives
-ipc.py recv --me A --block --count 3                  # BARRIER: after fanning to 3, wait for all 3
+ipc.py recv --me A --block --count 3                  # BARRIER: after fanning to 3, wait for all 3 — COUNT TRAP: a worker that text-replies AND runs `done` sends TWO rows (reply + bodyless ack), so the quota can fill on the fastest workers' pairs; size ~2×workers, or tell workers to close with a single message (a text reply alone already marks done)
 ipc.py recv --me A --json                             # NDJSON envelopes {id,ts,from,type,task,session,body}: type is the machine-readable outcome (reply|ack|fail), task echoes in_reply_to, session identifies the sender session — reply session ≠ the task claimant's => that worker /clear-ed, its context is gone, re-brief before a follow-up (grok-build envelope + sessionId-echo ideas)
 ipc.py peek --me A --tail 5                            # review last 5 WITHOUT marking read
 ipc.py peek --me A --tail 5 --json                     # same, as NDJSON (adds to/unread fields)
@@ -140,7 +155,6 @@ ipc.py fail --me B --task N [--reason ...]   # mark failed (won't requeue)
 ipc_role.py status                 # reconciled view: ownership × heartbeat liveness
 ipc_role.py take A --session <sid> # (re)assign a role to this session
 ipc_role.py reclaim-dead           # free WORKER slots whose watcher heartbeat is gone (hub exempt — watcher-less by design; blind-safe. Rarely needed: claim() sweeps all ghost slots on every SessionStart)
-ipc_role.py take CODEX --session keepalive-codex   # deploy-time ONE-OFF: placeholder-own a daemon-kept channel so the hook never hands it to a random new window (the daemon itself never re-takes)
 ipc.py status --watch B            # ALIVE(parked, 0) / BUSY(executing, 1 — alive, don't re-dispatch) / DOWN(1) + pid/session
 ```
 
@@ -163,58 +177,16 @@ requeue can't make a worker redo finished work. The mailbox also self-trims:
 past 300 rows, handled/terminal history is lazily archived inside
 recv/watch/pending (newest 150 always kept).
 
-## How A waits for replies (watcher)
+## How A waits / recovery after /clear — see the commands
 
-Start **one** persistent Monitor running `ipc.py watch --me A`: each reply fires
-a tiny **SIGNAL** (`NEW MSG #id from …`, never the body); on the signal, read the
-full message with `ipc.py peek --me A --tail 3`. Idle cost ≈ zero. Fallback if
-Monitor is unavailable: `ipc.py recv --me A --block` as a background Bash (exit 0
-= message, 2 = timeout), or `--block --count N` to barrier-collect N replies.
-
-## Recovery after /clear / compaction / hook failure
-
-`/clear` does **not** release the role (the registry keeps `session_id`→role); it
-only kills the background **watcher process**. So recovery = re-establish the
-watcher, **not** re-claim the role.
-- Worker: run **`/ipc-recover B`** (real letter; a user-level command in
-  `~/.claude/commands/`, available in every opted-in project) — starts the
-  persistent Monitor `watch --me B` FIRST; backlog arrives as signals, read via
-  `peek` (watcher-first keeps the lease reaper off heartbeat-less work). Optional
-  second token `daemon[=<comma-list>]` also starts the keepalive daemon guarding
-  those slots (checks for a live one first) — so the slot survives the window
-  closing again.
-- Hub: you are A — continue as hub (or `/main`). A needs no standby watcher.
-- **Don't claim a different role** after /clear — the slot is still held under
-  the old session; a wrong self-claim is how a cleared B wrong-turns into D.
-
-## Daemon-kept slots / named channels (unattended & queued workers)
-
-Role names allow `[A-Za-z0-9_]+` — beyond the letters, define **named channels**
-(e.g. `CODEX`, `DS`) as dedicated model queues, added to `_BASE_ROLES` in `ipc.py`
-(letters first, so a random new window never lands on a channel). An external OS
-loop, `codex_ipc_worker.ps1` (repo root; Windows/pwsh), keeps them alive:
-
-- **keepalive mode (default)** — loops `ipc.py keepalive --me <Role[,Role]>`:
-  heartbeats beat, `--require-watcher` passes, rows queue UNCLAIMED (the reaper
-  ignores unclaimed rows) until the model's interactive window opens and drains
-  the backlog with full context (`/ipc-recover CODEX`). ALIVE then means "will be
-  read when a window opens", not "attended now".
-- **execute mode** (`-Mode execute -Executor codex|claude|claude-ds`) — fully
-  unattended: each task runs headless (`codex exec` read-only sandbox / `claude -p`
-  with a read-only tool allowlist), the reply's `--in-reply-to` link marks the task
-  done, and every error path emits a loud `fail` receipt.
-- **Launch from the project root** (or pass `-WorkRoot`): the script pins cwd, and
-  the mailbox resolves by cwd — a stray cwd means a silent wrong mailbox. This is
-  exactly what happens at BOOT (Startup-folder items start in System32), so boot
-  autostart REQUIRES the pin: copy `examples/ipc-keepalive.cmd` into the Startup
-  folder with `-WorkRoot` set. Verify without rebooting: launch the cmd with
-  `Start-Process -UseNewEnvironment -WorkingDirectory C:\Windows\System32`
-  (clean registry env ≈ logon env), then `status --watch <role>` from the project.
-- **Deploy-time one-off**: `ipc_role.py take CODEX --session keepalive-codex`
-  placeholder-owns the channel in the registry (see Role registry above); neither
-  the daemon nor `/ipc-recover` ever re-takes.
-- **On demand**: `/ipc-recover <role> daemon[=<comma-list>]` checks for a live
-  keepalive covering each slot and hidden-starts the ps1 for any gap.
+These two procedures live in the user-level slash commands (authoritative, do
+not restate here):
+- **Hub duties & collecting replies** → `~/.claude/commands/main.md` (`/main`):
+  persistent Monitor on `watch --me A`, signal → `peek`, bash fallback.
+- **Recovery after /clear / compaction / hook failure** →
+  `~/.claude/commands/ipc-recover.md` (`/ipc-recover <role>`). Key invariant:
+  `/clear` keeps the role, kills only the watcher — recovery = re-park the
+  watcher, never re-claim or switch roles.
 
 ## 注意事项 (the cautions that actually bite)
 
@@ -234,13 +206,8 @@ loop, `codex_ipc_worker.ps1` (repo root; Windows/pwsh), keeps them alive:
    reply.
 5. **A dispatches with `--require-watcher`.** The role registry survives `/clear`
    while the watcher process is dead, so registry ≠ "listening now". Without the
-   flag a task can drop into a black hole. The gate is tri-state: a mid-task worker
-   (busy heartbeat fresh) gets QUEUED-BUSY (exit 0) — the row waits in the mailbox,
-   visible in `pending`, and delivers when the worker next parks/recvs; don't
-   re-dispatch while it stays BUSY. Only neither-parked-nor-busy is refused
-   (exit 3) — then nudge the worker window to re-park its watcher and resend.
-   (`--type note` to a busy worker is fire-and-forget: notes are outside `pending`
-   and the reaper — use a task if delivery must be guaranteed.)
+   flag a task can drop into a black hole. On refusal (exit 3), nudge the worker
+   window to re-park its watcher, then resend.
 6. **Workers close tasks explicitly.** `done --me <self> --task N` when finished
    (a plain reply also marks done, but auto-links to the *oldest* open task, so
    `done --task N` is safer with several open). Call `ack` periodically on a long

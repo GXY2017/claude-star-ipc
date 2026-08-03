@@ -36,12 +36,14 @@ terminals. **Workers talk only to A, never to each other** — collaboration is
 relayed through A. This keeps the anti-echo invariant (only A decides whether to
 continue) linear rather than an N² mesh (a mesh echoes and deadlocks). The number of
 workers is set by `_BASE_ROLES` in `~/.claude/ipc/ipc.py` — the single source of truth,
-which `ipc_role.py` imports — currently the letters A,B,C,D plus the NAMED CHANNELS
-CODEX,DS; to add workers, extend that tuple. Letters = generic interactive windows (the
-hook assigns the lowest free one; letters are listed first so a random new window never
-lands on a channel). Named channels (any `[A-Za-z0-9_]+` name) = dedicated model queues
-kept dispatchable by a keepalive daemon — dispatch with `send --to CODEX`; the model's
-interactive window drains the queue via `/ipc-recover CODEX`.
+which `ipc_role.py` imports — currently the letters A,B,C,D,E plus the legacy named
+channels CODEX,DS; to add workers, extend that tuple. Letters = generic interactive
+windows (the hook assigns the lowest free one; letters are listed first so a random new
+window never lands on a channel). E is bound to the Codex CLI in the reference lineup —
+Codex has no SessionStart hook to claim a role, so give E a one-time registry
+placeholder (`ipc_role.py take E --session codex-cli`) or the hook hands E to the 5th
+random window. The named channels predate the letter lineup and are redundant since the
+2026-08-03 keepalive-daemon decommission — kept only so old queues stay drainable.
 
 > ✅ **The star is now CODE-ENFORCED (2026-06-28).** `send()` rejects any
 > non-hub→non-hub message with `StarViolation` (`send --from B --to C` → `REJECTED`,
@@ -67,7 +69,7 @@ run from its root — validates the install, refuses the home dir, creates the
 **Fixed master/worker roles, to avoid echo loops:**
 - **A = master terminal (hub)**: initiator/decider. Only A decides whether to
   continue; A orchestrates dispatch, synthesis, and reconciliation.
-- **B/C/D = worker terminals**: executors. Respond passively, stop when done, don't
+- **B/C/D/E = worker terminals**: executors. Respond passively, stop when done, don't
   proactively ask follow-ups, don't chit-chat, don't decide on A's behalf.
 
 **Commands (run from the project root):**
@@ -80,7 +82,7 @@ python ipc.py send --from A --to B "task" --require-watcher  # tri-state: watche
 python ipc.py send --from A --to B "task" --no-requeue     # fail-closed: a dead lease parks the row as NEEDS-REVIEW in pending instead of requeueing — use for NON-IDEMPOTENT work (writes/sends), see lifecycle below
 python ipc.py send --from A --to B "task" --submit-id K    # idempotency key scoped to (sender,recipient): resending the same key reuses the existing row (prints DUP) instead of duplicating — makes re-dispatch after a barrier timeout safe; cancel/fail reopens the key
 python ipc.py status --watch B                # ALIVE(parked, exit 0) / BUSY(executing a claimed task, exit 1 — alive, don't re-dispatch) / DOWN(exit 1)
-python ipc.py keepalive --me CODEX,DS         # liveness-only loop: beat watcher heartbeat(s) WITHOUT consuming — require-watcher passes, rows queue unclaimed until an interactive window drains them (comma list = one process keeps several slots; codex_ipc_worker.ps1 wraps this with auto-restart)
+python ipc.py keepalive --me CODEX,DS         # LEGACY (daemon decommissioned 2026-08-03): liveness-only loop that beats heartbeat(s) WITHOUT consuming — rows queue unclaimed until an interactive window drains them
 python ipc.py recv --me B                     # take NEW unread messages addressed to me, mark them read
 python ipc.py recv --me A --block             # block until a new message arrives (prints NONE (timeout) on timeout)
 python ipc.py recv --me A --block --count 3   # BARRIER: after fanning out to 3 workers, one call blocks until all 3 reply (timeout returns the k<3 received)
@@ -142,26 +144,17 @@ Two disciplines this lifecycle REQUIRES (a plain prose reply is no longer enough
   no tracking at all (notes are outside `pending` and the reaper) — fire-and-forget; an
   orphan busy daemon whose session died can hold the gate open until its lease ceiling
   falls (bounded, self-healing window).
-- **Daemon-kept slots (external OS loop, 2026-08).** `codex_ipc_worker.ps1` moves worker
-  liveness out of the model into a standalone PowerShell loop. Default `-Mode keepalive`
-  just loops `ipc.py keepalive --me <Role[,Role]>`: the slot stays dispatchable while rows
-  queue for an interactive window opened later. `-Mode execute` runs each task headless via
-  `-Executor codex|claude|claude-ds` (`codex exec` in a read-only sandbox, or `claude -p`
-  with a read-only tool allowlist), replies `send --body-file --in-reply-to <id>` (the
-  reply link marks the task done) and `fail`s loudly on every error path — one receipt per
-  message, never silent. This is how a non-Claude harness (e.g. Codex CLI) participates as
-  a truly unattended worker. Launch it from the project root or pass `-WorkRoot` — the
-  script pins cwd because the mailbox resolves by cwd, and at BOOT that matters: a
-  Startup-folder launch starts in System32, where the upward project-marker walk falls
-  back to cwd and the daemon silently beats a stray mailbox (every slot DOWN after
-  reboot, daemon looking healthy). Auto-start via the Startup folder — see
-  `examples/ipc-keepalive.cmd`, which also shows how to verify the boot chain without
-  rebooting (`Start-Process -UseNewEnvironment` + System32 cwd).
-  Deploy-time one-off: give a daemon-kept channel its registry placeholder owner ONCE
-  (`ipc_role.py take CODEX --session keepalive-codex`) so the SessionStart hook never
-  hands the channel to a random window; the daemon itself only beats heartbeats and never
-  (re-)takes. `/ipc-recover <role> daemon[=<comma-list>]` starts a missing keepalive on
-  demand (it checks for a live one first).
+- **Worker daemon — DECOMMISSIONED 2026-08-03 (simplest-principle decision).**
+  `codex_ipc_worker.ps1` (keepalive mode keeps a slot dispatchable with no window open;
+  execute mode runs tasks headless via `codex exec` / `claude -p`) and its Startup-folder
+  autostart (`examples/ipc-keepalive.cmd`) still work and stay in the repo for anyone who
+  wants unattended slots, but the reference workflow no longer runs them. Current
+  practice: before dispatching check `status --watch <role>`; wake a DOWN worker by
+  typing into (or relaunching) its WezTerm pane via `ipc_wezterm_launch.ps1` /
+  `ipc_newcycle.ps1`. If you do run the daemon: launch from the project root or pass
+  `-WorkRoot` (the mailbox resolves by cwd — a Startup-folder launch starts in System32
+  and silently beats a stray mailbox), and give a daemon-kept channel a one-time registry
+  placeholder (`ipc_role.py take CODEX --session keepalive-codex`).
 
 **Role registry management (`~/.claude/ipc/ipc_role.py`, 2026-06-28):** role
 assignment is no longer pure launch-order roulette.
@@ -196,7 +189,7 @@ reply shouldn't be blocked even when A isn't watching).
    only new unread messages, so history doesn't re-enter context and token cost
    doesn't grow with message count. Use `peek --tail N` to review context.
 2. Always send via `send`, spelling out `--from` / `--to`.
-3. **Worker (B/C/D)**: receive task → execute → `send --from <self> --to A` the
+3. **Worker (B/C/D/E)**: receive task → execute → `send --from <self> --to A` the
    result → **stop**. Don't proactively `recv` for the next one (unless `/loop` is
    set), and never send directly to another worker (star: reply to A only).
    **Hard rule: any A→worker message returned by the watcher/`recv` MUST get one
@@ -211,7 +204,11 @@ reply shouldn't be blocked even when A isn't watching).
    as a single background Bash: it parks until N replies have arrived and returns
    them together, so the tally lives in that one process and survives A's context
    compression — prefer this over manually re-arming `--block` N times and counting
-   replies by hand (that silently breaks when the count is lost on compaction). On
+   replies by hand (that silently breaks when the count is lost on compaction).
+   **Count trap (2026-08-03):** a worker that text-replies AND then runs `done` sends
+   TWO rows (reply + bodyless ack), so `--count N` can fill up on the fastest workers'
+   pairs before slow workers answer — size the barrier ~2×workers, or tell workers to
+   close with a single message (a text reply alone already marks the task done). On
    timeout the barrier returns the k<N replies received; A diffs the senders it got
    against the workers it dispatched to, finds who is absent, probes them
    (`status --watch X`, or a `--require-watcher` ping) and re-dispatches — but cap
@@ -275,7 +272,10 @@ background Bash watcher (a pure OS background process can't push-wake Claude). S
 park its watcher (backlog then arrives as signals)** per the injected instructions;
 "self-driving with zero keystrokes on open" is impossible — that's a harness floor,
 not a config defect. (Before dispatching, A should remind the user to type one line
-in each worker window to bring it online.)
+in each worker window to bring it online. The WezTerm fleet scripts —
+`ipc_wezterm_launch.ps1` to spawn one pane per role with `IPC_ROLE` preset, and
+`ipc_newcycle.ps1` to batch `/clear` + `/ipc-recover` them for a fresh task cycle —
+automate exactly this keystroke by injecting text into each pane.)
 
 After that it self-drives: a worker idles without spending tokens; when A dispatches,
 the worker's Monitor signals it, it executes and `send`s the result back, and the same
@@ -291,9 +291,9 @@ on `/clear`, and even if it did, the "manual floor" means a blank `ok` won't tel
 what to do). **Recover explicitly:** run **`/ipc-recover B`** (a USER-LEVEL command at
 `~/.claude/commands/ipc-recover.md`, available in every opted-in project; it takes the role as
 `$ARGUMENTS`, or reads it from any injected context; it starts the persistent Monitor
-`watch --me <role>` FIRST — backlog arrives as signals, read via `peek`; optional second
-token `daemon[=<comma-list>]` also starts the keepalive daemon guarding those slots when
-none is running — see the command file's step 5). **孤儿盯哨现由代码处理,不靠语义提醒(2026-06-30 代际令牌):**
+`watch --me <role>` FIRST — backlog arrives as signals, read via `peek`; the `daemon`
+token is RETIRED 2026-08-03 with the keepalive-daemon decommission — wake a DOWN worker
+via its WezTerm pane instead). **孤儿盯哨现由代码处理,不靠语义提醒(2026-06-30 代际令牌):**
 起新 `watch --me <role>` 时该 watcher 领一个递增代际号,使**同角色**任何旧/孤儿盯哨(如挺过 `/clear`
 仍在跑的旧进程)在下一轮 poll 自动退役(打印 `WATCHER ... retired` 后干净退出)——残留在死会话里的盯哨
 不会再黑洞本信箱,恢复时**无需手动找停同角色盯哨**。(唯一例外是代码管不到的:跑错角色——`watch --me D`
