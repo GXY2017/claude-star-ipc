@@ -47,7 +47,7 @@ $LaunchCmd = @{
 # sync with $LaunchCmd when rebinding a role; a role without a tag falls back to
 # the bare letter.
 $ModelTag = @{
-    A     = 'opus5'
+    A     = 'Claude'     # generic — the hub's model is switched in-session (/model), a version tag would go stale
     B     = 'kimi-k3'
     C     = 'glm5.2'
     D     = 'deepseek'
