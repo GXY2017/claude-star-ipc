@@ -220,6 +220,15 @@ reply shouldn't be blocked even when A isn't watching).
    read-only data pulls are idempotent, so the risk is low — but keep it in mind if
    parallel work ever extends to writes). Synthesis (reconciliation, coverage check,
    final call) always stays with A, never delegated to workers.
+   **Quota-aware dispatch:** in a cross-vendor fleet each worker model runs on its
+   own paid plan with independent limits — before fan-out, rough-estimate per-task
+   token cost (input to read + expected output + tool overhead) and size every task
+   to finish within that worker's available quota. Quota exhaustion shows as a
+   mid-task HANG (rate-limit banner in the worker's terminal), not a clean `fail` —
+   on a stall, read the worker's pane (`wezterm cli get-text`) for quota errors
+   BEFORE re-dispatching; resending into a dry model only burns attempts. Prefer
+   small slices with results written to disk so a quota death loses one slice, not
+   the job.
 5. Fold a bare acknowledgement ("got it") into the substantive reply where possible;
    don't send a message just to acknowledge — save tokens.
 6. **A waits for worker replies (watcher).** **[LOCAL TRIAL 2026-06-27 — default
