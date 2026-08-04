@@ -163,7 +163,7 @@ themselves.
 - **Workers are serial.** One task at a time per worker; for synchronized parallel
   joins inside one context, use subagents instead.
 - **One manual keystroke per worker window** (harness floor — hooks can't fire a
-  worker's first tool call). The WezTerm scripts automate the keystroke.
+  worker's first tool call). The WezTerm scripts automate the keystroke, and another AI can handle WezTerm.
 - Role names must match `[A-Za-z0-9_]+` (they become heartbeat filenames).
 
 ## License
