@@ -18,6 +18,7 @@ description: 恢复本终端的 IPC 待命(/clear、上下文压缩或 SessionSt
 1. **确定角色**(按优先级,**别盲信旧注入**):
    - **首选 `$ARGUMENTS`**(语法 `<角色> [daemon[=<守护角色逗号表>]]`):第 1 个令牌 = 角色 = 本终端的**开启次第**——第1台(hub)=A、第2台=B、第3台=C、第4台=D(具名通道如 CODEX/DS 也可直接写)。用户知道这是第几台,所以 `/ipc-recover B` 就是"我是第2台=B"。**有参数一律以参数为准**。第 2 个令牌可选:`daemon` 或 `daemon=CODEX,DS`,表示同步拉起 keepalive 守护进程,见第 5 步。
    - 无参数时:跑 `python ~/.claude/ipc/ipc_role.py status` 看注册表×心跳的对账视图,判断哪个角色槽该是你(你的会话若仍匹配某槽的 session_id 即用它;/clear 换过 sid 则匹配不到)。**不要只凭上下文里的 `[IPC role: ...]` 注入块**——它在 /clear 后可能过期或错误(例:曾被误判成 D)。
+   - ⚠️ **别拿 session id 判断"我的槽被抢了"(2026-08-03 实测 wrong-turn 变种)**:/clear 会换新 `session_id`,但环境变量(`CLAUDE_SESSION_ID`)和旧注入块里的 sid 是**过期旧值**。拿它对照注册表,会把 SessionStart 钩子**刚替你的新会话**重新认领的槽(WezTerm pane 预置 `IPC_ROLE` 时钩子按它确定性认领)误判成"被另一个 live 会话抢走",进而转投别的空闲槽——实例:newcycle 批量 /clear 后,B(Kimi)据 stale sid 误判 B 被抢,claim 了空闲的 E 还挂了 E 盯哨,占掉 codex 的注册表占位,直到 `/ipc-recover B` 执行时才自我纠正。**判据永远是"角色该不该是你"(参数/开启次第),不是 sid 匹配**:即便 `status` 显示你的角色由"别的" live 会话持有,只要参数/次第说你是 B,就直接按第 3 步给 B 挂盯哨(不必重 take——`recv`/`watch` 不依赖注册表,且同角色旧盯哨会被代际令牌自动退役),**绝不改投其他空闲槽**。
    - 仍不确定 → 问用户"这是第几台终端(→A/B/C/D)"。
    - ⚠️ **若你发现自己当前正以"错误角色"挂着盯哨**(如本该是 B 却在跑 `watch --me D`):先 `TaskStop` 那个错角色的 Monitor,再按正确角色走第 3 步。**代际令牌帮不了这一步**——它只让同角色的新盯哨退掉旧的,跑错角色(B 在跑 `watch --me D`)是**两个不同信箱**,起 `watch --me B` 不会退掉 `watch --me D`,必须手动 `TaskStop`。幂等"已恢复"判断要基于**正确角色**,不是基于你碰巧在跑的那个。
 
