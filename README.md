@@ -150,6 +150,8 @@ themselves.
 | `ipc.py` | the mailbox CLI — stdlib only, harness-neutral core |
 | `.claude/hooks/ipc_role.py` | `SessionStart`/`SessionEnd` hook: auto-assigns roles, injects behavior |
 | `ipc_wezterm_launch.ps1` / `ipc_newcycle.ps1` / `ipc_wezterm_common.ps1` | WezTerm fleet control: spawn one pane per role, batch-reset between tasks |
+| `ipc_fleet1_restart.ps1` / `ipc_fleet2_launch.ps1` / `mux-fleet*.lua` | mux-domain fleets (2026-08-17): panes live under a per-fleet `wezterm-mux-server`, the GUI is a detachable view; precise restart + independent second formation (role X) |
+| `ipc_dispatch.ps1` / `ipc_wake_pane.ps1` / `ipc_pane_exit.ps1` | per-pane ops: one-shot park+queue+nudge dispatch, wake an unattended pane (codex-safe), clean pane exit that retires the watcher |
 | `.claude/commands/main.md`, `ipc-recover.md` | slash commands: `/main` (assert hub), `/ipc-recover` (rebuild watcher after `/clear`) |
 | `skills/multi-terminal-ipc/SKILL.md` | operating + onboarding skill |
 | `CLAUDE.md` | the protocol the terminals follow |

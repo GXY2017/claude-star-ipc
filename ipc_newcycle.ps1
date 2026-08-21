@@ -54,6 +54,36 @@ foreach ($r in $Roles) {
     }
 
     $clear = if ($ClearCmd.ContainsKey($r)) { $ClearCmd[$r] } else { '/clear' }
+
+    if ($ClearCmd.ContainsKey($r)) {
+        # Codex pane hazards (2026-08-05): the TUI may have died back to the shell
+        # (then /new becomes a pwsh command error), and Ctrl+C during its MCP
+        # startup kills the TUI. Probe the screen first.
+        $lastLine = (Get-PaneText $paneId) | Where-Object { $_ -match '\S' } | Select-Object -Last 1
+        if ($lastLine -match '^\s*PS .*>') {
+            # TUI dead - relaunch instead; a fresh process IS a fresh context, no /new needed.
+            Submit-PaneText $paneId 'codex'
+            $deadline = (Get-Date).AddSeconds(90)
+            while ((Get-Date) -lt $deadline) {
+                Start-Sleep -Seconds 3
+                if (((Get-PaneText $paneId) -join ' ') -match 'Context \d+% left') { break }
+            }
+            $results += "[$r] pane $paneId : TUI was dead - relaunched codex (fresh context)"
+            continue
+        }
+        $deadline = (Get-Date).AddSeconds(90)
+        while (((Get-PaneText $paneId) -join ' ') -match 'Starting MCP servers' -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 3
+        }
+        # Ctrl+C QUITS the codex TUI even when idle (verified 2026-08-05) - never
+        # Clear-PaneInput here; Esc clears the composer without killing the app.
+        Send-PaneText $paneId ([string][char]27)
+        Start-Sleep -Milliseconds 400
+        Submit-PaneText $paneId $clear
+        $results += "[$r] pane $paneId : $clear (no wake)"
+        continue
+    }
+
     Clear-PaneInput $paneId
     Submit-PaneText $paneId $clear
     Start-Sleep -Seconds 3
@@ -63,7 +93,8 @@ foreach ($r in $Roles) {
             else { "/ipc-recover $r" }
     if ($wake) { Submit-PaneText $paneId $wake }
 
-    $results += "[$r] pane $paneId : $clear" + $(if ($wake) { " -> $wake" } else { " (hub, no recover)" })
+    $suffix = if ($wake) { " -> $wake" } elseif ($r -eq $Hub) { " (hub, no recover)" } else { " (no wake)" }
+    $results += "[$r] pane $paneId : $clear" + $suffix
 }
 
 Write-Host ($results -join "`n")

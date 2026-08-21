@@ -56,6 +56,7 @@ import json
 import os
 import re
 import sqlite3
+import stat as stat_mod
 import subprocess
 import sys
 import time
@@ -514,12 +515,33 @@ def _conn():
             gen  INTEGER NOT NULL
         )"""
     )
+    # Lazy column migration (2026-08-17, #1188 F2): CREATE TABLE IF NOT EXISTS
+    # never extends an EXISTING table, so a new column must be ALTERed in.
+    # last_seen_ts = epoch of the recipient's last code-knowable sign of life
+    # on this task (stamped at claim, on ack, and when a linked reply/fail/ack
+    # row arrives). NULL on pre-migration rows and after redeliver = unknown,
+    # never judged. One PRAGMA per connection; idempotent.
+    if not any(r[1] == "last_seen_ts"
+               for r in conn.execute("PRAGMA table_info(messages)")):
+        conn.execute("ALTER TABLE messages ADD COLUMN last_seen_ts REAL")
     return conn
 
 
 class WatcherDown(Exception):
     """Raised by send() when require_watcher is set but the recipient's
     --block watcher is not parked/listening."""
+
+
+class SquatterHeartbeat(WatcherDown):
+    """Raised by send() when require_watcher is set, the recipient's heartbeat
+    is FRESH, but the role has NO owner in the registry (and no busy beat): the
+    beater is an ownerless squatter — e.g. an orphan watcher surviving a hard
+    fleet kill (2026-08-17 #1186 incident: orphan pid beat B's slot for 2h47m
+    after its session died at 07:22, passed the gate at 10:08:57, then died on
+    its first signal print and rolled back the claim — task sat QUEUED
+    attempts=0 with no consumer and no alarm). A fresh heartbeat alone cannot
+    distinguish that orphan from a live worker; registry ownership is the
+    tie-breaker, so parked-evidence now requires BOTH. args = (role, pid)."""
 
 
 class StarViolation(Exception):
@@ -547,7 +569,12 @@ HUB = os.environ.get("IPC_HUB", "A")
 # or the hook hands E to the 5th random interactive window). CODEX/DS named
 # channels predate the WezTerm lineup (B=kimi C=glm D=ds E=codex) and are
 # redundant since the 2026-08-03 daemon decommission — kept only for old queues.
-_BASE_ROLES = ("A", "B", "C", "D", "E", "CODEX", "DS")
+# X = second-formation slot (user rule 2026-08-09): a SECOND wezterm window may
+# join the fleet with exactly ONE pane holding exactly this role. Deliberately
+# LAST so _take_auto's launch-order roulette never reaches it — X is claimed
+# only via explicit IPC_ROLE=X. Plain worker otherwise (star topology: talks
+# to the hub only).
+_BASE_ROLES = ("A", "B", "C", "D", "E", "F", "CODEX", "DS", "X")
 ROLES = _BASE_ROLES if HUB in _BASE_ROLES else (HUB,) + _BASE_ROLES
 
 
@@ -609,8 +636,26 @@ def task_done(conn, tid):
     ).fetchone() is not None
 
 
+# A QUEUED task nobody has claimed for this long, while its recipient is not
+# even busy, is a black-hole alarm (#1186 incident: sent 10:08:57, consumer died
+# 10:08:59, sat QUEUED attempts=0 with no signal anywhere until a human noticed
+# at ~10:33). Surfaced by pending as QUEUED-STALLED — display-layer only, the
+# reaper and gates are untouched.
+_STALL_AFTER = 300
+# A CLAIMED task whose recipient has shown no code-knowable sign of life
+# (claim, ack, linked reply/fail — see last_seen_ts) for this long is flagged
+# IN-PROGRESS-SILENT (#1188 type-2 incident: claimed at 10:14, the signal sat
+# in a background-shell file for 1h55m, busy heartbeat fresh throughout —
+# "working for two hours" and "never started" were indistinguishable).
+# Display-layer only: legit long tasks look identical, so this NEVER requeues
+# — the cure for a false flag is the worker's `ack --task N` (protocol: first
+# action on receiving a task). Deliberately NOT merged into NEEDS-REVIEW,
+# which is a reaper/lease lifecycle state; SILENT is a display inference.
+_SILENT_AFTER = 1800
+
+
 def task_state(conn, tid, recipient, handled, lease_until, tombstone,
-               no_requeue=0):
+               no_requeue=0, ts=None, last_seen_ts=None):
     """Derive the lifecycle state of a task row. No state column — everything is
     computed from (handled, lease_until, attempts, tombstone, in_reply_to, now,
     heartbeat). tombstone takes precedence over done/in_progress so cancelled/failed
@@ -628,8 +673,28 @@ def task_state(conn, tid, recipient, handled, lease_until, tombstone,
     if task_done(conn, tid):
         return "DONE"
     if handled == 0:
+        # QUEUED-STALLED: unclaimed past _STALL_AFTER while the recipient is
+        # not busy either. A parked watcher claims within one poll interval, so
+        # old-and-unclaimed means NO working consumer exists (dead, orphaned,
+        # or beating-without-claiming) — the exact state that needs a human/hub
+        # eye. A busy recipient legitimately queues work until it re-parks, so
+        # busy suppresses the alarm (same margin as the reaper's liveness).
+        if ts is not None and not worker_busy(recipient, _LEASE_MARGIN):
+            try:
+                age = time.time() - time.mktime(
+                    time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
+            except (ValueError, OverflowError):
+                age = 0
+            if age > _STALL_AFTER:
+                return "QUEUED-STALLED"
         return "QUEUED"  # attempts>0 means requeued; caller shows attempts separately
     if _lease_alive(recipient, lease_until):
+        # NULL last_seen_ts = unknown (pre-migration claim or post-redeliver):
+        # never judged — a wrong SILENT is noise, an absent one costs nothing
+        # extra over the pre-F2 world.
+        if (last_seen_ts is not None
+                and (time.time() - last_seen_ts) > _SILENT_AFTER):
+            return "IN-PROGRESS-SILENT"
         return "IN_PROGRESS"
     return "NEEDS-REVIEW" if no_requeue else "STALE"
 
@@ -707,21 +772,41 @@ def send(sender, recipient, body, *, in_reply_to=None, msg_type=None, hop=None,
         if dup:
             return dup[0], False, False
     queued_busy = False
-    if require_watcher and not watcher_alive(recipient, max_age, verify_owner=True):
-        # Not parked. A fresh busy heartbeat is code-forked at claim time and
-        # expires at done/fail/cancel/lease-ceiling, so it is strong (not
-        # perfect: an orphan daemon whose session died keeps beating until the
-        # lease ceiling — a BOUNDED window, C review B-2 2026-08-01) evidence
-        # the worker exists — queue instead of refusing. Only
-        # neither-parked-nor-busy (provably absent) still refuses.
-        # Same max_age as the .alive check, NOT _BUSY_FRESH: status --watch
-        # judges busy on max_age too, and the two gates disagreeing (status
-        # says BUSY, send says REFUSED) is observable boundary jitter (C review
-        # B-1). _BUSY_FRESH stays what it was built for: the spawn guard.
-        if worker_busy(recipient, max_age):
-            queued_busy = True
-        else:
-            raise WatcherDown(recipient)
+    if require_watcher:
+        parked = watcher_alive(recipient, max_age, verify_owner=True)
+        # Ownerless-squatter gate (2026-08-17, #1186 incident): a fresh
+        # heartbeat whose role has NO registry owner is NOT parked-evidence.
+        # An orphan watcher surviving a hard fleet kill beats indistinguishably
+        # from a live worker (its own anchors can all fail: parent pins an
+        # intermediate shell, a hard kill runs no SessionEnd so the registry
+        # never changes, and no successor bumps the gen), then dies on its
+        # first signal print and rolls the claim back — the task black-holes
+        # AFTER the gate approved. Registry ownership ("manual" counts) is the
+        # code-knowable tie-breaker every recovered worker has; requiring it
+        # turns that silent black hole into an actionable refusal. The busy
+        # fallback below is untouched, so a mid-task worker that never claimed
+        # the registry still queues as QUEUED-BUSY rather than refusing.
+        squatter = parked and _registry_session(recipient) is None
+        if squatter or not parked:
+            # Not parked (or parked-but-ownerless). A fresh busy heartbeat is
+            # code-forked at claim time and expires at
+            # done/fail/cancel/lease-ceiling, so it is strong (not perfect: an
+            # orphan daemon whose session died keeps beating until the lease
+            # ceiling — a BOUNDED window, C review B-2 2026-08-01) evidence
+            # the worker exists — queue instead of refusing. Only
+            # neither-parked-nor-busy (provably absent) still refuses.
+            # Same max_age as the .alive check, NOT _BUSY_FRESH: status --watch
+            # judges busy on max_age too, and the two gates disagreeing (status
+            # says BUSY, send says REFUSED) is observable boundary jitter (C
+            # review B-1). _BUSY_FRESH stays what it was built for: the spawn
+            # guard.
+            if worker_busy(recipient, max_age):
+                queued_busy = True
+            elif squatter:
+                raise SquatterHeartbeat(
+                    recipient, (watcher_identity(recipient) or {}).get("pid"))
+            else:
+                raise WatcherDown(recipient)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lease_secs = None if (lease is None or lease <= 0) else int(lease)
     lease_until = None if lease_secs is None else time.time() + lease_secs
@@ -760,6 +845,13 @@ def send(sender, recipient, body, *, in_reply_to=None, msg_type=None, hop=None,
             dup = _dup_by_submit_id(conn, sender, recipient, submit_id)
             if dup:
                 return dup[0], False, False
+        # A linked reply/fail/ack from the worker is a sign of life on the
+        # parent task: refresh its last_seen_ts so IN-PROGRESS-SILENT clears
+        # (2026-08-17 F2). Tasks/notes linked via in_reply_to (hub follow-ups)
+        # say nothing about the WORKER's liveness, so they don't stamp.
+        if in_reply_to is not None and msg_type in ("reply", "fail", "ack"):
+            conn.execute("UPDATE messages SET last_seen_ts=? WHERE id=?",
+                         (time.time(), in_reply_to))
         return cur.lastrowid, True, queued_busy
 
 
@@ -829,15 +921,17 @@ def _claim_one(conn, me):
     is RESET to now + lease_secs (claim-time lease: the runway starts when the work
     starts, see send()). Takes the caller's conn so watch() can reap and claim
     within one connection."""
+    _now = time.time()
     return conn.execute(
         "UPDATE messages SET handled=1, status='delivered', attempts=attempts+1, "
+        "last_seen_ts=?, "
         "lease_until=CASE WHEN lease_secs IS NULL THEN lease_until "
         "ELSE ? + lease_secs END "
         "WHERE id=("
         "  SELECT id FROM messages WHERE recipient=? AND handled=0 "
         "  ORDER BY id LIMIT 1"
         ") RETURNING id, ts, sender, body, msg_type, in_reply_to",
-        (time.time(), me),
+        (_now, _now, me),
     ).fetchone()
 
 
@@ -851,15 +945,16 @@ def pending(hub):
         _reap_stale(conn, hub=hub)
         rows = conn.execute(
             "SELECT t.id, t.recipient, t.ts, t.handled, t.lease_until, t.tombstone, "
-            "t.attempts, t.no_requeue FROM messages t "
+            "t.attempts, t.no_requeue, t.last_seen_ts FROM messages t "
             "WHERE t.sender=? AND t.msg_type='task' AND t.tombstone IS NULL "
             "ORDER BY t.id", (hub,)).fetchall()
         out = []
-        for rid, recipient, ts, handled, lease_until, tombstone, attempts, norq in rows:
+        for (rid, recipient, ts, handled, lease_until, tombstone, attempts,
+             norq, seen) in rows:
             if task_done(conn, rid):
                 continue
             st = task_state(conn, rid, recipient, handled, lease_until, tombstone,
-                            norq)
+                            norq, ts=ts, last_seen_ts=seen)
             out.append((rid, recipient, ts, st, attempts))
         return out
 
@@ -977,13 +1072,15 @@ def recv(me):
     returned — redelivering them would redo a completed task."""
     with _conn() as conn:
         _reap_stale(conn, me=me)
+        _now = time.time()
         rows = conn.execute(
             "UPDATE messages SET handled=1, status='delivered', attempts=attempts+1, "
+            "last_seen_ts=?, "
             "lease_until=CASE WHEN lease_secs IS NULL THEN lease_until "
             "ELSE ? + lease_secs END "
             "WHERE recipient=? AND handled=0 "
             "RETURNING id, ts, sender, body, msg_type, in_reply_to, session",
-            (time.time(), me),
+            (_now, _now, me),
         ).fetchall()
         # Done-drop: claimed (handled=1, so archive can sweep it) but not handed
         # to the caller. task_done is False for ordinary replies in a hub's inbox
@@ -1091,39 +1188,126 @@ def _current_gen(conn, role):
 # watcher whose role nobody re-takes had NO anchor and could squat "live" for
 # days (seen 2026-07-03: a bare `watch --me A` beat for 20h after its purpose
 # ended). Two cheap per-poll checks close that class:
-#   * parent death — at startup grab a SYNCHRONIZE handle to the parent process
-#     (the handle pins the process object, immune to PID reuse); each poll a
-#     0-timeout wait tells us if it exited. POSIX fallback: getppid() changed
-#     (reparented to init/subreaper). Parent gone -> retire.
+#   * anchor-process death — at startup pin the process whose lifetime this
+#     watcher should share and grab a SYNCHRONIZE handle to it (the handle pins
+#     the process object, immune to PID reuse); each poll a 0-timeout wait tells
+#     us if it exited. The pinned process is NOT the direct parent: review #537
+#     (2026-08-21) proved the direct parent is a shell-snapshot bash wrapper
+#     chain that OUTLIVES the TUI (python <- bash x3 <- claude.exe), which let a
+#     watcher survive its dead TUI for 30+ min while the same surviving bash
+#     chain also held the stdout pipe open (so _StdoutDead stayed silent too).
+#     Pin order: IPC_ANCHOR_PID env (bringup scripts pass the TUI pid
+#     explicitly) > nearest TUI-host ancestor (claude/codex/node, via a
+#     Toolhelp32 walk) > direct parent (legacy fallback). POSIX keeps the
+#     original getppid()-changed detection. Anchor gone -> retire.
 #   * registry owner change — snapshot this role's owner in ipc_roles.json at
 #     startup; if a later poll sees a DIFFERENT owner (another session took the
 #     role, or SessionEnd released it), this watcher is obsolete -> retire.
 #     Read errors return _REG_ERR and skip the check (never retire on a
-#     transient failure; missing registry = anchor off).
+#     transient failure; missing registry = anchor off). Startup exception
+#     (#537 bring-up ordering trap): see watch() — an unclaimed/manual owner
+#     turning into a real claim moments after this watcher started is our own
+#     session's take, not an eviction, and is adopted instead of retired on.
 
 _REG_ERR = object()  # sentinel: registry unreadable this poll (skip, don't retire)
+_REG_ANCHOR_GRACE = 45   # s after watch start in which None/manual -> claimed
+                         # is adopted as "my own take" instead of retiring
 
 _WAIT_OBJECT_0 = 0
 _SYNCHRONIZE = 0x00100000
 
+# Executables that host an interactive agent session ("the TUI"). The nearest
+# ancestor with one of these names is what a pane's watcher should die with.
+_TUI_EXES = {"claude.exe", "codex.exe", "node.exe"}
 
-def _parent_anchor():
-    """(handle, ppid) pinning the parent process for death-detection.
-    Windows: a SYNCHRONIZE handle (or None if OpenProcess failed -> anchor off).
-    POSIX: (None, ppid) — death detected by getppid() changing."""
+
+def _process_table():
+    """{pid: (ppid, exe_name_lowercase)} for every live process, via a
+    Toolhelp32 snapshot (Windows only). Raises on API failure — callers fall
+    back to pinning the direct parent, the pre-#537 behaviour."""
+    import ctypes
+    from ctypes import wintypes
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    k32 = ctypes.windll.kernel32
+    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    k32.Process32FirstW.argtypes = [ctypes.c_void_p,
+                                    ctypes.POINTER(PROCESSENTRY32W)]
+    k32.Process32NextW.argtypes = [ctypes.c_void_p,
+                                   ctypes.POINTER(PROCESSENTRY32W)]
+    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        raise OSError("CreateToolhelp32Snapshot failed")
+    table = {}
+    try:
+        e = PROCESSENTRY32W()
+        e.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = k32.Process32FirstW(snap, ctypes.byref(e))
+        while ok:
+            table[int(e.th32ProcessID)] = (int(e.th32ParentProcessID),
+                                           e.szExeFile.lower())
+            ok = k32.Process32NextW(snap, ctypes.byref(e))
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(snap))
+    return table
+
+
+def _anchor_target():
+    """(pid, label) of the process whose death should retire this watcher.
+    Windows: IPC_ANCHOR_PID env > nearest TUI-host ancestor > direct parent.
+    POSIX: always the direct parent (getppid-changed detection unchanged)."""
     ppid = os.getppid()
     if os.name != "nt":
-        return None, ppid
+        return ppid, f"ppid:{ppid}"
+    env = (os.environ.get("IPC_ANCHOR_PID") or "").strip()
+    if env.isdigit():
+        return int(env), f"env:{env}"
+    try:
+        table = _process_table()
+        pid, hops = ppid, 0
+        while pid and pid in table and hops < 12:
+            parent, exe = table[pid]
+            if exe in _TUI_EXES:
+                return pid, f"{exe}:{pid}"
+            if parent == pid:
+                break
+            pid, hops = parent, hops + 1
+    except Exception:
+        pass  # snapshot unavailable: legacy direct-parent pinning
+    return ppid, f"ppid:{ppid}"
+
+
+def _parent_anchor():
+    """(handle, pid, label) pinning the anchor process for death-detection.
+    Windows: a SYNCHRONIZE handle (or None if OpenProcess failed -> anchor off).
+    POSIX: (None, ppid, label) — death detected by getppid() changing."""
+    pid, label = _anchor_target()
+    if os.name != "nt":
+        return None, pid, label
     import ctypes
-    h = ctypes.windll.kernel32.OpenProcess(_SYNCHRONIZE, False, ppid)
-    return (h or None), ppid
+    h = ctypes.windll.kernel32.OpenProcess(_SYNCHRONIZE, False, pid)
+    return (h or None), pid, label
 
 
 def _parent_dead(handle, start_ppid):
-    """Has the process that launched us exited?"""
+    """Has the anchor process (see _anchor_target) exited?"""
     if os.name == "nt":
         if handle is None:
-            return False  # couldn't pin the parent; anchor off, never false-fire
+            return False  # couldn't pin the anchor; anchor off, never false-fire
         import ctypes
         return (ctypes.windll.kernel32.WaitForSingleObject(handle, 0)
                 == _WAIT_OBJECT_0)
@@ -1141,7 +1325,63 @@ def _registry_owner(role):
         return _REG_ERR
 
 
-def watch(me, interval):
+class _StdoutDead(Exception):
+    """watch()-internal: the signal pipe (stdout) is gone — the Monitor/session
+    that owns this watcher is dead, so this process is an orphan. Raised INSIDE
+    the claim transaction so the sqlite connection context manager rolls the
+    claim back (the un-signalled message returns to QUEUED for the next real
+    consumer instead of being swallowed handled=1), then handled by watch() as:
+    drop heartbeat, leave a disk trace, clean exit. Before 2026-08-17 this case
+    was an ACCIDENT: print raised, the except handler's own sys.stderr.write
+    raised again (stderr equally dead), the escape rolled back the claim and
+    killed the process — right outcome, but the heartbeat file stayed looking
+    fresh for max_age and nothing on disk said why (#1186 incident)."""
+
+
+def _stdout_is_regular_file():
+    """True iff stdout is a plain on-disk file — the signature of a watch()
+    hosted in a background Bash task (its output is redirected to a task file
+    the harness only surfaces on process EXIT, never per line). A Monitor and a
+    foreground shell both give a pipe/console. Probe failure returns False:
+    never refuse on an inconclusive probe (a false refusal is worse than
+    letting an exotic host through)."""
+    try:
+        return stat_mod.S_ISREG(os.fstat(sys.stdout.fileno()).st_mode)
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _emit(line):
+    """Print one watcher line; False if stdout is dead (EPIPE/EINVAL/closed).
+    Never raises: emission failure is a liveness signal, not an error."""
+    try:
+        print(line, flush=True)
+        return True
+    except (OSError, ValueError):  # ValueError: I/O operation on closed file
+        return False
+
+
+def _orphan_exit(me, reason):
+    """This watcher's consumer is gone: stop advertising the slot as parked
+    (remove the heartbeat NOW instead of letting it read fresh for another
+    max_age) and leave a trace in the state dir — stdout/stderr are dead, so
+    disk is the only place a post-mortem can read. Narrow race accepted: if a
+    NEW live watcher just took this role, deleting the shared per-role
+    heartbeat blanks its beat for under one poll interval (it re-beats next
+    poll) — a brief false DOWN, far cheaper than an orphan's evergreen file."""
+    try:
+        os.remove(_heartbeat_path(me))
+    except OSError:
+        pass
+    try:
+        with open(os.path.join(_STATE_DIR, f"_watcher_{me}.exit.log"), "a",
+                  encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat()} pid={os.getpid()} {reason}\n")
+    except OSError:
+        pass
+
+
+def watch(me, interval, allow_file_stdout=False):
     """Poll forever, printing a tiny SIGNAL for each new message for `me`.
     Designed to run under the Monitor tool with persistent=true: each printed
     line becomes an event/notification, so ONE long-lived Monitor replaces
@@ -1188,42 +1428,73 @@ def watch(me, interval):
     per-role (one _watcher_<me>.alive), so removing it would delete the NEW live
     watcher's heartbeat and briefly false-report DOWN; the retired watcher simply
     stops touching it and the new watcher's _beat owns its mtime."""
+    # Host gate (2026-08-17, #1188 type-2 incident): a watch whose stdout is a
+    # regular file is hosted in a background Bash task — its signals land in a
+    # file the harness surfaces only on process EXIT, so a claimed task's
+    # signal can sit unread for hours while status/busy/reaper all say fine
+    # (observed: 1h55m delivery gap). Refusing HERE is self-correcting: in a
+    # background bash the immediate exit fires the task-notification at once,
+    # so the agent reads this message seconds later and re-arms under Monitor.
+    if _stdout_is_regular_file() and not allow_file_stdout:
+        print(f"WATCH REFUSED for {me}: stdout is a regular file — this watch "
+              f"is hosted in a background shell, whose output is only "
+              f"surfaced when the process exits. Signals would black-hole "
+              f"(incident #1188: 1h55m delivery gap). Host the watcher under "
+              f"the Monitor tool (persistent) instead: "
+              f'python "{os.path.abspath(__file__)}" watch --me {me} . '
+              f"If file-stdout hosting is genuinely intended, re-run with "
+              f"--allow-file-stdout.", flush=True)
+        sys.exit(4)
     with _conn() as conn:
         my_gen = _bump_gen(conn, me)
-    parent_h, parent_pid = _parent_anchor()
+    parent_h, parent_pid, anchor_label = _parent_anchor()
+    t0 = time.time()              # registry anchor's bring-up grace window base
     owner0 = _registry_owner(me)  # snapshot; owner drift => this watcher is obsolete
     anchors = (
-        f"anchors: parent={'on' if (parent_h or os.name != 'nt') else 'off'}, "
+        f"anchors: parent={anchor_label if (parent_h or os.name != 'nt') else 'off'}, "
         f"registry={'off' if owner0 is _REG_ERR else 'on'}"
     )
-    print(f"WATCHER #{my_gen} for {me} online ({anchors})", flush=True)
+    if not _emit(f"WATCHER #{my_gen} for {me} online ({anchors})"):
+        return  # stdout dead before we ever advertised: nothing to clean up
     while True:
         try:
             with _conn() as conn:
                 cur = _current_gen(conn, me)
                 if cur > my_gen:
-                    print(
+                    _emit(
                         f"WATCHER for {me} retired: superseded by gen {cur} "
-                        f"(was #{my_gen})",
-                        flush=True,
+                        f"(was #{my_gen})"
                     )
                     return  # clean exit; the Monitor task ends — no orphan black hole
                 if _parent_dead(parent_h, parent_pid):
-                    print(
+                    _emit(
                         f"WATCHER for {me} retired: parent process gone "
-                        f"(was #{my_gen})",
-                        flush=True,
+                        f"(was #{my_gen})"
                     )
                     return
                 owner = _registry_owner(me)
                 if (owner0 is not _REG_ERR and owner is not _REG_ERR
                         and owner != owner0):
-                    print(
-                        f"WATCHER for {me} retired: registry owner changed "
-                        f"{owner0!r} -> {owner!r} (was #{my_gen})",
-                        flush=True,
-                    )
-                    return
+                    if (owner is not None
+                            and owner0 in (None, "manual")  # ipc_role.MANUAL_SID
+                            and time.time() - t0 <= _REG_ANCHOR_GRACE):
+                        # Bring-up ordering trap (#537): "take the role, THEN
+                        # park the watcher" inverted — a claim landing moments
+                        # after this watcher started is this pane's own take,
+                        # not a foreign eviction. Adopt the new owner. A change
+                        # to None (a release) never gets this grace: that is
+                        # exactly the orphan-retirement signal the anchor is for.
+                        _emit(
+                            f"WATCHER for {me}: adopted bring-up claim "
+                            f"{owner0!r} -> {owner!r} (startup grace)"
+                        )
+                        owner0 = owner
+                    else:
+                        _emit(
+                            f"WATCHER for {me} retired: registry owner changed "
+                            f"{owner0!r} -> {owner!r} (was #{my_gen})"
+                        )
+                        return
                 _beat(me)
                 _reap_stale(conn, me=me)  # re-expose this worker's orphaned claims first
                 while True:
@@ -1246,34 +1517,43 @@ def watch(me, interval):
                         # answered task is finished work; claim it silently,
                         # never re-announce it.
                         continue
-                    try:
-                        # SIGNAL ONLY (never the body): a tiny line that can never be
-                        # truncated by the harness notification layer. Read the full
-                        # message with `peek` (see below). A bodyless done-ack
-                        # (msg_type='ack', empty body) is a lifecycle marker, not
-                        # content — surface it as "TASK #N DONE" instead of a noisy
-                        # "0 chars" NEW MSG. Display-layer only; claim/done semantics
-                        # unchanged (done still derived from in_reply_to in task_done).
-                        if mtype == "ack" and not body:
-                            tgt = in_reply_to if in_reply_to is not None else "?"
-                            print(
-                                f"TASK #{tgt} DONE (ack from {sender})",
-                                flush=True,
-                            )
-                            continue
-                        # Absolute path in the hint: under the user-level install
-                        # a bare `python ipc.py` copy-pasted from this signal
-                        # fails (ipc.py is not in the project cwd).
-                        print(
+                    # SIGNAL ONLY (never the body): a tiny line that can never be
+                    # truncated by the harness notification layer. Read the full
+                    # message with `peek` (see below). A bodyless done-ack
+                    # (msg_type='ack', empty body) is a lifecycle marker, not
+                    # content — surface it as "TASK #N DONE" instead of a noisy
+                    # "0 chars" NEW MSG. Display-layer only; claim/done semantics
+                    # unchanged (done still derived from in_reply_to in task_done).
+                    # Emission failure = our consumer is dead: raise INSIDE the
+                    # claim transaction so the claim rolls back (message stays
+                    # QUEUED, never swallowed), then orphan-exit below.
+                    if mtype == "ack" and not body:
+                        tgt = in_reply_to if in_reply_to is not None else "?"
+                        if not _emit(f"TASK #{tgt} DONE (ack from {sender})"):
+                            raise _StdoutDead(mid)
+                        continue
+                    # Absolute path in the hint: under the user-level install
+                    # a bare `python ipc.py` copy-pasted from this signal
+                    # fails (ipc.py is not in the project cwd).
+                    if not _emit(
                             f"NEW MSG #{mid} from {sender} ({len(body)} chars) "
                             f'— read full: python "{os.path.abspath(__file__)}" '
-                            f"peek --me {me} --tail 3",
-                            flush=True,
-                        )
-                    except Exception as e:  # noqa: BLE001 — never kill the loop
-                        sys.stderr.write(f"[watch] signal failed for #{mid}: {e}\n")
+                            f"peek --me {me} --tail 3"):
+                        raise _StdoutDead(mid)
+        except _StdoutDead as e:
+            # Leaving the `with _conn()` block via this exception rolled the
+            # claim back: the un-signalled message is QUEUED again, attempts
+            # unchanged. Make the death VISIBLE (heartbeat gone at once, trace
+            # on disk) instead of camouflaged (#1186: fresh-looking heartbeat
+            # for max_age after death, no trace anywhere).
+            _orphan_exit(me, f"gen #{my_gen}: stdout dead on signal for "
+                             f"#{e.args[0]}; claim rolled back")
+            return
         except Exception as e:  # noqa: BLE001 — transient DB error: log, keep polling
-            sys.stderr.write(f"[watch] poll error: {e}\n")
+            try:
+                sys.stderr.write(f"[watch] poll error: {e}\n")
+            except (OSError, ValueError):
+                pass  # stderr dead too; never let the handler itself raise
         time.sleep(interval)
 
 
@@ -1380,6 +1660,11 @@ def main():
 
     w = sub.add_parser("watch")
     w.add_argument("--me", required=True)
+    w.add_argument("--allow-file-stdout", action="store_true",
+                   help="escape hatch for the background-shell host gate: run "
+                        "even though stdout is a regular file (signals will "
+                        "only surface when this process exits — incident "
+                        "#1188). Only for deliberate log-to-file setups.")
     w.add_argument("--interval", type=float, default=3.0,
                    help="seconds between polls (default 3). Keep it < status "
                         "--max-age (default 8) or the heartbeat ages out and "
@@ -1436,6 +1721,20 @@ def main():
     cn.add_argument("--task", type=int, required=True)
     cn.add_argument("--by", required=True,
                     help="caller role; must equal the hub (IPC_HUB, default A)")
+
+    rd = sub.add_parser(
+        "redeliver",
+        help="reset a claimed-but-never-started task back to QUEUED for a "
+             "fresh delivery (2026-08-17 #1188: a claim swallowed by a "
+             "mis-hosted watcher left recv returning NONE while the "
+             "documented same-submit-id resend hit DUP — the only recovery "
+             "was cancel + NEW submit-id + manual wake). Keeps the same row: "
+             "submit_id idempotency and attempts history intact (next claim "
+             "increments attempts as usual). Refused for done/tombstoned "
+             "rows. Pair with ipc_wake_pane.ps1 if the worker is not parked.")
+    rd.add_argument("--task", type=int, required=True)
+    rd.add_argument("--by", required=True,
+                    help="caller role; must equal the task's sender (the hub)")
 
     rp = sub.add_parser("reap",
                         help="manually run the lazy reaper and print what was harvested")
@@ -1533,6 +1832,17 @@ def main():
             except StarViolation as e:
                 any_refused = True
                 print(f"REJECTED  {e}")
+            except SquatterHeartbeat as e:
+                any_refused = True
+                pid = e.args[1] if len(e.args) > 1 else "?"
+                print(f"REFUSED-SQUATTER  {tgt}'s heartbeat is fresh but the "
+                      f"role has NO registry owner (beater pid={pid}) — likely "
+                      f"an orphan watcher from a dead session, not dispatch "
+                      f"evidence. NOT queued to {tgt}. If {tgt}'s pane is "
+                      f"really parked and alive, claim the role there: "
+                      f'python "{os.path.join(_HERE, "ipc_role.py")}" take '
+                      f"{tgt} — else run /ipc-recover in {tgt}'s pane. Then "
+                      f"re-send.")
             except WatcherDown:
                 any_refused = True
                 print(f"REFUSED  {tgt} is neither parked nor busy "
@@ -1578,7 +1888,8 @@ def main():
                     print(f"#{mid} [{ts}] {sender}: {body}")
     elif args.cmd == "watch":
         _require_valid(args.me, "--me")
-        watch(args.me, args.interval)  # never returns; Monitor owns the lifetime
+        watch(args.me, args.interval,
+              allow_file_stdout=args.allow_file_stdout)  # never returns; Monitor owns the lifetime
     elif args.cmd == "peek":
         _require_valid(args.me, "--me")
         rows = peek(args.me, args.tail)
@@ -1609,6 +1920,45 @@ def main():
         _require_valid(args.watch, "--watch")
         alive = watcher_alive(args.watch, args.max_age)
         busy = worker_busy(args.watch, args.max_age)
+        # DB-derived busy (2026-08-08): a Monitor-driven worker consumes via
+        # watch()+peek and never touches recv, so no busy-beater is ever forked
+        # and the .busy file stays absent while it is mid-task (observed: B
+        # worked 25 min on a claimed task, status showed plain ALIVE, the hub
+        # misread that as idle and cancelled 14s before the reply landed).
+        # The claim row itself is authoritative evidence of work in flight, so
+        # fall back to the DB with the SAME predicate _busy_daemon exits on:
+        # claimed (handled=1), not done, lease not yet fallen. Two guards:
+        # (1) DB file must exist - status must never CREATE a mailbox
+        #     (littering invariant, see _resolve_state_dir);
+        # (2) the .busy FILE must be ABSENT - absence is the Monitor-path
+        #     signature (watch never forks a beater), which is exactly the
+        #     blind spot this fallback covers. A PRESENT-but-stale .busy is
+        #     the recv-path ghost (beater killed, no finally cleanup): there
+        #     the 2026-08-01 window-consistency invariant must hold - status
+        #     and the send gate read the same file with the same max-age and
+        #     agree the worker is gone (regression group 12 enforces this;
+        #     first cut of this patch broke it and was caught by that group).
+        # Display-only: exit code and the send()/require-watcher gate are
+        # untouched.
+        claimed = []
+        if (not busy and not os.path.exists(_busy_path(args.watch))
+                and os.path.exists(DB_PATH)):
+            try:
+                conn = _conn()
+                try:
+                    _now = time.time()
+                    _rows = conn.execute(
+                        "SELECT id, lease_until FROM messages WHERE recipient=? "
+                        "AND handled=1 AND tombstone IS NULL AND msg_type='task'",
+                        (args.watch,)).fetchall()
+                    claimed = [(tid, lu) for tid, lu in _rows
+                               if not task_done(conn, tid)
+                               and (lu is None or _now < lu)]
+                finally:
+                    conn.close()
+            except sqlite3.Error:
+                pass  # never let a DB hiccup break a read-only status
+            busy = bool(claimed)
         ident = watcher_identity(args.watch)
         who = ""
         if ident and (ident.get("pid") or ident.get("session")):
@@ -1629,8 +1979,28 @@ def main():
             bident = _busy_identity(args.watch) or {}
             if bident.get("pid"):
                 who += f"  [busy-beater pid={bident['pid']}]"
+            elif claimed:
+                _now = time.time()
+                frag = ", ".join(
+                    f"#{tid}" + (f" lease {int(lu - _now)}s left" if lu else "")
+                    for tid, lu in claimed[:3])
+                who += f"  [claimed: {frag}]"
+        # Squatter surfacing (2026-08-17, #1186): a fresh heartbeat with no
+        # registry owner is the signature of an orphan watcher from a dead
+        # session. send --require-watcher now refuses that as parked-evidence
+        # (SquatterHeartbeat), so status must agree — the exit code gates "can
+        # I dispatch?", and ALIVE/exit-0 here with REFUSED at send would be the
+        # two-gates-disagree jitter C review B-1 banned. Busy still exits 0:
+        # dispatch to a busy worker queues (QUEUED-BUSY), same as the gate.
+        squatter = alive and _registry_session(args.watch) is None
+        if squatter:
+            state += " [SQUATTER: no registry owner — require-watcher will " \
+                     "refuse; run /ipc-recover in this role's pane]"
         print(f"{args.watch} watcher: {state}{who}")
-        sys.exit(0 if alive else 1)  # exit code unchanged: gates "can I dispatch?"
+        # Exit code: as before (alive -> 0) EXCEPT a squatter now exits 1, so
+        # scripts gating on it agree with the send gate. Busy-only stays 1,
+        # unchanged from the original semantics.
+        sys.exit(0 if (alive and not squatter) else 1)
     elif args.cmd == "pending":
         _require_valid(args.hub, "--hub")
         rows = pending(args.hub)
@@ -1662,13 +2032,20 @@ def main():
         # belt and braces, since the beater is now the primary mechanism.
         _beat(args.me)
         _beat_busy(args.me)
-        new_lease = time.time() + DEFAULT_LEASE
+        # Lease renewal semantics deliberately UNCHANGED by the 2026-08-17 F2
+        # work (A review on #1253/#1254): liveness is now carried by the
+        # explicit last_seen_ts stamp below, so ack keeps its single original
+        # job (flat DEFAULT_LEASE renewal) instead of doubling as the
+        # life-sign clock via lease arithmetic — coupling the two meant any
+        # future change to either would silently break the other.
+        _now = time.time()
+        new_lease = _now + DEFAULT_LEASE
         with _conn() as conn:
             if args.task is not None:
                 cur = conn.execute(
-                    "UPDATE messages SET lease_until=? WHERE id=? AND recipient=? "
-                    "AND handled=1 AND tombstone IS NULL",
-                    (new_lease, args.task, args.me))
+                    "UPDATE messages SET lease_until=?, last_seen_ts=? "
+                    "WHERE id=? AND recipient=? AND handled=1 AND tombstone IS NULL",
+                    (new_lease, _now, args.task, args.me))
                 n = cur.rowcount
             else:
                 rows = conn.execute(
@@ -1678,8 +2055,9 @@ def main():
                 for (rid,) in rows:
                     if task_done(conn, rid):
                         continue  # done tasks have no lease to renew
-                    conn.execute("UPDATE messages SET lease_until=? WHERE id=?",
-                                 (new_lease, rid))
+                    conn.execute(
+                        "UPDATE messages SET lease_until=?, last_seen_ts=? "
+                        "WHERE id=?", (new_lease, _now, rid))
                     n += 1
         print(f"ACK  renewed {n} task(s); lease_until -> now+{DEFAULT_LEASE}s")
     elif args.cmd == "done":
@@ -1738,6 +2116,43 @@ def main():
                 "UPDATE messages SET tombstone='cancelled', handled=1, lease_until=NULL "
                 "WHERE id=?", (args.task,))
         print(f"CANCELLED  task #{args.task}")
+    elif args.cmd == "redeliver":
+        with _conn() as conn:
+            row = conn.execute(
+                "SELECT sender, recipient, msg_type, tombstone, lease_secs "
+                "FROM messages WHERE id=?", (args.task,)).fetchone()
+            if not row:
+                print(f"NO TASK  #{args.task}")
+                sys.exit(2)
+            sender, recipient, mtype, tomb, lease_secs = row
+            if sender != args.by:
+                print(f"FORBIDDEN  task #{args.task} sender={sender} != --by "
+                      f"{args.by}; only the dispatching hub may redeliver")
+                sys.exit(2)
+            if mtype != "task":
+                print(f"NOT A TASK  #{args.task} is msg_type={mtype!r}")
+                sys.exit(2)
+            if tomb is not None:
+                print(f"ALREADY TERMINAL  task #{args.task} tombstone={tomb} "
+                      f"— send a fresh task instead")
+                sys.exit(2)
+            if task_done(conn, args.task):
+                print(f"ALREADY DONE  task #{args.task} has an answer; "
+                      f"nothing to redeliver")
+                sys.exit(2)
+            # Back to the queued phase: same lease semantics as send() (a hard
+            # lease restarts as a queue-phase ceiling and is reset again at
+            # claim; pure-heartbeat stays NULL). last_seen_ts=NULL — the old
+            # claim's life-signs are void, and unknown is never judged SILENT.
+            new_lu = (time.time() + lease_secs) if lease_secs else None
+            conn.execute(
+                "UPDATE messages SET handled=0, status='sent', lease_until=?, "
+                "last_seen_ts=NULL WHERE id=?", (new_lu, args.task))
+        print(f"REDELIVERED #{args.task}  back to QUEUED for {recipient} "
+              f"(same row: submit-id/attempts kept; its old busy beater "
+              f"exits within ~{int(2 * _BUSY_POLL + 2)}s once it sees no open claim). "
+              f"If {recipient} is not parked, wake it: "
+              f"pwsh ~/.claude/ipc/ipc_wake_pane.ps1 -Role {recipient}")
     elif args.cmd == "reap":
         if args.me and args.hub:
             print("REAP  pass either --me or --hub, not both")

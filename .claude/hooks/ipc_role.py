@@ -464,6 +464,32 @@ def release():
     try:
         reg = _load()
         role = _owned_role(reg, sid)
+        if role is None:
+            # 兜底（2026-08-21）：MANUAL_SID 不是身份（见其定义处注释），拿真实 sid
+            # 永远匹配不上，于是 manual 持有的角色在 SessionEnd 从不被释放；注册表
+            # 锚等的 owner 变化就永远不发生，watcher 变成孤儿——心跳照跳、
+            # status --watch 报 ALIVE、--require-watcher 放行，任务掉进没人读的信箱。
+            # 判别依据用 pane 自己声明的 IPC_ROLE，不去猜 sid：按 sid 匹配 manual
+            # 会重蹈 2026-07-31 那个 bug（worker 的 take 把 hub 的 A 清空）。
+            env_role = (os.environ.get("IPC_ROLE") or "").strip()
+            if env_role in ROLES:
+                cur = reg.get(env_role)
+                owner = cur.get("session_id") if isinstance(cur, dict) else None
+                # 只释放：无主 / 本会话 / manual。别人真实会话持有的槽一律不碰。
+                if owner in (None, sid, MANUAL_SID):
+                    role = env_role
+                    # 留痕：兜底释放的判据是环境变量而非身份，万一误释放，这行是唯一线索
+                    # （X 在 2026-08-21 复核 #538 指出：误释放此前无迹可查）。
+                    try:
+                        with open(os.path.join(os.path.dirname(REGISTRY),
+                                               "release_fallback.log"), "a",
+                                  encoding="utf-8") as _lg:
+                            _lg.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} "
+                                      f"release-fallback role={env_role} "
+                                      f"owner_was={owner!r} stdin_sid={sid!r} "
+                                      f"reason={reason!r}\n")
+                    except OSError:
+                        pass  # 留痕失败不能挡住释放本身
         if role is not None:
             reg[role] = None
             _save(reg)

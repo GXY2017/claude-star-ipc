@@ -39,10 +39,14 @@ COMMANDS = ("ipc-recover.md", "main.md")
 SKILL_SRC = os.path.join(SRC, "skills", "multi-terminal-ipc", "SKILL.md")
 SKILL_DST = os.path.join(os.path.expanduser("~"), ".claude", "skills",
                          "multi-terminal-ipc", "SKILL.md")
-# Optional WezTerm fleet-control scripts (2026-08-03): launch all role windows as
-# panes in one WezTerm window, batch /clear + /ipc-recover them between projects.
+# Optional WezTerm fleet-control scripts (2026-08-03; mux-domain world 2026-08-17):
+# launch all role windows as panes under a per-fleet wezterm-mux-server, batch
+# /clear + /ipc-recover them between projects, wake/dispatch/exit single panes.
 WEZTERM_SCRIPTS = ("ipc_wezterm_common.ps1", "ipc_wezterm_launch.ps1",
-                   "ipc_newcycle.ps1")
+                   "ipc_newcycle.ps1", "ipc_fleet1_restart.ps1",
+                   "ipc_fleet2_launch.ps1", "ipc_dispatch.ps1",
+                   "ipc_wake_pane.ps1", "ipc_pane_exit.ps1",
+                   "mux-fleet1.lua", "mux-fleet2.lua")
 
 # (event, command, idempotency marker substring)
 HOOK_SPECS = [

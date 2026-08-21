@@ -6,14 +6,16 @@ description: >-
   models, e.g. an Anthropic hub A + a Zhipu/GLM worker B) collaborating as peers
   through a file-based sqlite mailbox (`ipc.py`). Use whenever the user wants to
   ENABLE this collaboration in a new project (onboarding), dispatch work to
-  another terminal, coordinate a hub/worker (A/B/C/D/E) setup, fan out a task to
+  another terminal, coordinate a hub/worker (A/B/C/D/E/F) setup, fan out a task to
   workers and collect replies, bring a worker online, recover an IPC role after
   /clear, or asks about the multi-terminal / 多终端 / 多大模型 互通 / 派活给 B /
   主终端从终端 / 星型拓扑 / 信箱 mailbox protocol. Triggers on "在新项目启用/
   接入/开通 多终端协作/IPC"、"这个项目也要多模型互通"、"enable IPC in this
   project"、"set up multi-terminal collaboration"、"派活/派给 B"、"多终端协作"、
   "跨模型互通"、"收 B 的回复"、"让 B 上线"、"hub/worker"、"fan out to workers",
-  and any operation against `ipc.py`.
+  reattaching or checking a fleet whose window died — "编队窗口关了/没了"、
+  "重连编队"、"编队还在吗"、"reattach the fleet"、"fleet GUI closed"、
+  `wezterm connect fleet1/fleet2` — and any operation against `ipc.py`.
 ---
 
 # multi-terminal-ipc
@@ -108,12 +110,39 @@ terminals live as panes in one WezTerm window, launched and batch-controlled by
 two user-level scripts (role→pane-id map, no window guessing, no hand-typing):
 
 ```powershell
-pwsh ~/.claude/ipc/ipc_wezterm_launch.ps1 -Roles A,B,C,D,E -Project <root>  # spawn lineup, claim roles, park watchers
+pwsh ~/.claude/ipc/ipc_wezterm_launch.ps1 -Roles A,B,C,D,E,F -Project <root>  # spawn lineup, claim roles, park watchers
 pwsh ~/.claude/ipc/ipc_newcycle.ps1                                         # new task cycle: /clear + /ipc-recover per pane
+pwsh ~/.claude/ipc/ipc_fleet1_restart.ps1 -Project <root>                   # restart fleet 1: pending check -> tear down mux + GUI + orphan watchers -> relaunch -> verify parks
+pwsh ~/.claude/ipc/ipc_fleet2_launch.ps1                                    # second formation: its own mux + GUI, role X only
 ```
 
+**Mux-domain world (2026-08-17, adopted from the paseo evaluation):** pane
+processes live under a per-fleet `wezterm-mux-server` (sockets
+`~/.local/share/wezterm/fleet{1,2}.sock`, domains defined in `~/.wezterm.lua`);
+the GUI window is only a detachable VIEW. A GUI death — accidental close, crash,
+an unattended OS/Store update — no longer kills the fleet: **reattach with
+`wezterm connect fleet1` (or `fleet2`), no relaunch, context intact.** Check
+first with `status --watch <role>`: workers ALIVE + GUI gone = reattach only;
+workers DOWN = real teardown, use the restart script. Tearing a fleet down now
+means killing its MUX server (the restart/relaunch scripts do this via
+`wezterm_mux_pids.json`), not the GUI.
+
+Omit `-Project` and both launchers show the same history-derived menu as
+`cc project`, with the home dir appended as an explicit last entry and
+pre-selected as the default (launch-dir rule revised 2026-08-11, memory
+`home-dir-launch-default`). A headless caller — a Claude session, a piped run —
+silently gets the home dir instead of a prompt. Home can never get an
+`ipc.enabled` gate (`ipc_role.py enable` refuses it), but fleet panes still
+claim roles there: the launchers set `IPC_ROLE` per pane, which alone opts a
+session in (`ipc_role.py:92`) and claims deterministically (`ipc_role.py:427`).
+The gate only matters for bare sessions launched without `IPC_ROLE`; whether a
+claim lands depends on the harness firing the SessionStart hook (GLM/DeepSeek
+panes park a watcher but may never claim). **When launching a fleet on the
+user's behalf, ask which project first and pass `-Project`.**
+
 Role→model bindings (A=claude hub, B=kimi, C=glm via ollama, D=deepseek,
-E=codex) are a table at the top of the launch script. The old keepalive daemon
+E=codex, F=glm via Zhipu direct — added 2026-08-14) are a table at the top of
+the launch script; that table is the authority, this list is a snapshot. The old keepalive daemon
 is DECOMMISSIONED (same date): before dispatching, check `status --watch <role>`
 and wake a DOWN worker by typing into (or relaunching) its pane. Full findings,
 traps, and per-bridge caveats: project-lib memory `wezterm-pane-injection-verified`
@@ -127,7 +156,7 @@ ipc.py send --from A --to B "task"                    # one worker
 ipc.py send --from A --to B,C "task"                  # fan out (one row each)
 ipc.py send --from A --to ALL "task"                  # broadcast to every live worker
 ipc.py send --from A --to B --body-file task.md       # body from file — REQUIRED for bodies with backticks/$()/quotes (shell mangles them)
-ipc.py send --from A --to B "task" --require-watcher  # tri-state: parked=SENT; mid-task (busy fresh)=QUEUED-BUSY exit 0, delivers when B finishes; neither=REFUSED exit 3, not queued
+ipc.py send --from A --to B "task" --require-watcher  # parked=SENT; mid-task (busy fresh)=QUEUED-BUSY exit 0, delivers when B finishes; parked-but-role-unclaimed=REFUSED-SQUATTER exit 3 (2026-08-17 #1186: an orphan heartbeat is not dispatch evidence — remedy printed: ipc_role.py take <role>); neither=REFUSED exit 3, not queued
 ipc.py send --from A --to B "task" --submit-id fx7    # idempotency key: a resend with the same key prints DUP and reuses the row — re-dispatch after a barrier timeout is SAFE
 ipc.py send --from A --to B "task" --no-requeue       # fail-closed non-idempotent task: stale lease parks as NEEDS-REVIEW (never auto-requeued/auto-failed)
 ipc.py recv --me A                                    # take unread replies (NONE = nothing yet)
@@ -137,16 +166,18 @@ ipc.py recv --me A --json                             # NDJSON envelopes {id,ts,
 ipc.py peek --me A --tail 5                            # review last 5 WITHOUT marking read
 ipc.py peek --me A --tail 5 --json                     # same, as NDJSON (adds to/unread fields)
 ipc.py pending --hub A [--detail]                     # tasks dispatched with no reply yet (empty = done)
-ipc.py pending --hub A --json                         # NDJSON {id,to,ts,state,attempts} — state machine-readable (QUEUED|IN_PROGRESS|STALE|NEEDS-REVIEW); empty --json output = fan-out complete
+ipc.py pending --hub A --json                         # NDJSON {id,to,ts,state,attempts} — state machine-readable (QUEUED|QUEUED-STALLED|IN_PROGRESS|IN-PROGRESS-SILENT|STALE|NEEDS-REVIEW); empty --json output = fan-out complete. QUEUED-STALLED = unclaimed >5min with recipient not busy (#1186 black-hole alarm); IN-PROGRESS-SILENT = claimed but no life-sign (claim/ack/linked reply) >30min (#1188 alarm) — display-only, NEVER auto-requeued; check the pane, or redeliver deliberately
 ipc.py cancel --task N --by A                          # retract a dispatched task
+ipc.py redeliver --task N --by A                       # reset a claimed-but-never-started task to QUEUED for a fresh delivery (2026-08-17 #1188) — same row, submit-id/attempts kept, so idempotent re-dispatch stays safe; refused if done/tombstoned; pair with ipc_wake_pane.ps1 if the worker is not parked. This replaces the old undocumented "cancel + new submit-id + manual wake" recovery
 ```
 
 ### Worker B/C/D — execute & report
 ```
 ipc.py recv --me B                 # take my unread tasks (mark read)
+# Watcher hosting (2026-08-17 #1188 HARD RULE): `watch --me <role>` runs under the Monitor tool ONLY — a background-Bash watch buffers its signals to a file the harness surfaces only on exit (observed 1h55m delivery gap); watch now refuses file-stdout hosts with exit 4
 ipc.py send --from B --to A "result"   # reply to A (plain send, no --require-watcher)
 ipc.py done --me B --task N         # register task N done (bodyless ack)
-ipc.py ack  --me B [--task N]       # extend lease on a long task (no --task = all my claimed)
+ipc.py ack  --me B --task N         # FIRST ACTION after reading a task (2026-08-17): stamps last_seen_ts so A's IN-PROGRESS-SILENT alarm clears; also the lease-extender for long tasks (no --task = all my claimed)
 ipc.py fail --me B --task N [--reason ...]   # mark failed (won't requeue)
 ```
 
@@ -155,8 +186,76 @@ ipc.py fail --me B --task N [--reason ...]   # mark failed (won't requeue)
 ipc_role.py status                 # reconciled view: ownership × heartbeat liveness
 ipc_role.py take A --session <sid> # (re)assign a role to this session
 ipc_role.py reclaim-dead           # free WORKER slots whose watcher heartbeat is gone (hub exempt — watcher-less by design; blind-safe. Rarely needed: claim() sweeps all ghost slots on every SessionStart)
-ipc.py status --watch B            # ALIVE(parked, 0) / BUSY(executing, 1 — alive, don't re-dispatch) / DOWN(1) + pid/session
+ipc.py status --watch B            # ALIVE(parked, 0) / BUSY(executing, 1 — alive, don't re-dispatch) / DOWN(1) + pid/session; ALIVE with [SQUATTER: no registry owner] exits 1 — matches the send gate's REFUSED-SQUATTER
 ```
+
+## Orchestration patterns (adopted 2026-08-17 from the paseo evaluation)
+
+Named dispatch shapes for common cross-model collaborations, so A composes a
+brief from a template instead of improvising. All are plain `ipc.py` usage — no
+new machinery. (Provenance: paseo's `/paseo-handoff` / `/paseo-advisor` /
+`/paseo-committee` skills; adapted to the star mailbox.)
+
+- **Handoff (接力: 一家模型出方案, 另一家实现).** A (or one worker) produces a
+  PLAN as a file; A reviews/approves it, then dispatches implementation to a
+  DIFFERENT role with the plan attached verbatim:
+  `send --from A --to D --body-file plan-brief.md --submit-id <key>`.
+  The brief must carry the plan file's path AND the guard-safe shell constraints
+  (dispatch briefs copy printed values; workers can't read A's history). Use
+  when vendors have complementary strengths (e.g. Claude plans, Codex/DeepSeek
+  implements) or to keep the planner's context clean for review.
+- **Advisor (顾问: 只要第二意见, 不移交工作).** One worker, read-only charter:
+  `send --from A --to B --require-watcher "ADVISORY ONLY - do NOT modify any
+  file. Question: <decision + the options>. Reply: your recommendation + top
+  risks, <=N lines."` A keeps ownership and synthesizes; the advisor's reply is
+  input, not a decision (worker rule 3 unchanged). Cheap-tier advisors: wake E
+  with `-Model luna` for simple reviews.
+- **Committee (合议: 两个立场相反的模型交叉质证).** Same question to TWO roles
+  from different vendors, each briefed with an OPPOSING stance ("argue the
+  current design is fine" / "argue it must change"), each required to state the
+  strongest counter to its own stance. Fan out with `--submit-id`, collect with
+  the barrier (`recv --me A --block --count` — mind the 2-rows-per-worker count
+  trap), then A reconciles disagreements into the decision. Use for root-cause
+  analysis and irreversible calls; two same-vendor panes make a weak committee.
+
+## Capacity-aware dispatch (hub A, adopted 2026-08-19)
+
+The IPC layer carries **no context-capacity telemetry** — heartbeats, registry and
+`status --watch` prove liveness only. A judges a worker's remaining context by
+reading its TUI status line through the fleet mux (verified 2026-08-19 across all
+three vendors: claude/kimi/glm panes show `Ctx N% left`, codex shows
+`Context N% left`):
+
+```bash
+WEZTERM_UNIX_SOCKET=~/.local/share/wezterm/fleet1.sock wezterm cli get-text --pane-id <N> | grep -iE "context|ctx"
+```
+
+Role→pane ids: `~/.claude/ipc/wezterm_panes.json`. No match = pane down or
+mid-render — recheck once before concluding.
+
+Dispatch policy:
+
+- **Scrape all worker panes before a dispatch round.** Heavy batches (long-doc
+  extraction, bulk transcription) go only to workers at **≥70%** or freshly
+  cycled. Observed burn rate: E consumes **40–60 percentage points per zsxq
+  batch**, so a sub-70% pane cannot absorb one.
+- **Below threshold: refresh, don't gamble.** Reset the pane to a known-full
+  state (`pwsh ~/.claude/ipc/ipc_newcycle.ps1`, or per-pane /clear +
+  /ipc-recover). Success criterion is the status line back at **`Context 100%`**
+  — not the absence of output; /clear must be injected via PowerShell (typed
+  text can sit unsubmitted in the composer). Resetting to full beats measuring
+  precisely.
+- **Context % and provider quota are independent axes.** A quota/limit banner
+  (D's usual state) is vendor credit exhaustion — leave the role down per the
+  restart script's warning; refreshing context does not help, only waiting does.
+- **Any refresh discards the worker's task context.** Its session id changes;
+  follow-ups need a fresh self-contained `--body-file` brief (workers can never
+  read hub history). Corollary of the existing session-echo rule: a reply whose
+  `session` ≠ the claimant's means the worker /clear-ed mid-stream — re-brief
+  before dispatching a follow-up.
+- **Shape batches so cost is predictable**: preprocessed inputs ship as files,
+  briefs are self-contained, and batch sizes come from measured saturation
+  (e.g. zsxq: 2 calendar days = 4 posts = one saturated batch), not optimism.
 
 ## Task lifecycle
 
