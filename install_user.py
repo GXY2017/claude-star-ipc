@@ -49,9 +49,13 @@ WEZTERM_SCRIPTS = ("ipc_wezterm_common.ps1", "ipc_wezterm_launch.ps1",
                    "mux-fleet1.lua", "mux-fleet2.lua")
 
 # (event, command, idempotency marker substring)
+# Guarded (user rule 2026-08-09): claim/release run only inside a WezTerm pane or a
+# window with an explicit IPC_ROLE — a bare terminal never claims a role — and never
+# in harness child sessions. Requires "shell": "bash" on the hook entry.
+_GUARD = '{ [ -n "$WEZTERM_PANE" ] || [ -n "$IPC_ROLE" ]; } && [ -z "$CLAUDE_CODE_CHILD_SESSION" ]'
 HOOK_SPECS = [
-    ("SessionStart", f'python "{ROLE_DST}" claim', "ipc_role.py\" claim"),
-    ("SessionEnd", f'python "{ROLE_DST}" release', "ipc_role.py\" release"),
+    ("SessionStart", f'if {_GUARD}; then python "{ROLE_DST}" claim; fi', "ipc_role.py\" claim"),
+    ("SessionEnd", f'if {_GUARD}; then python "{ROLE_DST}" release; fi', "ipc_role.py\" release"),
 ]
 
 
@@ -102,7 +106,7 @@ def _merge_hooks():
                      for g in groups for h in g.get("hooks", []))
         if present:
             continue
-        groups.append({"hooks": [{"type": "command", "command": command}]})
+        groups.append({"hooks": [{"type": "command", "command": command, "shell": "bash"}]})
         added.append(event)
     os.makedirs(os.path.dirname(USER_SETTINGS), exist_ok=True)
     tmp = USER_SETTINGS + ".tmp"

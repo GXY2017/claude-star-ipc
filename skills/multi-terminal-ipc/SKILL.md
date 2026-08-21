@@ -27,10 +27,12 @@ mailbox**. Unlike subagents/same-harness agent teams (single-vendor, single
 process), each terminal here is a full separate session; the mailbox is just
 files on disk and doesn't care which model drives each terminal.
 
-This skill is the *operational* distillation. The authoritative, per-project
-spec lives in that project's `CLAUDE.md` (auto-loaded when cwd = project root).
-When a project's `CLAUDE.md` disagrees with this skill, **the project wins** —
-paths and role count are per-deployment.
+**This skill is the single authority for the protocol (2026-08-21).** Project
+`CLAUDE.md` files no longer restate it — they carry only that deployment's own
+facts and hard rules (mailbox key, model bindings, dispatch exceptions), which
+override this skill on exactly those points. The claude-star-ipc repo's
+`CLAUDE.md` is likewise a pointer here; `install_user.py` ships this skill
+user-level, version-locked to the machinery.
 
 ## Mental model
 
@@ -47,6 +49,21 @@ paths and role count are per-deployment.
   the same project root**. A terminal started elsewhere runs a different (or no)
   `ipc.py` and can never connect. `ipc.py` below = `python ipc.py` run from that
   root.
+- **More code-level guarantees you can lean on.** Role names come from
+  `_BASE_ROLES` in `~/.claude/ipc/ipc.py` (single source of truth, currently
+  A–F + legacy CODEX/DS + second-formation X; extend the tuple to add workers).
+  Message claim is one atomic single-consumer `UPDATE … RETURNING` — two
+  consumers can never both get a row; a duplicate watcher is wasteful, not
+  corrupting. Worker liveness is a two-file heartbeat split:
+  `_watcher_<X>.alive` = a consumer is parked; `_worker_<X>.busy` = a claimed
+  task is executing (beaten by a daemon `recv` forks automatically at claim
+  time, exits at done/fail/cancel or the lease ceiling). The reaper tests
+  `alive OR busy`, so a correctly-busy worker is never reaped for forgetting to
+  `ack`; `--require-watcher` accepts a fresh busy beat as liveness (QUEUED-BUSY,
+  exit 0, delivered at the worker's next park). Caveats: the reaper never
+  touches unclaimed rows (a queued task waits for the worker's next recv,
+  visible in `pending` the whole time), and a QUEUED-BUSY `--type note` has no
+  tracking at all — fire-and-forget.
 
 ## Hard prerequisite
 
@@ -72,8 +89,13 @@ registered project; user config must never be one), and creates
 that empty gate file yourself.
 
 Then bring terminals online:
-1. Open each terminal with cwd = the project root (first in = A/hub, the rest take
-   B, C, D…; pin a window's role with `IPC_ROLE=X claude`).
+1. Open each terminal with cwd = the project root. **Claim is guarded (user rule
+   2026-08-09): the SessionStart hook runs only when `WEZTERM_PANE` or
+   `IPC_ROLE` is set** (never in child sessions) — a bare terminal outside
+   WezTerm never claims a role. Launch via the fleet script (presets `IPC_ROLE`
+   per pane) or pin a window's role with `IPC_ROLE=B claude`; among
+   guard-passing sessions without a preset role, first in = A/hub, the rest
+   take the lowest free slot.
 2. Type one line (`ok`/`standby`) in each worker window — the manual floor; its
    watcher parks and any backlog arrives as signals.
 3. Verify: `ipc_role.py status` shows the roles live, then one A→B round-trip
@@ -81,9 +103,10 @@ Then bring terminals online:
 
 What you do NOT need: no per-project copy of `ipc.py`, no per-project hooks, no
 mailbox setup — state auto-creates under `~/.claude/projects/<key>/ipc/` on first
-use, one isolated mailbox per project. Optional: paste the protocol section (the
-repo `CLAUDE.md`) into the new project's own CLAUDE.md so the injected "see
-protocol" pointer resolves in-project; otherwise THIS skill is the reference.
+use, one isolated mailbox per project. In the project's own CLAUDE.md add only a
+one-line pointer ("协作协议见 `multi-terminal-ipc` skill") plus any
+deployment-specific rules — never paste the protocol (user rule 2026-08-21:
+project docs must not restate user-level content).
 
 Fresh **machine** rather than fresh project? Run `python install_user.py` from the
 claude-star-ipc repo once (deploys machinery + slash commands + this skill), then
@@ -93,7 +116,10 @@ per-project `enable` as above.
 
 The SessionStart hook auto-claims a role (first-in = A, rest take lowest free
 slot B, C, D…) and injects that role's behavior + watcher instructions as
-context — so a worker usually needn't type any command to get its role.
+context — so a worker usually needn't type any command to get its role. The
+hook is guarded (user rule 2026-08-09): it fires only when `WEZTERM_PANE` or
+`IPC_ROLE` is set, so terminals outside WezTerm without an explicit role never
+claim.
 
 **The one manual floor the hook can't cross:** it can inject instructions but
 can't fire a worker's first tool call. So **after opening a worker window, type
@@ -135,9 +161,10 @@ silently gets the home dir instead of a prompt. Home can never get an
 `ipc.enabled` gate (`ipc_role.py enable` refuses it), but fleet panes still
 claim roles there: the launchers set `IPC_ROLE` per pane, which alone opts a
 session in (`ipc_role.py:92`) and claims deterministically (`ipc_role.py:427`).
-The gate only matters for bare sessions launched without `IPC_ROLE`; whether a
-claim lands depends on the harness firing the SessionStart hook (GLM/DeepSeek
-panes park a watcher but may never claim). **When launching a fleet on the
+The gate only matters for `WEZTERM_PANE` sessions without an explicit
+`IPC_ROLE` (bare terminals outside WezTerm never run claim at all — hook guard
+2026-08-09); whether a claim lands depends on the harness firing the
+SessionStart hook (GLM/DeepSeek panes park a watcher but may never claim). **When launching a fleet on the
 user's behalf, ask which project first and pass `-Project`.**
 
 Role→model bindings (A=claude hub, B=kimi, C=glm via ollama, D=deepseek,
