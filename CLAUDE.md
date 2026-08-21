@@ -36,8 +36,10 @@ terminals. **Workers talk only to A, never to each other** — collaboration is
 relayed through A. This keeps the anti-echo invariant (only A decides whether to
 continue) linear rather than an N² mesh (a mesh echoes and deadlocks). The number of
 workers is set by `_BASE_ROLES` in `~/.claude/ipc/ipc.py` — the single source of truth,
-which `ipc_role.py` imports — currently the letters A,B,C,D,E plus the legacy named
-channels CODEX,DS; to add workers, extend that tuple. Letters = generic interactive
+which `ipc_role.py` imports — currently the letters A,B,C,D,E,F (F added 2026-08-14),
+the legacy named channels CODEX,DS, and X, the second-formation role (fleet 2: its own
+mux domain + window so the two formations restart independently, see
+`ipc_fleet2_launch.ps1`); to add workers, extend that tuple. Letters = generic interactive
 windows (the hook assigns the lowest free one; letters are listed first so a random new
 window never lands on a channel). E is bound to the Codex CLI in the reference lineup —
 Codex has no SessionStart hook to claim a role, so give E a one-time registry
@@ -78,10 +80,10 @@ python ipc.py send --from A --to B "msg"      # send to one worker
 python ipc.py send --from A --to B,C "task"   # fan out to several workers (one row each, independent read-flags)
 python ipc.py send --from A --to ALL "task"   # broadcast to every live worker (claimed roles except A)
 python ipc.py send --from A --to B --body-file task.md   # body from file — REQUIRED for bodies with backticks/$()/quotes (shell would mangle/execute them; see memory ipc-send-backtick-trap)
-python ipc.py send --from A --to B "task" --require-watcher  # tri-state: watcher parked=SENT; not parked but busy heartbeat fresh (mid-task)=QUEUED-BUSY, queued for delivery when the worker finishes, exit 0; neither=REFUSED, not queued, exit 3 (several recipients: judged per-recipient, exit 3 if any refused)
+python ipc.py send --from A --to B "task" --require-watcher  # watcher parked + role claimed=SENT; not parked but busy heartbeat fresh (mid-task)=QUEUED-BUSY, queued for delivery when the worker finishes, exit 0; parked but role UNCLAIMED in the registry=REFUSED-SQUATTER exit 3 (2026-08-17 #1186: an orphan heartbeat is not dispatch evidence — a legit recovery and a dead session's leftover watcher beat identically, the registry owner is the only discriminator; remedy printed: ipc_role.py take <role>); neither parked nor busy=REFUSED, not queued, exit 3 (several recipients: judged per-recipient, exit 3 if any refused)
 python ipc.py send --from A --to B "task" --no-requeue     # fail-closed: a dead lease parks the row as NEEDS-REVIEW in pending instead of requeueing — use for NON-IDEMPOTENT work (writes/sends), see lifecycle below
 python ipc.py send --from A --to B "task" --submit-id K    # idempotency key scoped to (sender,recipient): resending the same key reuses the existing row (prints DUP) instead of duplicating — makes re-dispatch after a barrier timeout safe; cancel/fail reopens the key
-python ipc.py status --watch B                # ALIVE(parked, exit 0) / BUSY(executing a claimed task, exit 1 — alive, don't re-dispatch) / DOWN(exit 1)
+python ipc.py status --watch B                # ALIVE(parked, exit 0) / BUSY(executing a claimed task, exit 1 — alive, don't re-dispatch) / DOWN(exit 1); ALIVE with [SQUATTER: no registry owner] exits 1 — matches the send gate's REFUSED-SQUATTER
 python ipc.py keepalive --me CODEX,DS         # LEGACY (daemon decommissioned 2026-08-03): liveness-only loop that beats heartbeat(s) WITHOUT consuming — rows queue unclaimed until an interactive window drains them
 python ipc.py recv --me B                     # take NEW unread messages addressed to me, mark them read
 python ipc.py recv --me A --block             # block until a new message arrives (prints NONE (timeout) on timeout)
@@ -105,11 +107,12 @@ default 3 — a **module-level constant** in `ipc.py`, overridable only per-proc
 `IPC_MAX_ATTEMPTS`; there is **no** per-message `--max-attempts` flag). Verbs:
 ```
 python ipc.py done --me B --task N            # register task N done (bodyless ack reply)
-python ipc.py ack  --me B [--task N]          # extend the lease on a long task (no --task = renew all my claimed)
+python ipc.py ack  --me B [--task N]          # FIRST ACTION after reading a task (2026-08-17): stamps last_seen_ts so the hub's IN-PROGRESS-SILENT alarm clears; also the lease-extender on a long task (no --task = renew all my claimed; ack also beats the heartbeat)
 python ipc.py fail --me B --task N [--reason ...]   # mark task failed (tombstone), won't requeue
 python ipc.py cancel --task N --by A          # hub-only: cancel a dispatched task
+python ipc.py redeliver --task N --by A       # 2026-08-17 #1188: reset a claimed-but-never-started task to QUEUED for a fresh delivery — same row, submit-id/attempts kept (idempotent re-dispatch stays safe); refused if done/tombstoned. The only correct path when a claim exists but the worker session never actually got the task (a same-key resend just prints DUP without redelivering); pair with ipc_wake_pane.ps1 if the worker is not parked
 python ipc.py reap --me B | --hub A           # force the lazy reaper (debug; auto-runs in recv/watch/pending)
-python ipc.py pending --hub A --detail        # each task's derived state QUEUED/IN_PROGRESS/STALE/FAILED + attempts
+python ipc.py pending --hub A --detail        # each task's derived state QUEUED/IN_PROGRESS/STALE/FAILED + attempts. Two DISPLAY-ONLY alarm states (2026-08-17, never auto-requeued): QUEUED-STALLED = unclaimed >5min with the recipient not busy (black-hole alarm); IN-PROGRESS-SILENT = claimed but no life-sign (claim/ack/linked reply) >30min (suspected never-started) — check the pane, or redeliver deliberately
 ```
 Two disciplines this lifecycle REQUIRES (a plain prose reply is no longer enough by itself):
 - **A — tag coordination as `--type note`.** Only *real dispatched work* should be a
@@ -229,6 +232,15 @@ reply shouldn't be blocked even when A isn't watching).
    BEFORE re-dispatching; resending into a dry model only burns attempts. Prefer
    small slices with results written to disk so a quota death loses one slice, not
    the job.
+   **Capacity-aware dispatch (2026-08-19):** provider quota and CONTEXT remaining
+   are independent axes — the IPC layer carries no context telemetry, so before a
+   heavy batch A reads each worker pane's own status line through the fleet mux
+   (`wezterm cli get-text --pane-id N | grep -iE "context|ctx"`; claude/kimi/glm
+   show `Ctx N% left`, codex `Context N% left`). Heavy batches go only to workers
+   at ≥70% context or freshly cycled; below that, reset the pane to a known-full
+   state (`ipc_newcycle.ps1`, success = `Context 100%` back on the line) instead of
+   gambling. Any refresh discards the worker's context and changes its session id —
+   follow-ups need a fresh self-contained `--body-file` brief.
 5. Fold a bare acknowledgement ("got it") into the substantive reply where possible;
    don't send a message just to acknowledge — save tokens.
 6. **A waits for worker replies (watcher).** **[LOCAL TRIAL 2026-06-27 — default
@@ -237,7 +249,13 @@ reply shouldn't be blocked even when A isn't watching).
    tiny **SIGNAL** notification (`NEW MSG #id from …`, **never the body** — a fixed
    short line can't be truncated, unlike inline content which the harness silently
    clips on long messages); on the signal, read the **full** message with `python
-   ipc.py peek --me A --tail 3`. The watcher lives the whole session and idle costs
+   ipc.py peek --me A --tail 3`. **HARD RULE (2026-08-17 #1188): `watch` runs under
+   the Monitor tool ONLY, never as a background Bash** — a background bash's stdout
+   goes to a file the harness surfaces only at process exit, and `watch` never
+   exits, so its signals sit unseen (observed 1h55m delivery gap while the task
+   showed IN_PROGRESS); `watch` now detects a file-stdout host and refuses with
+   exit 4. The bash fallback below is exempt because `recv --block` exits on
+   delivery, which fires the notification. The watcher lives the whole session and idle costs
    **~zero turns** — it only fires on a real message, no re-arming. This beats the old re-arm-bash watcher (which paid one full agent turn
    per ~580s of idle, since a background bash is capped at ~600s and a new turn/user
    input can kill it; the Monitor survives both — verified). To wait on several
@@ -285,6 +303,19 @@ in each worker window to bring it online. The WezTerm fleet scripts —
 `ipc_wezterm_launch.ps1` to spawn one pane per role with `IPC_ROLE` preset, and
 `ipc_newcycle.ps1` to batch `/clear` + `/ipc-recover` them for a fresh task cycle —
 automate exactly this keystroke by injecting text into each pane.)
+**Mux-domain fleets (2026-08-17):** pane processes live under a per-fleet
+`wezterm-mux-server` (`mux-fleet{1,2}.lua`; sockets
+`~/.local/share/wezterm/fleet{1,2}.sock`); the GUI window is only a detachable
+VIEW, so a GUI death (crash, accidental close, OS update) no longer kills the
+fleet — check `status --watch <role>` first: workers ALIVE + GUI gone = just
+`wezterm connect fleet1`, context intact; workers DOWN = real teardown, use
+`ipc_fleet1_restart.ps1` (pending check → kill the mux via
+`wezterm_mux_pids.json` → relaunch → verify parks). `ipc_fleet2_launch.ps1` runs
+the second formation (role X) in its own mux + GUI so the two restart
+independently. Per-pane ops: `ipc_dispatch.ps1` (park → queue → nudge, encodes
+the codex traps), `ipc_wake_pane.ps1` (wake an unattended pane; Ctrl+C QUITS a
+codex TUI — it uses Esc there), `ipc_pane_exit.ps1` (clean exit that actually
+retires the watcher).
 
 After that it self-drives: a worker idles without spending tokens; when A dispatches,
 the worker's Monitor signals it, it executes and `send`s the result back, and the same
@@ -306,7 +337,16 @@ via its WezTerm pane instead). **孤儿盯哨现由代码处理,不靠语义提�
 起新 `watch --me <role>` 时该 watcher 领一个递增代际号,使**同角色**任何旧/孤儿盯哨(如挺过 `/clear`
 仍在跑的旧进程)在下一轮 poll 自动退役(打印 `WATCHER ... retired` 后干净退出)——残留在死会话里的盯哨
 不会再黑洞本信箱,恢复时**无需手动找停同角色盯哨**。(唯一例外是代码管不到的:跑错角色——`watch --me D`
-不会被 `watch --me B` 退掉,那是两个不同信箱,仍须手动 `TaskStop` 切到对的角色。) If that slash command
+不会被 `watch --me B` 退掉,那是两个不同信箱,仍须手动 `TaskStop` 切到对的角色。) Two more watcher
+anchors close the "green lights over a dead session" hole (2026-08-21): the **parent
+anchor** now pins the TUI process itself, not the longer-lived intermediate shell
+that used to outlive it (a crashed TUI retires its watcher within ~2s), with a
+**registry-release fallback** — `ipc_role.py release()` falls back to matching by
+`IPC_ROLE` when the session id doesn't match (a `manual` owner was previously never
+released). Third-party panes (glm/deepseek routes) never fire SessionStart/SessionEnd
+hooks at all, so their exit can't rely on release() being called — close such a pane
+with `ipc_pane_exit.ps1 -Role <r>`, which retires the watcher and frees the slot
+explicitly. If that slash command
 isn't loaded in the cleared session, paste the equivalent recipe instead: tell the worker its role, then
 start a persistent Monitor `watch --me B` FIRST (backlog arrives as signals; read with `peek`) → end
 turn. A (hub) needs no standby
