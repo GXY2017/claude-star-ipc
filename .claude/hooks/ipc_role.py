@@ -117,8 +117,9 @@ def _master_context(hub):
         f"project CLAUDE.md's IPC section if present, else the multi-terminal-ipc skill. "
         f"You are the initiator/decider. Dispatch to one worker: "
         f"`python ipc.py send --from {hub} --to <worker> \"<task>\"`; to several at once: `--to B,C`; "
-        f"broadcast to all live workers: `--to ALL`. [LOCAL TRIAL 2026-06-27] To listen for "
-        f"replies, start ONE persistent Monitor (the Monitor tool, persistent=true) running "
+        f"broadcast to all live workers: `--to ALL`. [2026-08-21, user decision] Park your "
+        f"watcher NOW as your first action (the hub is no longer watcher-less): start ONE "
+        f"persistent Monitor (the Monitor tool, persistent=true, timeout_ms 3600000) running "
         f"`python ipc.py watch --me {hub}`: each reply fires a tiny SIGNAL notification "
         f"(`NEW MSG #id from ...`, never the body — avoids notification truncation of long "
         f"messages); on the signal, read the FULL message with `python ipc.py peek --me {hub} "
@@ -281,6 +282,18 @@ _CONTINUATION = ("clear", "resume", "compact")  # same terminal continuing, NOT 
 # several unrelated terminals can carry it at once, so anything that reasons about
 # "the same session" must special-case it — see take().
 MANUAL_SID = "manual"
+
+
+def _short_sid(sid):
+    """Display form of a session id that stays distinguishable. A bare [:8]
+    collides for codex: its thread ids are UUIDv7 (first 48 bits = unix ms), so
+    every thread started within the same 65.5 s window shares the first 8 hex
+    (2026-08-31: C and E both showed as `01a056af`, and pane C read E's
+    legitimate slot as its own mis-registration). Head + tail, ASCII only."""
+    sid = sid or ""
+    return sid if len(sid) <= 14 else f"{sid[:8]}..{sid[-4:]}"
+
+
 WATCHER_MAX_AGE = 60     # a heartbeat older than this => the watcher is gone
 CLAIM_GRACE = 120        # a claim with NO heartbeat yet is dormant only after this
                          # (gives a just-started owner time to park its watcher)
@@ -363,10 +376,11 @@ def _is_dormant(reg, role, sid):
     stale heartbeat => dormant; no heartbeat => dormant only once the claim is old
     enough that the owner should have parked a watcher (avoids evicting a peer that
     just started and hasn't beaten yet).
-    The HUB slot is NEVER dormant: the hub runs no persistent watcher by design
-    (it dispatches and collects on demand), so a dead heartbeat says nothing about
-    whether the hub is alive. Auto-reclaiming it hands the hub role out by
-    launch-order roulette — hub identity must change only deliberately
+    The HUB slot is NEVER dormant: even though the hub parks a watcher at boot
+    since 2026-08-21, a dead heartbeat still says nothing definitive about
+    whether the hub is alive (it may be mid-turn with the watcher lost to a
+    /clear). Auto-reclaiming it hands the hub role out by launch-order
+    roulette — hub identity must change only deliberately
     (`take <hub>` / /main / IPC_ROLE)."""
     if role == HUB:
         return False
@@ -374,9 +388,17 @@ def _is_dormant(reg, role, sid):
     if not claim or claim.get("session_id") == sid:
         return False
     age = _watcher_age(role)
+    ca = _claim_age(claim)
+    if age is not None and ca is not None and age > ca:
+        # The heartbeat file predates this claim: it is the PREVIOUS owner's
+        # remains (`recv --keep-heartbeat` leaves .alive behind by design and
+        # nothing clears it on relaunch), not evidence about the current
+        # claimant. Judge the new claim by its own grace window instead.
+        # 2026-08-31: a 16h-old _watcher_C.alive made E's SessionStart sweep
+        # null B/C/F's seconds-old claims before their watchers parked.
+        age = None
     if age is not None:
         return age > WATCHER_MAX_AGE
-    ca = _claim_age(claim)
     return ca is None or ca > CLAIM_GRACE
 
 
@@ -408,10 +430,26 @@ def _take_auto(reg, sid):
     return None
 
 
+def _auto_claim_allowed():
+    """User rule 2026-08-09: roles are auto-claimed ONLY inside a WezTerm pane
+    (`WEZTERM_PANE`) or with an explicit `IPC_ROLE`; a bare terminal never claims.
+    Until 2026-09-02 this guard lived only in Claude's settings.json hook line, so
+    the Codex hooks (~/.codex/hooks.json → codex-compat.js, and project-level
+    .codex/hooks.json) still auto-claimed a free role in any `ipc.enabled` project
+    — a standalone `codex` in AI财务分析 silently became C. Enforced here so every
+    host goes through the same gate. Child sessions (subagents) never claim."""
+    if os.environ.get("CLAUDE_CODE_CHILD_SESSION"):
+        return False
+    return bool(os.environ.get("IPC_ROLE") or os.environ.get("WEZTERM_PANE"))
+
+
 def claim():
     info = _read_stdin()
     sid = info.get("session_id") or "unknown"
     source = info.get("source", "")
+    # Gate 0: pane-or-explicit-role only (see _auto_claim_allowed).
+    if not _auto_claim_allowed():
+        return                                # bare terminal: inject nothing
     # Gate: stay completely inert in projects that don't use IPC (lets the
     # user-level GLOBAL hook be registered once without claiming a role in every
     # project the user opens), and defer to a project-local hook if one also runs.
@@ -541,11 +579,22 @@ def take(role, sid):
         prev = reg.get(role)
         reg[role] = {"session_id": sid, "ts": _now()}
         _save(reg)
+        # 留痕（2026-08-31 #1431）：C 槽在 15:22:07 被写成 manual，全部 agent
+        # 记录里找不到执行者。release 有 release_fallback.log，take 却无迹可查。
+        # 同目录（每项目 ipc 状态目录，与 ipc_roles.json 同处，不跨项目共享）。
+        try:
+            with open(os.path.join(os.path.dirname(REGISTRY), "take.log"), "a",
+                      encoding="utf-8") as _lg:
+                _lg.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} take role={role} "
+                          f"sid={sid!r} prev={(prev or {}).get('session_id')!r} "
+                          f"pid={os.getpid()} ppid={os.getppid()} cwd={os.getcwd()!r}\n")
+        except OSError:
+            pass  # 留痕失败不能挡住 take 本身
     finally:
         if locked:
             _unlock()
-    evicted = f" (evicted {prev['session_id'][:8]})" if prev else ""
-    print(f"OK {sid[:8]} now holds {role}{evicted}")
+    evicted = f" (evicted {_short_sid(prev['session_id'])})" if prev else ""
+    print(f"OK {_short_sid(sid)} now holds {role}{evicted}")
 
 
 def enable():
@@ -602,9 +651,9 @@ def enable():
 def reclaim_dead():
     """Free every WORKER slot whose watcher heartbeat is gone (dormant), so dead
     claims stop blocking slots. Safer than `reset`: live roles are kept, and the
-    hub slot is exempt (no persistent watcher by design — a dead heartbeat proves
-    nothing; reassign the hub deliberately via `take <hub> --session <sid>` or
-    /main). Safe to run any time."""
+    hub slot is exempt (the hub parks a watcher since 2026-08-21, but a dead
+    heartbeat still proves nothing — reassign the hub deliberately via
+    `take <hub> --session <sid>` or /main). Safe to run any time."""
     locked = _lock()
     try:
         reg = _load()
@@ -622,10 +671,10 @@ def status_view():
     that shows both truths together so a ghost (heartbeat with no/old claim) or a
     dormant claim (claim with no heartbeat) is obvious at a glance."""
     reg = _load()
-    print(f"{'role':4} {'owner':10} {'claim-age':>9} {'alive':>8} {'via':>6}  state")
+    print(f"{'role':4} {'owner':14} {'claim-age':>9} {'alive':>8} {'via':>6}  state")
     for r in ROLES:
         claim = reg.get(r)
-        owner = (claim.get('session_id', '')[:8] if claim else '-')
+        owner = (_short_sid(claim.get('session_id', '')) if claim else '-')
         ca = _claim_age(claim) if claim else None
         wa = _liveness_age(r)
         # Which of the two heartbeats is carrying this role right now. Without
@@ -644,10 +693,12 @@ def status_view():
         elif wa is not None and wa <= WATCHER_MAX_AGE:
             state = "live (working)" if (busy and not parked) else "live"
         elif r == HUB:
-            state = "hub (watcher-less by design)"
+            # Since 2026-08-21 the hub parks a watcher too, so a dead heartbeat
+            # is visible as down — but hub identity is still never auto-reclaimed.
+            state = "hub (watcher down - never auto-reclaimed)"
         else:
             state = "DORMANT (reclaimable)"
-        print(f"{r:4} {owner:10} {ca_s:>9} {wa_s:>8} {via:>6}  {state}")
+        print(f"{r:4} {owner:14} {ca_s:>9} {wa_s:>8} {via:>6}  {state}")
 
 
 def _inject(text):

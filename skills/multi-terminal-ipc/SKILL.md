@@ -1,21 +1,7 @@
 ---
 name: multi-terminal-ipc
 description: >-
-  Operating guide for the cross-vendor multi-terminal IPC mailbox — several
-  independent Claude Code terminals (possibly driven by different companies'
-  models, e.g. an Anthropic hub A + a Zhipu/GLM worker B) collaborating as peers
-  through a file-based sqlite mailbox (`ipc.py`). Use whenever the user wants to
-  ENABLE this collaboration in a new project (onboarding), dispatch work to
-  another terminal, coordinate a hub/worker (A/B/C/D/E/F) setup, fan out a task to
-  workers and collect replies, bring a worker online, recover an IPC role after
-  /clear, or asks about the multi-terminal / 多终端 / 多大模型 互通 / 派活给 B /
-  主终端从终端 / 星型拓扑 / 信箱 mailbox protocol. Triggers on "在新项目启用/
-  接入/开通 多终端协作/IPC"、"这个项目也要多模型互通"、"enable IPC in this
-  project"、"set up multi-terminal collaboration"、"派活/派给 B"、"多终端协作"、
-  "跨模型互通"、"收 B 的回复"、"让 B 上线"、"hub/worker"、"fan out to workers",
-  reattaching or checking a fleet whose window died — "编队窗口关了/没了"、
-  "重连编队"、"编队还在吗"、"reattach the fleet"、"fleet GUI closed"、
-  `wezterm connect fleet1/fleet2` — and any operation against `ipc.py`.
+  Operate cross-model terminal IPC: onboard projects, dispatch/collect work, recover roles, check or reconnect fleets; 多终端、多模型互通、派活、收回复、主从终端、信箱、编队重连. Use for ipc.py operations. Covers hub/workers and window loss without assuming a fleet restart.
 ---
 
 # multi-terminal-ipc
@@ -71,46 +57,14 @@ All terminals **must launch from the same project root** (the cwd when starting
 `claude`). Confirm cwd matches before opening a terminal. This is the #1 cause of
 "they can't see each other".
 
-## Enable in a new project (onboarding)
+## Enable in a new project (onboarding) — `references/onboarding.md`
 
-The machinery is USER-LEVEL (one copy at `~/.claude/ipc/`, global hooks in
-`~/.claude/settings.json`); a new project needs exactly ONE per-project artifact —
-the opt-in gate file. One command creates it, with guards:
-
-```
-cd <the new project root>
-python ~/.claude/ipc/ipc_role.py enable   # write the expanded path on Windows/PowerShell — a quoted "~" is never expanded
-```
-
-`enable` validates the user-level install (ipc.py importable, claim hook
-registered), **refuses the home dir and `~/.claude`** (every launch dir becomes a
-registered project; user config must never be one), and creates
-`.claude/ipc.enabled` at the project root. Idempotent. Manual equivalent: create
-that empty gate file yourself.
-
-Then bring terminals online:
-1. Open each terminal with cwd = the project root. **Claim is guarded (user rule
-   2026-08-09): the SessionStart hook runs only when `WEZTERM_PANE` or
-   `IPC_ROLE` is set** (never in child sessions) — a bare terminal outside
-   WezTerm never claims a role. Launch via the fleet script (presets `IPC_ROLE`
-   per pane) or pin a window's role with `IPC_ROLE=B claude`; among
-   guard-passing sessions without a preset role, first in = A/hub, the rest
-   take the lowest free slot.
-2. Type one line (`ok`/`standby`) in each worker window — the manual floor; its
-   watcher parks and any backlog arrives as signals.
-3. Verify: `ipc_role.py status` shows the roles live, then one A→B round-trip
-   (`send` a test task, worker replies, `pending --hub A` returns to empty).
-
-What you do NOT need: no per-project copy of `ipc.py`, no per-project hooks, no
-mailbox setup — state auto-creates under `~/.claude/projects/<key>/ipc/` on first
-use, one isolated mailbox per project. In the project's own CLAUDE.md add only a
-one-line pointer ("协作协议见 `multi-terminal-ipc` skill") plus any
-deployment-specific rules — never paste the protocol (user rule 2026-08-21:
-project docs must not restate user-level content).
-
-Fresh **machine** rather than fresh project? Run `python install_user.py` from the
-claude-star-ipc repo once (deploys machinery + slash commands + this skill), then
-per-project `enable` as above.
+One per-project artifact only: from the project root run `python ~/.claude/ipc/ipc_role.py enable`
+(creates `.claude/ipc.enabled`; validates the user-level install; refuses the home dir and `~/.claude`;
+idempotent). Then launch panes via the fleet script, type one line in each worker, verify with
+`ipc_role.py status` plus one A→B round-trip. Guards, the per-project CLAUDE.md pointer rule and the
+fresh-machine path (`install_user.py`) are in the reference file — read it when the trigger is
+在新项目启用 IPC / enable IPC.
 
 ## Bringing terminals online
 
@@ -119,7 +73,18 @@ slot B, C, D…) and injects that role's behavior + watcher instructions as
 context — so a worker usually needn't type any command to get its role. The
 hook is guarded (user rule 2026-08-09): it fires only when `WEZTERM_PANE` or
 `IPC_ROLE` is set, so terminals outside WezTerm without an explicit role never
-claim.
+claim. Since 2026-09-02 the gate is inside `ipc_role.py claim` itself
+(`_auto_claim_allowed`), not only on Claude's settings.json hook line — before
+that, the Codex hooks (`~/.codex/hooks.json` → `codex-compat.js
+session-start-ipc`, and a project-level `.codex/hooks.json` calling `claim`
+directly) skipped the guard, so a bare `codex` opened in any `ipc.enabled`
+project silently auto-claimed a free role (became C in AI财务分析). Codex is
+stricter than Claude (user rule 2026-09-02): it claims only with an explicit
+`IPC_ROLE`, i.e. only as a fleet member launched by the fleet script; a codex
+opened by hand, even inside a WezTerm pane, stays standalone. The project-level
+`.codex/hooks.json` claim in AI财务分析 was removed the same day so every codex
+claim goes through `codex-compat.js`. Fleet panes are unaffected: the launcher
+sets `IPC_ROLE` per pane.
 
 **The one manual floor the hook can't cross:** it can inject instructions but
 can't fire a worker's first tool call. So **after opening a worker window, type
@@ -131,15 +96,24 @@ window.
 
 Force a specific role at launch: `IPC_ROLE=A claude …` (overrides launch order).
 
+**Bring-up order: `ipc_role.py take <role> --session <sid>` FIRST, `watch --me <role>` SECOND.**
+The watcher snapshots the registry owner at start and retires on any later change (`WATCHER for X retired: registry owner changed`),
+so watch-then-take retires the watcher just parked (D, 2026-08-13) and a watcher over an unclaimed slot is `ALIVE [SQUATTER]`, refused by
+`--require-watcher`; `ipc.py` `_REG_ANCHOR_GRACE = 45` s adopts a None/manual → claimed change as the pane's own take — a safety net, not permission.
+Mid-task the inverse holds: never `take` or re-park while a claimed task runs — the busy-beater fork rewrites the owner with an empty session, the
+parent watcher retires, the task drops to QUEUED; close with `send` + `done --task N`, then `take`, then re-park. [[C--Users-gxy49-Downloads-AI-----::ipc-claim-busy-beater-evicts-owner]] [[C--Users-gxy49-Downloads-----::orphan-watcher-survives-tui-death]]
+
 **Preferred since 2026-08-03 — WezTerm pane fleet (automates all of the above):**
 terminals live as panes in one WezTerm window, launched and batch-controlled by
 two user-level scripts (role→pane-id map, no window guessing, no hand-typing):
 
 ```powershell
 pwsh ~/.claude/ipc/ipc_wezterm_launch.ps1 -Roles A,B,C,D,E,F -Project <root>  # spawn lineup, claim roles, park watchers
-pwsh ~/.claude/ipc/ipc_newcycle.ps1                                         # new task cycle: /clear + /ipc-recover per pane
-pwsh ~/.claude/ipc/ipc_fleet1_restart.ps1 -Project <root>                   # restart fleet 1: pending check -> tear down mux + GUI + orphan watchers -> relaunch -> verify parks
-pwsh ~/.claude/ipc/ipc_fleet2_launch.ps1                                    # second formation: its own mux + GUI, role X only
+pwsh ~/.claude/ipc/ipc_newcycle.ps1 [-Roles C] [-Force] [-SkipHub]          # refresh context: per pane kind sends /clear + /ipc-recover (claude) or /new (codex, no wake, never Ctrl+C); BUSY roles skipped; dead codex TUI relaunched instead. This is A's tool when a role runs low on context — clearing beats restarting the pane
+pwsh ~/.claude/ipc/ipc_wezterm_launch.ps1 -Roles C -Project <root>          # ONE role back into the LIVE fleet: mux is reused, other panes untouched (this is how A restarts a single worker)
+pwsh ~/.claude/ipc/ipc_fleet1_restart.ps1 -Project <root>                   # WHOLE-FLEET restart only: pending check -> tear down mux + GUI + orphan watchers -> relaunch -> verify parks. `-Roles` picks what comes BACK, never what gets torn down: `-Roles C` still kills the mux and every pane incl. A itself (bit 2026-09-03, memory `ipc-single-role-restart`); since 2026-09-03 a `-Roles` list without the hub is REFUSED unless `-Force` Orphan-watcher sweep covers `$FleetRoles` = A–F ∪ old fleet-1 pane map ∪ `-Roles` (fixed 2026-09-04: it used to loop over `-Roles` only, so `-Roles A,C` left B/D/E/F watchers alive = fake ALIVE + stolen mail; memory `fleet-shutdown-orphan-watchers` 第三型).
+pwsh ~/.claude/ipc/ipc_fleet2_launch.ps1 -Project <root>                   # second formation: its own mux + GUI, role X only (Claude, --permission-mode auto); ask which project first unless the user already named the project and scope in this request, same rule as fleet 1
+pwsh ~/.claude/ipc/ipc_pane_exit.ps1 -Role F [-KeepRole]                   # clean exit of ONE pane: /exit -> release slot -> confirm watcher retired (caution 10); fleet 1 only
 ```
 
 **Mux-domain world (2026-08-17, adopted from the paseo evaluation):** pane
@@ -165,10 +139,14 @@ The gate only matters for `WEZTERM_PANE` sessions without an explicit
 `IPC_ROLE` (bare terminals outside WezTerm never run claim at all — hook guard
 2026-08-09); whether a claim lands depends on the harness firing the
 SessionStart hook (GLM/DeepSeek panes park a watcher but may never claim). **When launching a fleet on the
-user's behalf, ask which project first and pass `-Project`.**
+user's behalf, ask which project first and pass `-Project` — unless the user already named the
+project and scope in this request (2026-09-05 relaxation: do not re-confirm what was just stated;
+still validate the `-Project` value and never widen the scope to a whole-fleet restart, another
+project, or someone else's running task).**
 
-Role→model bindings (A=claude hub, B=kimi, C=glm via ollama, D=deepseek,
-E=codex, F=glm via Zhipu direct — added 2026-08-14) are a table at the top of
+Role→model bindings (A=claude hub, B=kimi, C=codex gpt-5.6-sol xhigh — rebound
+2026-08-30, was glm via ollama, D=deepseek, E=codex, F=glm via Zhipu direct —
+added 2026-08-14) are a table at the top of
 the launch script; that table is the authority, this list is a snapshot. The old keepalive daemon
 is DECOMMISSIONED (same date): before dispatching, check `status --watch <role>`
 and wake a DOWN worker by typing into (or relaunching) its pane. Full findings,
@@ -196,12 +174,23 @@ ipc.py pending --hub A [--detail]                     # tasks dispatched with no
 ipc.py pending --hub A --json                         # NDJSON {id,to,ts,state,attempts} — state machine-readable (QUEUED|QUEUED-STALLED|IN_PROGRESS|IN-PROGRESS-SILENT|STALE|NEEDS-REVIEW); empty --json output = fan-out complete. QUEUED-STALLED = unclaimed >5min with recipient not busy (#1186 black-hole alarm); IN-PROGRESS-SILENT = claimed but no life-sign (claim/ack/linked reply) >30min (#1188 alarm) — display-only, NEVER auto-requeued; check the pane, or redeliver deliberately
 ipc.py cancel --task N --by A                          # retract a dispatched task
 ipc.py redeliver --task N --by A                       # reset a claimed-but-never-started task to QUEUED for a fresh delivery (2026-08-17 #1188) — same row, submit-id/attempts kept, so idempotent re-dispatch stays safe; refused if done/tombstoned; pair with ipc_wake_pane.ps1 if the worker is not parked. This replaces the old undocumented "cancel + new submit-id + manual wake" recovery
+# --- mechanical gates & clocks (2026-08-30, from the 2026-08-29 postmortem; user: "能用脚本固化的就固化") ---
+pwsh ~/.claude/ipc/ipc_dispatch.ps1 -Role E -BodyFile brief.md [-SubmitId k] [-MaxMinutes 15] [-DryRun] [-Force]
+                                                      # THE dispatch path. Gate 0a = ipc_brief_lint.py (header role == -Role; `预算: N 分钟` required, <= MaxMinutes;
+                                                      # `UNITS: n` x measured min/unit must fit; abs paths exist; no empty product target; title/body "N 份" agree;
+                                                      # guard-safe shell shapes). Gate 0b = ipc_pane_probe.py on the recipient PANE status line (DEAD-CTX <=20% /
+                                                      # DEAD-LOOP / QUOTA banner / BLOCKED-PROMPT refuse; LOW-CTX <70% warns). Then park -> send -> nudge -> confirm claim.
+python ~/.claude/ipc/ipc_pane_probe.py E F [--json] / --all   # what the gate reads: ctx_left, flags (working|idle|recv_loop|permission_prompt|quota_banner), verdict
+python ~/.claude/ipc/stall_watch.py [--poll 60] [--once]      # hub's SECOND persistent Monitor (project-root cwd): at 15/30/45 min after each dispatch probes the pane
+                                                      # and prints one REPLY-CLOCK verdict (WORKING -> extend / ACT NOW: <reason> / TWO EXTENSIONS USED -> reassign)
+python ~/.claude/ipc/ipc_timing.py --since 2026-08-29 [--hub A] [--cwd root]   # dispatch->reply minutes per task and per role, paired by in_reply_to (never by hand)
 ```
 
 ### Worker B/C/D — execute & report
 ```
 ipc.py recv --me B                 # take my unread tasks (mark read)
 # Watcher hosting (2026-08-17 #1188 HARD RULE): `watch --me <role>` runs under the Monitor tool ONLY — a background-Bash watch buffers its signals to a file the harness surfaces only on exit (observed 1h55m delivery gap); watch now refuses file-stdout hosts with exit 4
+# Monitor host is BASH (2026-08-23): a backslash path `C:\Users\gxy49\.claude\ipc\ipc.py` is stripped to `Usersgxy49.claudeipcipc.py` (exit 2) — write `python ~/.claude/ipc/ipc.py watch --me <role>` or `C:/Users/...` forward slashes; PowerShell-tool calls are unaffected [[C--Users-gxy49-Downloads-------::monitor-host-bash-forward-slash]]
 ipc.py send --from B --to A "result"   # reply to A (plain send, no --require-watcher)
 ipc.py done --me B --task N         # register task N done (bodyless ack)
 ipc.py ack  --me B --task N         # FIRST ACTION after reading a task (2026-08-17): stamps last_seen_ts so A's IN-PROGRESS-SILENT alarm clears; also the lease-extender for long tasks (no --task = all my claimed)
@@ -212,77 +201,20 @@ ipc.py fail --me B --task N [--reason ...]   # mark failed (won't requeue)
 ```
 ipc_role.py status                 # reconciled view: ownership × heartbeat liveness
 ipc_role.py take A --session <sid> # (re)assign a role to this session
-ipc_role.py reclaim-dead           # free WORKER slots whose watcher heartbeat is gone (hub exempt — watcher-less by design; blind-safe. Rarely needed: claim() sweeps all ghost slots on every SessionStart)
+ipc_role.py reclaim-dead           # free WORKER slots whose watcher heartbeat is gone (hub exempt — never auto-reclaimed, even though A parks a watcher at boot since 2026-08-21; blind-safe. Rarely needed: claim() sweeps all ghost slots on every SessionStart)
 ipc.py status --watch B            # ALIVE(parked, 0) / BUSY(executing, 1 — alive, don't re-dispatch) / DOWN(1) + pid/session; ALIVE with [SQUATTER: no registry owner] exits 1 — matches the send gate's REFUSED-SQUATTER
 ```
 
-## Orchestration patterns (adopted 2026-08-17 from the paseo evaluation)
+## Orchestration, brief standard, capacity — `references/orchestration-and-dispatch.md`
 
-Named dispatch shapes for common cross-model collaborations, so A composes a
-brief from a template instead of improvising. All are plain `ipc.py` usage — no
-new machinery. (Provenance: paseo's `/paseo-handoff` / `/paseo-advisor` /
-`/paseo-committee` skills; adapted to the star mailbox.)
-
-- **Handoff (接力: 一家模型出方案, 另一家实现).** A (or one worker) produces a
-  PLAN as a file; A reviews/approves it, then dispatches implementation to a
-  DIFFERENT role with the plan attached verbatim:
-  `send --from A --to D --body-file plan-brief.md --submit-id <key>`.
-  The brief must carry the plan file's path AND the guard-safe shell constraints
-  (dispatch briefs copy printed values; workers can't read A's history). Use
-  when vendors have complementary strengths (e.g. Claude plans, Codex/DeepSeek
-  implements) or to keep the planner's context clean for review.
-- **Advisor (顾问: 只要第二意见, 不移交工作).** One worker, read-only charter:
-  `send --from A --to B --require-watcher "ADVISORY ONLY - do NOT modify any
-  file. Question: <decision + the options>. Reply: your recommendation + top
-  risks, <=N lines."` A keeps ownership and synthesizes; the advisor's reply is
-  input, not a decision (worker rule 3 unchanged). Cheap-tier advisors: wake E
-  with `-Model luna` for simple reviews.
-- **Committee (合议: 两个立场相反的模型交叉质证).** Same question to TWO roles
-  from different vendors, each briefed with an OPPOSING stance ("argue the
-  current design is fine" / "argue it must change"), each required to state the
-  strongest counter to its own stance. Fan out with `--submit-id`, collect with
-  the barrier (`recv --me A --block --count` — mind the 2-rows-per-worker count
-  trap), then A reconciles disagreements into the decision. Use for root-cause
-  analysis and irreversible calls; two same-vendor panes make a weak committee.
-
-## Capacity-aware dispatch (hub A, adopted 2026-08-19)
-
-The IPC layer carries **no context-capacity telemetry** — heartbeats, registry and
-`status --watch` prove liveness only. A judges a worker's remaining context by
-reading its TUI status line through the fleet mux (verified 2026-08-19 across all
-three vendors: claude/kimi/glm panes show `Ctx N% left`, codex shows
-`Context N% left`):
-
-```bash
-WEZTERM_UNIX_SOCKET=~/.local/share/wezterm/fleet1.sock wezterm cli get-text --pane-id <N> | grep -iE "context|ctx"
-```
-
-Role→pane ids: `~/.claude/ipc/wezterm_panes.json`. No match = pane down or
-mid-render — recheck once before concluding.
-
-Dispatch policy:
-
-- **Scrape all worker panes before a dispatch round.** Heavy batches (long-doc
-  extraction, bulk transcription) go only to workers at **≥70%** or freshly
-  cycled. Observed burn rate: E consumes **40–60 percentage points per zsxq
-  batch**, so a sub-70% pane cannot absorb one.
-- **Below threshold: refresh, don't gamble.** Reset the pane to a known-full
-  state (`pwsh ~/.claude/ipc/ipc_newcycle.ps1`, or per-pane /clear +
-  /ipc-recover). Success criterion is the status line back at **`Context 100%`**
-  — not the absence of output; /clear must be injected via PowerShell (typed
-  text can sit unsubmitted in the composer). Resetting to full beats measuring
-  precisely.
-- **Context % and provider quota are independent axes.** A quota/limit banner
-  (D's usual state) is vendor credit exhaustion — leave the role down per the
-  restart script's warning; refreshing context does not help, only waiting does.
-- **Any refresh discards the worker's task context.** Its session id changes;
-  follow-ups need a fresh self-contained `--body-file` brief (workers can never
-  read hub history). Corollary of the existing session-echo rule: a reply whose
-  `session` ≠ the claimant's means the worker /clear-ed mid-stream — re-brief
-  before dispatching a follow-up.
-- **Shape batches so cost is predictable**: preprocessed inputs ship as files,
-  briefs are self-contained, and batch sizes come from measured saturation
-  (e.g. zsxq: 2 calendar days = 4 posts = one saturated batch), not optimism.
+Read that file before composing a dispatch round. It holds the named dispatch
+shapes (handoff / advisor / committee), the three seam-sealing brief rules from
+arXiv:2608.16801 (A rules on every cross-worker interface; verifier briefs land
+only after the producer delivers; shared context ships as ONE file by path),
+and capacity-aware dispatch (scrape each pane's `Ctx N% left` through the fleet
+mux before a heavy batch; below ~70% refresh the pane instead of gambling;
+context % and vendor quota are independent axes; any refresh discards the
+worker's task context, so re-brief with a fresh `--body-file`).
 
 ## Task lifecycle
 
@@ -308,7 +240,11 @@ recv/watch/pending (newest 150 always kept).
 These two procedures live in the user-level slash commands (authoritative, do
 not restate here):
 - **Hub duties & collecting replies** → `~/.claude/commands/main.md` (`/main`):
-  persistent Monitor on `watch --me A`, signal → `peek`, bash fallback.
+  persistent Monitor on `watch --me A`, signal → `peek`, bash fallback. Since
+  2026-08-21 (user decision) the hub parks this watcher at BOOT like a worker —
+  the fleet launcher sends `/ipc-recover A` to the hub pane too, and newcycle
+  re-parks it after /clear. Registry exemption is unchanged: a dead hub
+  heartbeat is never auto-reclaimed (`status` shows "watcher down", role kept).
 - **Recovery after /clear / compaction / hook failure** →
   `~/.claude/commands/ipc-recover.md` (`/ipc-recover <role>`). Key invariant:
   `/clear` keeps the role, kills only the watcher — recovery = re-park the
@@ -356,6 +292,65 @@ not restate here):
    rely on a worker's model "reading the rules" — the star rejection and echo
    ceiling hold regardless of which vendor drives B. Names are `[A-Za-z0-9_]+`;
    path separators are rejected before any heartbeat file is touched.
+
+10. **Clean exit is a script, not Ctrl+C / closing the pane.**
+    `pwsh ~/.claude/ipc/ipc_pane_exit.ps1 -Role <r>` sends `/exit`, takes "Exit and
+    stop tasks" ("Move to background" is the orphan-watcher switch), releases the
+    slot and confirms the watcher retired. Third-party panes (glm / deepseek) never
+    fire SessionEnd, so a hand-closed pane leaves a watcher beating under a green
+    light and dispatches fall into an unread mailbox. Fleet 2's X is not in the
+    pane map: run the same steps against `fleet2.sock` + `wezterm_fleet2.json`
+    pane 0 (memory `runtime-upgrade-fleets-down` has the verified sequence).
+11. **From inside a pane, launch or connect to the OTHER fleet only with
+    `WEZTERM_*` env stripped** — the child inherits this fleet's
+    `WEZTERM_CONFIG_FILE`/`WEZTERM_UNIX_SOCKET`, loads the wrong mux config and
+    dies with "domain not found" (memory `wezterm-env-inheritance-gui-launch`;
+    `ipc_fleet1_restart.ps1` strips them itself).
+12. **Every pane-spawn site uses `$script:PaneShell` (MSI pwsh, absolute path),
+    never bare `pwsh`.** A Microsoft-Store MSIX PowerShell update force-kills every
+    process launched from the Store package — it wiped both fleets on 2026-08-17
+    (memory `store-pwsh-update-kills-fleet`). `mux-fleet{1,2}.lua` `default_prog`
+    pins the same path for the initial pane.
+13. **Node.js / wezterm upgrades happen only with BOTH fleets down.** Pane-spawned
+    `node.exe` MCP servers (dozens) lock `node.exe` — the MSI defers to reboot and
+    npm/node mismatch meanwhile — and a wezterm upgrade replaces the mux server
+    under every pane. Non-fleet MCP `node.exe` (Claude Desktop, other CLI sessions)
+    must go too. Runbook incl. the winget-nightly hash-mismatch fallback: memory
+    `runtime-upgrade-fleets-down`.
+
+14. **A runs a 15-minute reply clock; workers do not self-report quota** (user
+    decision 2026-08-29). No reply 15 min after dispatch → A inspects (`pending
+    --hub A --detail`, `ipc_role.py status`, pane text); working normally → one
+    more 15 min; stalled/abnormal → act now; two extensions max. Tasks are sliced
+    so a recipient can deliver in ≤15 min. Full procedure and the
+    manage-not-operate boundary: `~/.claude/commands/main.md` § A 的职责边界与节奏.
+    Worker quota self-reporting was considered and deferred: no vendor CLI
+    exposes an in-turn quota read (Claude `/usage` and Codex `/status` are
+    TUI-only; `statusline.js:10-11`), so A reads quota banners from the pane
+    during the 15-min inspection instead.
+15. **Both fleet GUIs vanish at once while every pane and mux server is alive =
+    system commit (virtual memory) exhaustion, not a wezterm bug** (2026-08-31,
+    twice in one day). Diagnose in this order, then reattach — never relaunch:
+    (a) `Get-Process wezterm-mux-server, pwsh` alive → GUI-only death;
+    (b) `~/.local/share/wezterm/wezterm-mux-server.exe-log-*.txt` shows
+    `encoding PDU to client: Allocation error : not enough memory`;
+    (c) `Get-WinEvent` provider `Microsoft-Windows-Resource-Exhaustion-Detector`
+    id 2004 names the top three commit consumers (vmmemWSL / Bloomberg
+    clientrater / AnyTXT ATOHelper that day). Fix the consumer, then
+    `wezterm connect fleet1` / `fleet2` (env-stripped when launched from inside
+    the other fleet). Measured levers and pagefile/WSL settings: memory
+    `fleet-gui-commit-exhaustion` in the home project.
+16. **Unforeseeable fleet anomalies go to X in fleet 2, not to A debugging on the
+    spot** (user rule 2026-08-30). Toolchain / pane / registry / watcher faults: A
+    writes a brief for X — deliverable = root cause / file:line fixed / how to verify;
+    "do not touch panes running tasks"; no `ipc_role.py reset` — and the fix lands in
+    shared code, never a one-off script. [[C--Users-gxy49-Downloads-----::fleet-anomalies-to-x]]
+17. **A worker is one context window; a long token-heavy serial queue exhausts it
+    mid-queue** (B died after card 1/6, 2026-06-28 — returned results do not free the
+    worker's context). Dispatch 2–3 items per batch and re-dispatch the remainder;
+    workers write each product to a file and keep a one-line result in context; a
+    dozen mechanical items go to subagents/Workflow, not one serial worker.
+    [[C--Users-gxy49-Downloads-AI-----::ipc-worker-queue-context-limit]]
 
 ## Deployment topologies (where state lives)
 

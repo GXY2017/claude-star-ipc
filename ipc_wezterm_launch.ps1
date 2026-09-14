@@ -56,6 +56,7 @@ $Roles = @($Roles | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim(
 # Per-role launch command. Edit bindings here. An empty value = refuse to
 # launch that role until you fill it in.
 # User lineup 2026-08-03: A=Anthropic hub, B=Kimi, C=GLM via ollama cloud, D=DeepSeek.
+# C rebound 2026-08-30 (user): codex gpt-5.6-sol, reasoning xhigh.
 # F added 2026-08-14: GLM via Zhipu direct (claude-glm profile fn, glm-5.3[1m]).
 # All four in --permission-mode auto (user decision 2026-08-03: manual mode stalls
 # unattended panes on tool-approval prompts). Wrapper fns forward extra args to claude;
@@ -63,7 +64,7 @@ $Roles = @($Roles | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim(
 $LaunchCmd = @{
     A     = 'claude --model claude-opus-5 --permission-mode auto'   # user pick 2026-08-03: hub on Opus 5
     B     = "claude-kimi 'k3[1m]' --permission-mode auto"    # positional -Model MUST come first or it swallows the flag (ValidateSet)
-    C     = 'ollama launch claude --model glm-5.2:cloud -y -- --permission-mode auto'  # model preselected, -y skips prompts
+    C     = 'codex --model gpt-5.6-sol -c model_reasoning_effort=xhigh'  # user 2026-08-30: C = codex sol xhigh (was GLM via ollama cloud); flags pin it even if ~/.codex/config.toml defaults change
     D     = 'claude-ds --permission-mode auto'               # profile fn, DeepSeek env block
     E     = 'codex'      # codex CLI slot (letter binding 2026-08-03)
     F     = 'claude-glm --permission-mode auto'              # profile fn, Zhipu direct (glm-5.3[1m]); added 2026-08-14
@@ -77,10 +78,10 @@ $ModelTag = @{
     # Vendor names only, no version — models get switched/upgraded, version tags go stale.
     A     = 'Claude'
     B     = 'Kimi'
-    C     = 'GLM'
+    C     = 'Codex-sol'  # 2026-08-30: second codex pane, sol xhigh (E stays the luna/sol-switchable one)
     D     = 'DeepSeek'
     E     = 'Codex'
-    F     = 'GLM-Zhipu'  # distinguish from C (GLM via ollama cloud)
+    F     = 'GLM-Zhipu'
     CODEX = 'Codex'
     DS    = 'DeepSeek'
 }
@@ -90,7 +91,7 @@ $ModelTag = @{
 # -> ipc_role.py claim), so it needs $env:IPC_ROLE like everyone else - without
 # it, an inherited IPC_ROLE squats that role (X-eviction bug, 2026-08-12) and a
 # clean env roulette-claims the lowest free slot.
-$CodexRoles = @('E','CODEX')
+$CodexRoles = @('C','E','CODEX')   # C joined 2026-08-30; keep in sync with ipc_dispatch.ps1 / ipc_wake_pane.ps1 / ipc_fleet1_restart.ps1
 $Hub = if ($env:IPC_HUB) { $env:IPC_HUB } else { 'A' }
 
 $Project = (Resolve-Path $Project).Path
@@ -196,17 +197,16 @@ foreach ($l in $launched) {
         continue
     }
     if (Wait-PaneReady $l.pane) {
-        if ($l.role -ne $Hub) {
-            # 2026-08-17: was a bare "standby" — Kimi-B answered it with prose and
-            # parked nothing (incident #1186: no watcher, no registry claim, an
-            # orphan heartbeat then spoofed ALIVE). /ipc-recover <role> is the
-            # deterministic boot: parks the watcher under Monitor AND verifies the
-            # registry claim (unclaimed roles are REFUSED-SQUATTER on dispatch).
-            Submit-PaneText $l.pane "/ipc-recover $($l.role)"
-            Write-Host "[$($l.role)] TUI ready, /ipc-recover $($l.role) sent - watcher should park + claim"
-        } else {
-            Write-Host "[$($l.role)] TUI ready (hub - no watcher needed)"
-        }
+        # 2026-08-17: was a bare "standby" — Kimi-B answered it with prose and
+        # parked nothing (incident #1186: no watcher, no registry claim, an
+        # orphan heartbeat then spoofed ALIVE). /ipc-recover <role> is the
+        # deterministic boot: parks the watcher under Monitor AND verifies the
+        # registry claim (unclaimed roles are REFUSED-SQUATTER on dispatch).
+        # 2026-08-21 (user decision): the HUB gets it too — A parks a persistent
+        # `watch --me A` at boot instead of collecting on demand (reply signals
+        # land immediately; registry hub-exemption from reclaim is unchanged).
+        Submit-PaneText $l.pane "/ipc-recover $($l.role)"
+        Write-Host "[$($l.role)] TUI ready, /ipc-recover $($l.role) sent - watcher should park + claim"
     } else {
         Write-Warning "[$($l.role)] pane $($l.pane) TUI not detected within timeout - check it manually"
     }

@@ -630,9 +630,13 @@ def task_done(conn, tid):
     row = conn.execute("SELECT tombstone FROM messages WHERE id=?", (tid,)).fetchone()
     if not row or row[0] is not None:
         return False
+    # 2026-09-05: the closing reply/ack must come from the task's own recipient
+    # (Codex design review, overall item 3: a reply from another worker that
+    # named this task id used to complete it). Mirrored in _ARCHIVE_DELETE.
     return conn.execute(
-        "SELECT 1 FROM messages WHERE in_reply_to=? AND msg_type IN ('reply','ack') "
-        "LIMIT 1", (tid,)
+        "SELECT 1 FROM messages r JOIN messages t ON t.id=r.in_reply_to "
+        "WHERE r.in_reply_to=? AND r.msg_type IN ('reply','ack') "
+        "AND r.sender=t.recipient LIMIT 1", (tid,)
     ).fetchone() is not None
 
 
@@ -968,11 +972,18 @@ _ARCHIVE_KEEP = 150        # rows always kept (same guard as `archive --keep`)
 # active work, never archivable. The NOT EXISTS mirrors task_done()'s
 # reply/ack predicate in SQL (kept adjacent by this comment: change both
 # together) so a RESOLVED no-requeue task does age out normally.
+# 2026-09-05: protection widened from no_requeue tasks to EVERY unfinished
+# task (tombstone NULL, no reply/ack from its own recipient). A plain claimed
+# task mid-lease is handled=1 too and could be deleted once 150 newer rows
+# accumulated (Codex design review, overall item 2). Code-reachable: the
+# reaper skips a task whose worker heartbeat is fresh and lease valid, then
+# this archive runs on the same path (Codex re-test 2026-09-05: 310 rows
+# during one live task deleted it). Production frequency unmeasured.
 _ARCHIVE_DELETE = (
     "DELETE FROM messages WHERE (handled=1 OR tombstone IS NOT NULL) AND id<=? "
-    "AND NOT (no_requeue=1 AND tombstone IS NULL AND msg_type='task' "
+    "AND NOT (tombstone IS NULL AND msg_type='task' "
     "AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.in_reply_to=messages.id "
-    "AND r.msg_type IN ('reply','ack')))"
+    "AND r.msg_type IN ('reply','ack') AND r.sender=messages.recipient))"
 )
 
 

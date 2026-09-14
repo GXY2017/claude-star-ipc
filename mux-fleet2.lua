@@ -8,4 +8,7 @@ config.unix_domains = {
   { name = 'fleet2', socket_path = wezterm.home_dir .. '/.local/share/wezterm/fleet2.sock' },
 }
 config.default_prog = { 'C:\\Program Files\\PowerShell\\7\\pwsh.exe' }
+-- No SSH agent forwarding in local fleets; symlink upkeep throws error 1314 on
+-- Windows without Developer Mode. Matches the same setting in ~/.wezterm.lua.
+config.mux_enable_ssh_agent = false
 return config

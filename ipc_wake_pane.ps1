@@ -24,7 +24,7 @@ param(
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\ipc_wezterm_common.ps1"
 
-$CodexRoles = @('E', 'CODEX')
+$CodexRoles = @('C', 'E', 'CODEX')   # keep in sync with ipc_wezterm_launch.ps1 (C = codex since 2026-08-30)
 $IpcPy = Join-Path $env:USERPROFILE '.claude\ipc\ipc.py'
 
 if (-not $Message) {
@@ -34,10 +34,9 @@ if (-not $Message) {
     $Message = "IPC wake: mailbox has messages for $Role. Run python `"$IpcPy`" recv --me $Role to fetch, execute the task, send the result back to A (use --body-file for CJK/backtick bodies), then done --me $Role --task N. Also verify your registry claim: if python `"$RolePy`" status shows role $Role owner '-', run python `"$RolePy`" take $Role (unclaimed roles are REFUSED-SQUATTER on A's require-watcher dispatch)."
 }
 
-if (-not (Resolve-WeztermSocket)) { throw 'WezTerm GUI not running / socket unreachable' }
-$map = Read-PaneMap
-if (-not $map.ContainsKey($Role)) { throw "role $Role not in pane map $script:PaneMapPath" }
-$paneId = [int]$map[$Role].pane_id
+$target = Get-PaneTarget $Role                       # fleet-aware (X = fleet2), 2026-08-30 #1262
+if (-not (Resolve-WeztermSocket -Fleet $target.fleet)) { throw "WezTerm $($target.fleet) mux not running / socket unreachable" }
+$paneId = Get-PaneIdForRole $Role                    # override-aware on that fleet
 $livePanes = @(Get-WeztermPanes | ForEach-Object { $_.pane_id })
 if ($livePanes -notcontains $paneId) { throw "pane $paneId for role $Role is gone - relaunch via ipc_wezterm_launch.ps1" }
 

@@ -10,7 +10,11 @@
 # Usage:
 #   pwsh ~/.claude/ipc/ipc_fleet1_restart.ps1 -Project "C:\path\to\project"
 #   pwsh ~/.claude/ipc/ipc_fleet1_restart.ps1 -Project ... -Roles A,B,C,E,F
-#   ... -Force        # proceed even if `pending --hub A` is non-empty
+#   ... -Force        # proceed even if `pending --hub A` is non-empty, or -Roles omits the hub
+#
+# !! WHOLE-FLEET only. -Roles = who comes BACK; teardown (step 2) is always the entire
+#    mux. A -Roles list without the hub is refused without -Force (2026-09-03): to recycle
+#    one role use ipc_wezterm_launch.ps1 -Roles <r> (live mux reused) or ipc_newcycle.ps1.
 #
 # Sequence (deviations from the shutdown runbook are deliberate):
 #   1. pending --hub A must be empty (or -Force) - never kill mid-flight fan-out.
@@ -45,7 +49,20 @@ $IpcPy = Join-Path $env:USERPROFILE '.claude\ipc\ipc.py'
 # `pwsh -File` passes "-Roles A,B" as one literal string; normalize.
 $Roles = @($Roles | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $Hub = if ($env:IPC_HUB) { $env:IPC_HUB } else { 'A' }
-$CodexRoles = @('E','CODEX')
+$CodexRoles = @('C','E','CODEX')   # keep in sync with ipc_wezterm_launch.ps1 (C = codex since 2026-08-30)
+
+# --- 0. this is a WHOLE-FLEET restart; -Roles is the relaunch list, never the teardown scope ---
+# 2026-09-03 11:14: hub A ran `-Roles C` meaning "give C a fresh session"; step 2 killed the
+# mux, every pane died incl. A itself, only C came back (memory ipc-single-role-restart).
+# A -Roles list without the hub is that misuse in almost every case: refuse unless -Force.
+if (($Roles -notcontains $Hub) -and -not $Force) {
+    throw ("-Roles ($($Roles -join ',')) does not include the hub $Hub. This script tears down the ENTIRE fleet-1 mux " +
+           "(every pane, including the caller) and relaunches only the listed roles.`n" +
+           "To recycle ONE role into the live fleet use the launcher instead:`n" +
+           "  pwsh ~/.claude/ipc/ipc_wezterm_launch.ps1 -Project `"$Project`" -Roles $($Roles -join ',')`n" +
+           "(low context only? pwsh ~/.claude/ipc/ipc_newcycle.ps1 -Roles $($Roles -join ','))`n" +
+           "Rerun with -Force only if you really want the whole fleet down and just these roles back.")
+}
 
 $Project = (Resolve-Path $Project).Path
 # Old docked project, read from the pane map the previous launch wrote (this is
@@ -63,12 +80,26 @@ try {
         if ($op -and (Test-Path $op)) { $OldProject = (Resolve-Path $op).Path }
     }
 } catch {}
+# Teardown is fleet-wide.  Include the configured fleet-1 map so legacy or
+# future role names are swept too; -Roles controls only who is relaunched.
+$FleetRoles = @(
+    (@('A','B','C','D','E','F') + @($oldMap.Keys) + @($Roles)) |
+        Where-Object { $_ } |
+        Sort-Object -Unique
+)
 Push-Location $OldProject
 try {
     # --- 1. refuse to kill mid-flight work (checked in the OLD mailbox) ---
     $pending = (& python $IpcPy pending --hub $Hub 2>&1) -join "`n"
     if ($pending -notmatch 'NONE' -and -not $Force) {
         throw "pending --hub $Hub is non-empty - workers may be mid-task:`n$pending`nResolve (recv/cancel) or rerun with -Force."
+    }
+
+    # --- 1b. a socket detour (wezterm_sock_override.json) describes the fleet we are about
+    # to kill; drop it NOW so neither this teardown nor tomorrow's tools follow it (2026-08-30 #1235).
+    if (Test-Path $script:SockOverridePath) {
+        Remove-Item $script:SockOverridePath -Force
+        Write-Host "socket override removed ($($script:SockOverridePath)) - fixed mux socket is authoritative again"
     }
 
     # --- 2. tear down fleet 1: the MUX server first (mux world 2026-08-17 -
@@ -121,11 +152,12 @@ try {
     }
 
     # --- 3. orphan watchers (pane children survive the GUI on Windows) ---
+    # Sweep the entire former fleet, including roles that will not be relaunched.
     # Includes the hub: its old watcher orphans too, and a beating hub orphan
     # swallows every signal meant for the fresh hub pane (bit 2026-08-15: X->A
     # note #1135 sat unread while the dead hub watcher looked "park live").
     # The ancestor-trace guard below protects any live watcher, hub included.
-    foreach ($r in $Roles) {
+    foreach ($r in $FleetRoles) {
         $s = (& python $IpcPy status --watch $r 2>&1) -join ' '
         if ($s -notmatch '(ALIVE|BUSY)') { continue }
         if ($s -notmatch 'pid=(\d+)') { continue }
@@ -163,7 +195,9 @@ try {
     # run, 2026-08-15; only ipc_wake_pane's own re-resolve masked it).
     [void](Resolve-WeztermSocket)
     $map = Read-PaneMap
-    $todo = @{}; foreach ($r in $Roles) { if ($r -ne $Hub) { $todo[$r] = $true } }
+    # Hub included since 2026-08-21: A also parks a `watch --me A` watcher at boot
+    # (launcher sends /ipc-recover to the hub pane too), so verify its park here.
+    $todo = @{}; foreach ($r in $Roles) { $todo[$r] = $true }
     $repaired = @{}
     $deadline = (Get-Date).AddSeconds(240)   # kimi (B) parks slowest, ~200s observed
     $grace = (Get-Date).AddSeconds(30)   # let SessionStart hooks land before repairing
@@ -184,7 +218,13 @@ try {
                     Write-Warning "[$r] pane shows a quota/limit banner - leaving it down (dispatch capacity: see ipc-dispatch-quota-awareness)"
                     $todo.Remove($r); continue
                 }
-                & pwsh "$PSScriptRoot\ipc_wake_pane.ps1" -Role $r
+                if ($r -eq $Hub) {
+                    # Hub repair: re-run the boot command; the default wake message
+                    # carries worker semantics (recv/execute/done) that don't apply.
+                    & pwsh "$PSScriptRoot\ipc_wake_pane.ps1" -Role $r -NoClear -Message "/ipc-recover $r"
+                } else {
+                    & pwsh "$PSScriptRoot\ipc_wake_pane.ps1" -Role $r
+                }
                 $repaired[$r] = $true
             }
         }

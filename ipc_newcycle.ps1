@@ -7,9 +7,10 @@
 #   pwsh ~/.claude/ipc/ipc_newcycle.ps1 -Force       # don't skip BUSY workers
 #   pwsh ~/.claude/ipc/ipc_newcycle.ps1 -SkipHub     # leave the hub pane alone
 #
-# Per role: send /clear, wait, send /ipc-recover <role> (workers; the hub just
-# continues after /clear). A BUSY worker (mid-task) is skipped unless -Force -
-# clearing it would strand the in-flight task as NEEDS-REVIEW/requeue.
+# Per role: send /clear, wait, send /ipc-recover <role> (hub included since
+# 2026-08-21 - A re-parks its `watch --me A` watcher after /clear like everyone
+# else). A BUSY worker (mid-task) is skipped unless -Force - clearing it would
+# strand the in-flight task as NEEDS-REVIEW/requeue.
 
 param(
     [string[]]$Roles,
@@ -26,8 +27,9 @@ $Hub   = if ($env:IPC_HUB) { $env:IPC_HUB } else { 'A' }
 $IpcPy = Join-Path $env:USERPROFILE ".claude\ipc\ipc.py"
 
 # Non-claude TUIs need different commands; empty wake = nothing sent after clear.
-$ClearCmd = @{ CODEX = '/new'; E = '/new' }
-$WakeCmd  = @{ CODEX = ''; E = '' }
+# Keep in sync with $CodexRoles in ipc_wezterm_launch.ps1 / ipc_dispatch.ps1 (C = codex since 2026-08-30, #1381).
+$ClearCmd = @{ CODEX = '/new'; E = '/new'; C = '/new' }
+$WakeCmd  = @{ CODEX = ''; E = ''; C = '' }
 
 $map = Read-PaneMap
 if ($map.Count -eq 0) { throw "No pane map at $script:PaneMapPath - run ipc_wezterm_launch.ps1 first" }
@@ -46,7 +48,8 @@ foreach ($r in $Roles) {
     $paneId = [int]$entry.pane_id
     if ($livePanes -notcontains $paneId) { $results += "[$r] SKIP - pane $paneId gone (relaunch or edit $script:PaneMapPath)"; continue }
 
-    # BUSY guard (workers only; the hub is watcher-less so status means nothing there)
+    # BUSY guard (workers only; the hub never claims dispatched tasks, so BUSY
+    # means nothing there even now that it parks a watcher - 2026-08-21)
     if ($r -ne $Hub -and -not $Force) {
         Push-Location $entry.project
         try { $status = (& python $IpcPy status --watch $r 2>&1) -join ' ' } finally { Pop-Location }
@@ -89,11 +92,10 @@ foreach ($r in $Roles) {
     Start-Sleep -Seconds 3
 
     $wake = if ($WakeCmd.ContainsKey($r)) { $WakeCmd[$r] }
-            elseif ($r -eq $Hub) { '' }
             else { "/ipc-recover $r" }
     if ($wake) { Submit-PaneText $paneId $wake }
 
-    $suffix = if ($wake) { " -> $wake" } elseif ($r -eq $Hub) { " (hub, no recover)" } else { " (no wake)" }
+    $suffix = if ($wake) { " -> $wake" } else { " (no wake)" }
     $results += "[$r] pane $paneId : $clear" + $suffix
 }
 

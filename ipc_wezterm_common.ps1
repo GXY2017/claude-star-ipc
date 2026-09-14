@@ -33,6 +33,49 @@ $script:MuxCfg = @{
     fleet2 = Join-Path $env:USERPROFILE ".claude\ipc\mux-fleet2.lua"
 }
 $script:MuxPidPath = Join-Path $env:USERPROFILE ".claude\ipc\wezterm_mux_pids.json"  # { fleet1 = pid; fleet2 = pid }
+# Temporary socket detour (2026-08-30 #1235): { fleet1 = { sock; pane_offset; expect_pane_ids } }.
+# Written by hand when the fixed mux socket is hijacked; DELETED by ipc_fleet1_restart.ps1
+# before teardown so it can never outlive the fleet it describes.
+$script:SockOverridePath = Join-Path $env:USERPROFILE ".claude\ipc\wezterm_sock_override.json"
+
+function Read-SockOverride([string]$Fleet) {
+    if (-not (Test-Path $script:SockOverridePath)) { return $null }
+    try { $o = Get-Content $script:SockOverridePath -Raw | ConvertFrom-Json } catch { return $null }
+    if ($o.PSObject.Properties.Name -contains $Fleet) { return $o.$Fleet }
+    return $null
+}
+
+function Get-PaneTarget([string]$Role) {
+    # THE role -> (fleet, pane_id, project) resolver for PowerShell. Two registries exist by design:
+    # wezterm_panes.json = fleet1 roles (written by ipc_wezterm_launch.ps1, merge-updated),
+    # wezterm_fleet2.json = fleet2's single role X (written by ipc_fleet2_launch.ps1).
+    # Mirror of ipc_pane_probe.pane_for() - keep the two in sync (2026-08-30 #1262: dispatch/wake read
+    # only the first file and threw "no pane recorded for X"; the probe read both and was right).
+    # Read-PaneMap stays fleet1-only on purpose: newcycle/restart iterate its keys against the fleet1
+    # socket, and a merged X (pane 0) would collide with A's pane 0 there.
+    $map = Read-PaneMap
+    if ($map.ContainsKey($Role)) {
+        return @{ fleet = 'fleet1'; pane_id = [int]$map[$Role].pane_id; project = $map[$Role].project }
+    }
+    if ($Role -eq 'X' -and (Test-Path $script:Fleet2Path)) {
+        try { $f2 = Get-Content $script:Fleet2Path -Raw | ConvertFrom-Json } catch { $f2 = $null }
+        if ($f2 -and $null -ne $f2.pane_id) {
+            return @{ fleet = 'fleet2'; pane_id = [int]$f2.pane_id; project = $f2.project }
+        }
+    }
+    throw "no pane recorded for $Role (checked $($script:PaneMapPath) and, for X, $($script:Fleet2Path))"
+}
+
+function Get-FleetForRole([string]$Role) { return (Get-PaneTarget $Role).fleet }
+
+function Get-PaneIdForRole([string]$Role) {
+    # Pane id on the role's OWN fleet socket, shifted by that fleet's override offset if a detour is active.
+    $t = Get-PaneTarget $Role
+    $id = [int]$t.pane_id
+    $ov = Read-SockOverride $t.fleet
+    if ($ov) { $id += [int]$ov.pane_offset }
+    return $id
+}
 
 function Read-MuxPids {
     if (Test-Path $script:MuxPidPath) {
@@ -127,6 +170,19 @@ function Resolve-WeztermSocket([string]$Fleet = 'fleet1') {
     # live wezterm-gui - a manual window - and either fake a "fleet running"
     # answer (small pane_ids collide) or silently spawn a whole fleet into an
     # unprotected GUI window, exactly the failure mode the mux migration kills.
+    $ov = Read-SockOverride $Fleet
+    if ($ov) {
+        # Detour active: identity check = the pane-id SET must match exactly (P2), else hard fail.
+        $env:WEZTERM_UNIX_SOCKET = $ov.sock
+        $raw = & $script:WeztermExe cli --no-auto-start list --format json 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "socket override $($ov.sock) does not answer - delete $($script:SockOverridePath) or restart fleet1" }
+        $got = @(($raw | ConvertFrom-Json) | ForEach-Object { [int]$_.pane_id } | Sort-Object)
+        $exp = @($ov.expect_pane_ids | ForEach-Object { [int]$_ } | Sort-Object)
+        if ($exp.Count -and (($got -join ',') -ne ($exp -join ','))) {
+            throw "override identity check FAILED: panes [$($got -join ',')] != expected [$($exp -join ',')] (a pane was opened/closed; offset no longer trusted - delete $($script:SockOverridePath) or restart fleet1)"
+        }
+        return $ov.sock
+    }
     $msock = $script:MuxSock[$Fleet]
     if ($msock -and (Test-Path $msock)) {
         $env:WEZTERM_UNIX_SOCKET = $msock
@@ -221,7 +277,11 @@ function Get-WeztermPanes {
 function Send-PaneText([int]$PaneId, [string]$Text) {
     # --no-paste: characters go in as keystrokes, so an embedded `r submits.
     # Verified: "/clear`r" in ONE send executes the slash command immediately.
-    & $script:WeztermExe cli send-text --pane-id $PaneId --no-paste -- $Text
+    # 2026-08-30 (X, #1180): wezterm's "no such pane N" / "failed to connect" used to be
+    # swallowed here and callers printed "nudge sent" - a hijacked fleet1.sock hid a whole
+    # morning of undelivered nudges. Non-zero exit is now a hard failure.
+    & $script:WeztermExe cli --no-auto-start send-text --pane-id $PaneId --no-paste -- $Text
+    if ($LASTEXITCODE -ne 0) { throw "send-text to pane $PaneId failed (wezterm exit $LASTEXITCODE; socket=$env:WEZTERM_UNIX_SOCKET)" }
 }
 
 function Get-PaneText([int]$PaneId) {
@@ -237,9 +297,30 @@ function Submit-PaneText([int]$PaneId, [string]$Text, [int]$DelayMs = 400) {
     Send-PaneText $PaneId "`r"
 }
 
+function Get-PaneKind([int]$PaneId) {
+    # What is running in the pane RIGHT NOW, judged by the pane's own footer/prompt shape:
+    #   'codex'  - `› Ask Codex to do anything` prompt or `Context NN% left ·` status line
+    #   'claude' - `⏵⏵ auto mode on` / `? for shortcuts` footer or `Ctx NN% left` statusline
+    #   'shell'  - last non-empty line is a PowerShell prompt (the TUI has exited)
+    #   'unknown'
+    $lines = @((Get-PaneText $PaneId) | Where-Object { $_ -match '\S' })
+    if ($lines.Count -eq 0) { return 'unknown' }
+    $tail = ($lines | Select-Object -Last 12) -join "`n"
+    $last = $lines[-1]
+    # 3+ SGR mouse reports on one line = a TUI died without restoring terminal modes (#1416)
+    if (($lines | Select-Object -Last 12 | Where-Object { $_ -match '(\[\d{1,4};\d{1,4};\d{1,4}[Mm]){3,}' }).Count -ge 1) { return 'dead-tui' }
+    if ($last -match '^\s*PS [A-Za-z]:\\.*>\s*$') { return 'shell' }
+    if ($tail -match '› Ask Codex|Context \d{1,3}% left ·') { return 'codex' }
+    if ($tail -match '⏵⏵ auto mode|\? for shortcuts|accept edits on|plan mode on|\bCtx \d{1,3}(\.\d+)?% left') { return 'claude' }
+    return 'unknown'
+}
+
 function Clear-PaneInput([int]$PaneId) {
     # One Ctrl+C empties a non-empty input box (a stray draft would otherwise
     # concatenate with our injected command); harmless hint when already empty.
+    # NOT for codex (2026-08-30 #1381): an idle codex TUI QUITS on Ctrl+C - C died at 22:0x exactly
+    # this way (memory codex-pane-operation). Codex gets nothing here; a stray draft is the lesser evil.
+    if ((Get-PaneKind $PaneId) -eq 'codex') { return }
     Send-PaneText $PaneId ([string][char]3)
     Start-Sleep -Milliseconds 300
 }
@@ -294,13 +375,22 @@ function Wait-CodexReady([int]$PaneId, [int]$TimeoutSec = 150, [string]$LaunchCm
 
 function Wait-PaneReady([int]$PaneId, [int]$TimeoutSec = 40) {
     # Poll the screen until the Claude Code TUI is at its input prompt.
-    # Handles the first-run folder-trust dialog by confirming it (option 1
-    # "Yes, I trust" is pre-selected).
+    # Folder-trust dialog (2026-08-28 fix): "Yes, I trust this folder" is NOT
+    # pre-selected - the marker starts on "No, exit", so the old bare Enter
+    # QUIT claude and left a bare shell prompt (fleet2 @ home, X never came up).
+    # Read where the marker sits and arrow down onto the Yes line first.
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 2
         $txt = (Get-PaneText $PaneId) -join "`n"
-        if ($txt -match 'trust this folder') { Send-PaneText $PaneId "`r"; continue }
+        if ($txt -match 'trust this folder') {
+            if ($txt -match '(?m)^\s*[>❯]\s*No, exit') {
+                Send-PaneText $PaneId "$([char]27)[B"   # Down: No, exit -> Yes, I trust
+                Start-Sleep -Milliseconds 400
+            }
+            Send-PaneText $PaneId "`r"
+            continue
+        }
         # First-run announcement/changelog modals OVERLAY a ready-looking footer,
         # so the footer check alone passes while the modal silently eats the wake
         # line (2026-08-15: "Don't show again ... Enter to confirm - Esc to

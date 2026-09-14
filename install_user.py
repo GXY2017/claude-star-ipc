@@ -39,6 +39,10 @@ COMMANDS = ("ipc-recover.md", "main.md")
 SKILL_SRC = os.path.join(SRC, "skills", "multi-terminal-ipc", "SKILL.md")
 SKILL_DST = os.path.join(os.path.expanduser("~"), ".claude", "skills",
                          "multi-terminal-ipc", "SKILL.md")
+# references/ (2026-09-14): onboarding + orchestration/dispatch patterns split out of
+# SKILL.md so the always-loaded body stays small; SKILL.md links them by relative path.
+SKILL_REF_SRC = os.path.join(SRC, "skills", "multi-terminal-ipc", "references")
+SKILL_REF_DST = os.path.join(os.path.dirname(SKILL_DST), "references")
 # Optional WezTerm fleet-control scripts (2026-08-03; mux-domain world 2026-08-17):
 # launch all role windows as panes under a per-fleet wezterm-mux-server, batch
 # /clear + /ipc-recover them between projects, wake/dispatch/exit single panes.
@@ -47,6 +51,12 @@ WEZTERM_SCRIPTS = ("ipc_wezterm_common.ps1", "ipc_wezterm_launch.ps1",
                    "ipc_fleet2_launch.ps1", "ipc_dispatch.ps1",
                    "ipc_wake_pane.ps1", "ipc_pane_exit.ps1",
                    "mux-fleet1.lua", "mux-fleet2.lua")
+# Hub-side tooling (2026-08-29..31 postmortems): brief lint before dispatch, pane
+# liveness probe (context % / stall flags), dispatch->reply timing, 15-min stall
+# watchdog, read-only pane listing/tail, and the fleet triage checklist they implement.
+TOOL_SCRIPTS = ("ipc_brief_lint.py", "ipc_pane_probe.py", "ipc_timing.py",
+                "stall_watch.py", "fleet_list_panes.py", "fleet_get_text.py",
+                "FLEET-TRIAGE.md")
 
 # (event, command, idempotency marker substring)
 # Guarded (user rule 2026-08-09): claim/release run only inside a WezTerm pane or a
@@ -75,7 +85,14 @@ def _deploy():
         os.makedirs(os.path.dirname(SKILL_DST), exist_ok=True)
         shutil.copyfile(SKILL_SRC, SKILL_DST)
         print(f"  + {SKILL_DST}")
-    for name in WEZTERM_SCRIPTS:
+        if os.path.isdir(SKILL_REF_SRC):
+            os.makedirs(SKILL_REF_DST, exist_ok=True)
+            for name in sorted(os.listdir(SKILL_REF_SRC)):
+                if name.endswith(".md"):
+                    shutil.copyfile(os.path.join(SKILL_REF_SRC, name),
+                                    os.path.join(SKILL_REF_DST, name))
+                    print(f"  + {os.path.join(SKILL_REF_DST, name)}")
+    for name in WEZTERM_SCRIPTS + TOOL_SCRIPTS:
         src = os.path.join(SRC, name)
         if os.path.exists(src):
             shutil.copyfile(src, os.path.join(DST, name))
