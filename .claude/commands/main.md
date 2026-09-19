@@ -21,7 +21,7 @@ python ~/.claude/ipc/ipc_role.py take A
 
 之后按 hub 职责协作:
 - **派活**:`send --from A --to B "<任务>"`;多 worker 一次派 `--to B,C`;广播活 worker `--to ALL`。派活默认加 `--require-watcher`(防黑洞)。任务正文含反引号/`$`/引号时**用 `--body-file <文件>`**,别走 shell 参数。
-- **收回复**:起 ONE 常驻 Monitor(`persistent=true`)跑 `watch --me A`——每条回复以 `NEW MSG #id from ...` 小信号到达,收到后 `peek --me A --tail 3` 读全文。2026-08-21 起这个盯哨在引导时就该挂上(fleet 启动脚本对 A 也发 `/ipc-recover A`,其第 4 步即挂哨)——若发现没挂(如本命令在裸终端手动执行),现在补挂。Monitor 不可用时退回后台 Bash `recv --me A --block`(exit 0=有消息,2=空超时重挂),或 `--block --count N` 屏障式收齐 N 条。
+- **收回复**:起 ONE 常驻 Monitor(`persistent=true`)跑 `watch --me A`——每条回复以 `NEW MSG #id from ...` 小信号到达,收到后 `peek --me A --tail 3` 读全文。**例外(2026-09-19 RESULT 行协议)**:worker 回复首行 `RESULT: <绝对路径>` 且 `send` 核盘通过的,盯哨不发 NEW MSG,而是攒到该轮派单结清后一次打出(只等预算截止落在 15 分钟窗口内的兄弟单;预算 40 分钟的长单和已超时的单不会拖住它) `DONE #N <- 角色 RESULT: 路径 (#id, no peek needed)`——照这一行记 ledger 即可,**不要 peek**;要看正文再 `peek --tail`。收到 NEW MSG 的才是要细读的(提问/部分完成/失败/路径核不过)。2026-08-21 起这个盯哨在引导时就该挂上(fleet 启动脚本对 A 也发 `/ipc-recover A`,其第 4 步即挂哨)——若发现没挂(如本命令在裸终端手动执行),现在补挂。Monitor 不可用时退回后台 Bash `recv --me A --block`(exit 0=有消息,2=空超时重挂),或 `--block --count N` 屏障式收齐 N 条。
 - **查派单完成度**:`pending --hub A [--detail]`(空=全部完成;状态 QUEUED/IN_PROGRESS/STALE/FAILED)。
 - **协调类消息**(致谢/FYI/"重挂盯哨")一律 `--type note`——note 免租约免重派、不进 pending,也不要求 worker 回复。
 
@@ -62,6 +62,19 @@ python ~/.claude/ipc/ipc_role.py take A
   `ipc_wake_pane.ps1`;未开工的 `redeliver --task N --by A`;角色不可用则同 `--submit-id`
   改派他人;配额横幅按 `fleet-worker-capacity` 派单纪律搁置该角色。
 - 延时最多两轮(累计 45 分钟)仍无产出 → 收回改派,并在派单记录里写明原因。
+- **收到的最终回执若是无关联 note(`peek --json` 里 `type=note`、`task=null`)→ 先 `python ~/.claude/ipc/ipc.py done --me <角色> --task N` 补结清,再存回执**;
+  否则该单一直挂在 `pending`,时钟每轮误报,租约到期后重新入队直至自动 failed(2026-09-16 NetLink 案 #1592–#1598,E 评审)。不要用 cancel 代替 done,不要重启编队,也不要反复忽略报警。
+
+**4. 任务中途不给用户选项;一个会话跑到底(用户 2026-09-16 定)。**
+- **`AskUserQuestion` 只允许在开工前一次性问完**(编队名单、正式件语言等)。派单发出之后直到交付,
+  **一律不再问用户**——用户常不在电脑前,一个选项框会让整条编队空等。中途遇到分岔按既有规则自决并写进派单记录:
+  角色不可用 → 同 `--submit-id` 改派空闲角色(本节第 3 条已有此规定);语言按市场;名单按可用角色。
+  证据:2026-09-15 NetLink 案,D 余额耗尽,A 15:41 弹选项问"改派给谁",用户次日 00:09 才答,编队空转 8 小时 28 分
+  (transcript `a7c92c44-…jsonl`,两次 AskUserQuestion 记录)。
+- **上下文靠自动压缩续命,不停下来等用户 `/compact`。** harness 会在下一次调用前自动压缩,A 不能自己触发,
+  也不需要:接近上限时照常继续下一步,不要以"请先 /compact"结束回合(2026-09-16 00:57 A 在 987K/1M 处停下等用户)。
+  为让压缩后能无缝接续:开工即建 `temp/<案例>/_A_ledger.md`(派单号、状态、产物路径、待办),每次收回或裁定后追加一行;
+  大块原文(年报、抽取结果)不进 A 的上下文,只落文件、只读摘要(本节第 1 条)。
 
 (worker 自报 5 小时/周额度一事**暂缓**——用户 2026-08-29 决定,各厂商 CLI 都没有回合内读额度的路径;
 配额状态由 A 在第 3 条的主动查看里从 pane 横幅判断,见 `fleet-worker-capacity` 派单纪律。)

@@ -101,7 +101,7 @@ The watcher snapshots the registry owner at start and retires on any later chang
 so watch-then-take retires the watcher just parked (D, 2026-08-13) and a watcher over an unclaimed slot is `ALIVE [SQUATTER]`, refused by
 `--require-watcher`; `ipc.py` `_REG_ANCHOR_GRACE = 45` s adopts a None/manual → claimed change as the pane's own take — a safety net, not permission.
 Mid-task the inverse holds: never `take` or re-park while a claimed task runs — the busy-beater fork rewrites the owner with an empty session, the
-parent watcher retires, the task drops to QUEUED; close with `send` + `done --task N`, then `take`, then re-park. [[C--Users-gxy49-Downloads-AI-----::ipc-claim-busy-beater-evicts-owner]] [[C--Users-gxy49-Downloads-----::orphan-watcher-survives-tui-death]]
+parent watcher retires, the task drops to QUEUED; close with `send` + `done --task N`, then `take`, then re-park. [[C--Users-<user>-Downloads-AI-----::ipc-claim-busy-beater-evicts-owner]] [[C--Users-<user>-Downloads-----::orphan-watcher-survives-tui-death]]
 
 **Preferred since 2026-08-03 — WezTerm pane fleet (automates all of the above):**
 terminals live as panes in one WezTerm window, launched and batch-controlled by
@@ -110,7 +110,7 @@ two user-level scripts (role→pane-id map, no window guessing, no hand-typing):
 ```powershell
 pwsh ~/.claude/ipc/ipc_wezterm_launch.ps1 -Roles A,B,C,D,E,F -Project <root>  # spawn lineup, claim roles, park watchers
 pwsh ~/.claude/ipc/ipc_newcycle.ps1 [-Roles C] [-Force] [-SkipHub]          # refresh context: per pane kind sends /clear + /ipc-recover (claude) or /new (codex, no wake, never Ctrl+C); BUSY roles skipped; dead codex TUI relaunched instead. This is A's tool when a role runs low on context — clearing beats restarting the pane
-pwsh ~/.claude/ipc/ipc_wezterm_launch.ps1 -Roles C -Project <root>          # ONE role back into the LIVE fleet: mux is reused, other panes untouched (this is how A restarts a single worker)
+pwsh ~/.claude/ipc/ipc_wezterm_launch.ps1 -Roles C -Project <root>          # ONE role back into the LIVE fleet: mux is reused, other panes untouched — ONLY for a role whose pane is GONE (`wezterm cli list` lacks its wezterm_panes.json pane id). A DOWN watcher with a live pane is woken in place: claude roles `ipc_wake_pane.ps1 -Role D -Message '/ipc-recover D'`, codex roles `-Message '$ipc-recover C'`. Since 2026-09-15 the launcher REFUSES a role whose mapped pane is still alive and prints that wake command (`-Force` adds the duplicate anyway). Bit 2026-09-14: A saw C DOWN, ran `-Roles C` then `-Roles D`; fleet ended with two C and two D panes and A's kill-pane cleanup was blocked
 pwsh ~/.claude/ipc/ipc_fleet1_restart.ps1 -Project <root>                   # WHOLE-FLEET restart only: pending check -> tear down mux + GUI + orphan watchers -> relaunch -> verify parks. `-Roles` picks what comes BACK, never what gets torn down: `-Roles C` still kills the mux and every pane incl. A itself (bit 2026-09-03, memory `ipc-single-role-restart`); since 2026-09-03 a `-Roles` list without the hub is REFUSED unless `-Force` Orphan-watcher sweep covers `$FleetRoles` = A–F ∪ old fleet-1 pane map ∪ `-Roles` (fixed 2026-09-04: it used to loop over `-Roles` only, so `-Roles A,C` left B/D/E/F watchers alive = fake ALIVE + stolen mail; memory `fleet-shutdown-orphan-watchers` 第三型).
 pwsh ~/.claude/ipc/ipc_fleet2_launch.ps1 -Project <root>                   # second formation: its own mux + GUI, role X only (Claude, --permission-mode auto); ask which project first unless the user already named the project and scope in this request, same rule as fleet 1
 pwsh ~/.claude/ipc/ipc_pane_exit.ps1 -Role F [-KeepRole]                   # clean exit of ONE pane: /exit -> release slot -> confirm watcher retired (caution 10); fleet 1 only
@@ -148,8 +148,10 @@ Role→model bindings (A=claude hub, B=kimi, C=codex gpt-5.6-sol xhigh — rebou
 2026-08-30, was glm via ollama, D=deepseek, E=codex, F=glm via Zhipu direct —
 added 2026-08-14) are a table at the top of
 the launch script; that table is the authority, this list is a snapshot. The old keepalive daemon
-is DECOMMISSIONED (same date): before dispatching, check `status --watch <role>`
-and wake a DOWN worker by typing into (or relaunching) its pane. Full findings,
+is DECOMMISSIONED (same date): before dispatching, check `status --watch <role>`.
+DOWN means the watcher is not parked, NOT that the pane is gone: check the pane
+first (`wezterm cli list` against the pane map), wake a live pane by typing into
+it (`ipc_wake_pane.ps1`), and relaunch only a pane that no longer exists. Full findings,
 traps, and per-bridge caveats: project-lib memory `wezterm-pane-injection-verified`
 (AI 财务分析 repo, `.claude/memory/`).
 
@@ -184,15 +186,19 @@ python ~/.claude/ipc/ipc_pane_probe.py E F [--json] / --all   # what the gate re
 python ~/.claude/ipc/stall_watch.py [--poll 60] [--once]      # hub's SECOND persistent Monitor (project-root cwd): at 15/30/45 min after each dispatch probes the pane
                                                       # and prints one REPLY-CLOCK verdict (WORKING -> extend / ACT NOW: <reason> / TWO EXTENSIONS USED -> reassign)
 python ~/.claude/ipc/ipc_timing.py --since 2026-08-29 [--hub A] [--cwd root]   # dispatch->reply minutes per task and per role, paired by in_reply_to (never by hand)
+python ~/.claude/ipc/ipc_estimate.py estimate --role E --brief brief.md        # 2026-09-19: pre-dispatch budget from the cross-project ledger ~/.claude/ipc/timing.jsonl (one row per first linked reply/fail, written by send(); `backfill` rescans every mailbox). Keyed by MODEL (launcher $ModelTag), not role; per-unit p80 x UNITS when n>=5, else the model's total p80, else all models — each tier prints n and INSUFFICIENT when it falls through. Write the suggested number as the brief's `预算:` line; ipc_brief_lint.py's "fits in 15 min" gate uses the ledger's p50 min/unit (typical rate, like the old static table) so it does not over-refuse — backfilled rows include queue wait. `stats [--by model|role|project]` shows p50/p80, per-unit rates, fail share
+ipc.py send --from A --to B --body-file brief.md --budget 12                    # optional; default = the brief's `预算: N 分钟` line. Stored as budget_min: drives the CLEAN-summary hold rule above and the ledger
 ```
 
 ### Worker B/C/D — execute & report
 ```
 ipc.py recv --me B                 # take my unread tasks (mark read)
 # Watcher hosting (2026-08-17 #1188 HARD RULE): `watch --me <role>` runs under the Monitor tool ONLY — a background-Bash watch buffers its signals to a file the harness surfaces only on exit (observed 1h55m delivery gap); watch now refuses file-stdout hosts with exit 4
-# Monitor host is BASH (2026-08-23): a backslash path `C:\Users\gxy49\.claude\ipc\ipc.py` is stripped to `Usersgxy49.claudeipcipc.py` (exit 2) — write `python ~/.claude/ipc/ipc.py watch --me <role>` or `C:/Users/...` forward slashes; PowerShell-tool calls are unaffected [[C--Users-gxy49-Downloads-------::monitor-host-bash-forward-slash]]
-ipc.py send --from B --to A "result"   # reply to A (plain send, no --require-watcher)
-ipc.py done --me B --task N         # register task N done (bodyless ack)
+# Monitor host is BASH (2026-08-23): a backslash path `C:\Users\<user>\.claude\ipc\ipc.py` is stripped to `Users<user>.claudeipcipc.py` (exit 2) — write `python ~/.claude/ipc/ipc.py watch --me <role>` or `C:/Users/...` forward slashes; PowerShell-tool calls are unaffected [[C--Users-<user>-Downloads-------::monitor-host-bash-forward-slash]]
+ipc.py send --from B --to A --in-reply-to N --body-file result.md   # THE result path (2026-09-16): a linked reply closes task N by itself — no separate `done`, no `--type note`. With several open tasks an unlinked reply is REFUSED-LINK (exit 3), never guessed; --in-reply-to naming a task dispatched to someone else is refused too
+                                   # RESULT-line protocol (2026-09-19): result.md OPENS with one `RESULT: <absolute path>` line per product file (then any summary). send() checks each path on disk (absolute, exists, mtime >= dispatch) and prints `RESULT CLEAN` / `RESULT UNVERIFIED: <why>` / `RESULT none`. CLEAN => A's watcher (and `recv`) prints one line `DONE #N <- B RESULT: <path>` and A never reads the body. Held only while a sibling task's budget end (dispatch + `预算: N 分钟`, default 15) falls before the flush deadline (oldest held + IPC_HOLD_SECS=900); a long-budget or overdue sibling never delays it. Anything else (a question, partial work, a wrong path) still arrives as `NEW MSG` and A reads it in full — so put a RESULT line ONLY when the product really is on disk
+ipc.py send --from B --to A --type note "progress"   # progress/FYI only — a note never closes a task (F's four note-typed results left #1592-#1598 open, 2026-09-16)
+ipc.py done --me B --task N         # close task N WITHOUT a text result (bodyless ack); redundant after a linked reply
 ipc.py ack  --me B --task N         # FIRST ACTION after reading a task (2026-08-17): stamps last_seen_ts so A's IN-PROGRESS-SILENT alarm clears; also the lease-extender for long tasks (no --task = all my claimed)
 ipc.py fail --me B --task N [--reason ...]   # mark failed (won't requeue)
 ```
@@ -270,9 +276,16 @@ not restate here):
    while the watcher process is dead, so registry ≠ "listening now". Without the
    flag a task can drop into a black hole. On refusal (exit 3), nudge the worker
    window to re-park its watcher, then resend.
-6. **Workers close tasks explicitly.** `done --me <self> --task N` when finished
-   (a plain reply also marks done, but auto-links to the *oldest* open task, so
-   `done --task N` is safer with several open). Call `ack` periodically on a long
+6. **Workers close tasks by the result itself: `send --to A --in-reply-to N`.**
+   The linked reply IS the completion; `done --task N` is only for a task with no
+   text result. **Open the reply with `RESULT: <absolute path>` (one line per product)**
+   when the task produced a file: `send` verifies the path against the disk and a CLEAN
+   reply reaches A as a one-line `DONE #N <- B RESULT: <path>` summary instead of a
+   `NEW MSG` it must peek — this is what keeps A's context flat across a fan-out
+   (2026-09-19). Questions, partial results and failures carry NO RESULT line so A reads
+   them in full. Auto-link happens only when exactly one task is open; with several,
+   an unlinked reply is refused (2026-09-16 — the old oldest-open guess bound F's
+   "#1566 回执" to #1567). A `--type note` never closes anything. Call `ack` periodically on a long
    task or the 1800s ceiling reaps it as "stuck" — `ack` also beats the heartbeat,
    so it is the keep-alive for a watcher-less worker mid-task (bash-fallback mode,
    whose heartbeat dies the moment a task is delivered). For a **non-idempotent**
@@ -344,13 +357,13 @@ not restate here):
     spot** (user rule 2026-08-30). Toolchain / pane / registry / watcher faults: A
     writes a brief for X — deliverable = root cause / file:line fixed / how to verify;
     "do not touch panes running tasks"; no `ipc_role.py reset` — and the fix lands in
-    shared code, never a one-off script. [[C--Users-gxy49-Downloads-----::fleet-anomalies-to-x]]
+    shared code, never a one-off script. [[C--Users-<user>-Downloads-----::fleet-anomalies-to-x]]
 17. **A worker is one context window; a long token-heavy serial queue exhausts it
     mid-queue** (B died after card 1/6, 2026-06-28 — returned results do not free the
     worker's context). Dispatch 2–3 items per batch and re-dispatch the remainder;
     workers write each product to a file and keep a one-line result in context; a
     dozen mechanical items go to subagents/Workflow, not one serial worker.
-    [[C--Users-gxy49-Downloads-AI-----::ipc-worker-queue-context-limit]]
+    [[C--Users-<user>-Downloads-AI-----::ipc-worker-queue-context-limit]]
 
 ## Deployment topologies (where state lives)
 

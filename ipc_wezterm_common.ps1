@@ -128,7 +128,7 @@ function Select-IpcProject {
     # var the launchers set (ipc_role.py:92 opt-in, :427 deterministic claim).
     $home_ = $env:USERPROFILE.TrimEnd('\')
     $projects = @(Get-ClaudeProject | Where-Object { $_.Path.TrimEnd('\') -ne $home_ })
-    $projects += [pscustomobject]@{ Name = 'gxy49 (home, default dir)'; Path = $env:USERPROFILE }
+    $projects += [pscustomobject]@{ Name = 'home (default dir)'; Path = $env:USERPROFILE }
     if ($projects.Count -eq 0) { return $Default }
 
     Write-Host ""

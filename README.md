@@ -131,9 +131,19 @@ idle costs ~zero turns):
 python ~/.claude/ipc/ipc.py watch --me B          # persistent watcher (Monitor), or:
 python ~/.claude/ipc/ipc.py recv --me B --block   # bash fallback, re-arm each wake
 python ~/.claude/ipc/ipc.py peek --me B --tail 3  # read full text after a signal
-python ~/.claude/ipc/ipc.py send --from B --to A "result"     # reply = task closed
+python ~/.claude/ipc/ipc.py send --from B --to A --in-reply-to N --body-file result.md   # reply = task closed
 python ~/.claude/ipc/ipc.py done --me B --task N              # or close explicitly
 ```
+
+RESULT-line protocol (2026-09-19): when the task produced a file, `result.md`
+opens with one `RESULT: <absolute path>` line per product. `send` verifies each
+path on disk (absolute, exists, mtime ≥ dispatch) and prints `RESULT CLEAN` /
+`RESULT UNVERIFIED: <why>`. A CLEAN reply reaches the hub as a single line
+`DONE #N <- B RESULT: <path>` (held until sibling tasks whose budget ends inside
+the hold window finish, `IPC_HOLD_SECS`=900) — the hub never reads the body.
+Questions, partial work and failures carry no RESULT line and arrive as
+`NEW MSG` for a full read. Budgets come from the brief's `预算: N 分钟` line
+(or `send --budget N`); `ipc_estimate.py` suggests them from per-model history.
 
 After `/clear` or context compaction, a worker recovers with `/ipc-recover B`
 (role survives; only the watcher needs rebuilding).
@@ -154,6 +164,7 @@ themselves.
 | `ipc_dispatch.ps1` / `ipc_wake_pane.ps1` / `ipc_pane_exit.ps1` | per-pane ops: one-shot park+queue+nudge dispatch, wake an unattended pane (codex-safe), clean pane exit that retires the watcher |
 | `.claude/commands/main.md`, `ipc-recover.md` | slash commands: `/main` (assert hub), `/ipc-recover` (rebuild watcher after `/clear`) |
 | `ipc_brief_lint.py` / `ipc_pane_probe.py` / `ipc_timing.py` / `stall_watch.py` | hub-side tooling (2026-08-29..31): lint a dispatch brief before it is sent, probe a pane's real liveness (context % / stall flags, not just heartbeat), pair dispatch→reply timing by `in_reply_to`, 15-minute stall watchdog for the hub |
+| `ipc_estimate.py` | per-model duration ledger (2026-09-19): `send()` appends one metadata row per first linked reply/fail to `~/.claude/ipc/timing.jsonl`; `backfill` rescans every mailbox, `stats` prints p50/p80 per model, `estimate --role R --brief f.md` suggests the brief's `预算:` line (n≥5 per tier, else INSUFFICIENT + fallback); the brief lint takes its per-unit rate from the same ledger |
 | `fleet_list_panes.py` / `fleet_get_text.py` / `FLEET-TRIAGE.md` | read-only pane inventory / screen tail per mux socket (hard timeout, `--no-auto-start`), and the symptom→command→verdict triage checklist that uses them |
 | `skills/multi-terminal-ipc/SKILL.md` + `references/` | operating skill; `references/onboarding.md` (enable in a project) and `references/orchestration-and-dispatch.md` (handoff / advisor / committee patterns, dispatch gates) |
 | `CLAUDE.md` | the protocol the terminals follow |

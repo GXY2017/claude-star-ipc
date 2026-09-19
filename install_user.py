@@ -55,6 +55,7 @@ WEZTERM_SCRIPTS = ("ipc_wezterm_common.ps1", "ipc_wezterm_launch.ps1",
 # liveness probe (context % / stall flags), dispatch->reply timing, 15-min stall
 # watchdog, read-only pane listing/tail, and the fleet triage checklist they implement.
 TOOL_SCRIPTS = ("ipc_brief_lint.py", "ipc_pane_probe.py", "ipc_timing.py",
+                "ipc_estimate.py",   # 2026-09-19: per-model duration ledger + budget estimates
                 "stall_watch.py", "fleet_list_panes.py", "fleet_get_text.py",
                 "FLEET-TRIAGE.md")
 

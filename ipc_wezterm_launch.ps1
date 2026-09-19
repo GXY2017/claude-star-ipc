@@ -14,7 +14,8 @@
 param(
     [string[]]$Roles = @('A','B'),
     [string]$Project,   # empty = ask (console) / error (headless, incl. Claude sessions)
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$Force     # add a pane even if the role's mapped pane is still alive (normally refused, 2026-09-15)
 )
 
 . "$PSScriptRoot\ipc_wezterm_common.ps1"
@@ -62,7 +63,7 @@ $Roles = @($Roles | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim(
 # unattended panes on tool-approval prompts). Wrapper fns forward extra args to claude;
 # ollama forwards what follows `--` to the integration.
 $LaunchCmd = @{
-    A     = 'claude --model claude-opus-5 --permission-mode auto'   # user pick 2026-08-03: hub on Opus 5
+    A     = "claude --model 'claude-opus-5[1m]' --permission-mode auto"   # user pick 2026-08-03: hub on Opus 5; [1m] added 2026-09-14 (fixed ctx was 206K > 200K, auto-compact loop)
     B     = "claude-kimi 'k3[1m]' --permission-mode auto"    # positional -Model MUST come first or it swallows the flag (ValidateSet)
     C     = 'codex --model gpt-5.6-sol -c model_reasoning_effort=xhigh'  # user 2026-08-30: C = codex sol xhigh (was GLM via ollama cloud); flags pin it even if ~/.codex/config.toml defaults change
     D     = 'claude-ds --permission-mode auto'               # profile fn, DeepSeek env block
@@ -140,6 +141,30 @@ if ($guiPid) {
 }
 
 $map = Read-PaneMap
+
+# --- 0. refuse to duplicate a role whose pane is still alive (2026-09-15) ---
+# A DOWN watcher means "not parked", not "pane gone". On 2026-09-14 hub A saw C
+# DOWN, ran `-Roles C` then `-Roles D`, and the fleet ended with two C and two D
+# panes (its kill-pane cleanup was then blocked by the permission classifier).
+# A live pane is woken in place; only a pane missing from `wezterm cli list` is
+# relaunched here. -Force keeps the old behaviour for a deliberate duplicate.
+if (-not $freshGui -and -not $Force) {
+    $livePanes = @(Get-WeztermPanes | ForEach-Object { $_.pane_id })
+    $dupes = @()
+    foreach ($r in $Roles) {
+        $entry = $map[$r]
+        if ($entry -and $entry.pane_id -ne $null -and $livePanes -contains [int]$entry.pane_id) {
+            $recover = if ($CodexRoles -contains $r) { "`$ipc-recover $r" } else { "/ipc-recover $r" }
+            $dupes += "  role $r -> pane $($entry.pane_id) is still alive. Wake it in place instead:`n" +
+                      "    pwsh ~/.claude/ipc/ipc_wake_pane.ps1 -Role $r -Message '$recover'`n" +
+                      "  (low context? pwsh ~/.claude/ipc/ipc_newcycle.ps1 -Roles $r ; TUI dead back to the shell? type its launch command into that pane)"
+        }
+    }
+    if ($dupes.Count -gt 0) {
+        throw ("refusing to add a duplicate pane:`n" + ($dupes -join "`n") +
+               "`nOnly a role whose pane is GONE from `wezterm cli list` belongs here. Pass -Force to add a duplicate anyway (then kill the old pane yourself).")
+    }
+}
 
 # A freshly started GUI already owns one pane; use it for the first role
 # instead of leaving a stray shell tab.

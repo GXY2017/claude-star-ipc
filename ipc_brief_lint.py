@@ -53,6 +53,16 @@ def main():
     a = ap.parse_args()
     role = a.role.upper()
     rate = dict(DEFAULT_RATE)
+    rate_src = "static table"
+    try:  # 2026-09-19: ledger-derived p50 min/unit for the role's CURRENT model beats the static table
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from ipc_estimate import rate_for
+        learned = rate_for(role)
+        if learned:
+            rate[role] = round(learned[0], 2)
+            rate_src = f"timing.jsonl p50, n={learned[1]}"
+    except Exception as e:  # noqa: BLE001 — lint must run without the ledger
+        rate_src = f"static table (ledger unavailable: {e})"
     for kv in a.rate:
         k, v = kv.split("=", 1)
         rate[k.upper()] = float(v)
@@ -85,9 +95,9 @@ def main():
     if units and role in rate:
         est = units * rate[role]
         if est > a.max_min:
-            fails.append(f"U UNITS={units} × {rate[role]} 分钟/份（{role} 实测）≈ {est:.0f} 分钟 > {a.max_min}，拆单")
+            fails.append(f"U UNITS={units} × {rate[role]} 分钟/份（{role} {rate_src}）≈ {est:.0f} 分钟 > {a.max_min}，拆单")
         elif budget is not None and est > budget:
-            warns.append(f"U 估算 {est:.0f} 分钟 > 你写的预算 {budget} 分钟")
+            warns.append(f"U 估算 {est:.0f} 分钟（{rate[role]} 分钟/份，{rate_src}）> 你写的预算 {budget} 分钟")
     elif not units:
         warns.append("U 没写 `UNITS: n`，无法按实测吞吐校验单量")
 
@@ -130,7 +140,7 @@ def main():
                 continue
             base = name.replace("/", "\\").split("\\")[-1]
             fails.append(f"D2 第 {i} 行产物写成非绝对路径 `{name}`：改成绝对路径，例如 "
-                         f"C:\\Users\\gxy49\\Downloads\\<项目>\\_staging\\{base}（更正类简报也要写全）")
+                         f"C:\\Users\\<user>\\Downloads\\<项目>\\_staging\\{base}（更正类简报也要写全）")
 
     # N title-count vs body-count
     mt = FEN.search(first)

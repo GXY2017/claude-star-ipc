@@ -77,7 +77,17 @@ rules (guard-safe constraints verbatim; preprocessed inputs ship as files).
    `-Role`, whose `UNITS: n` x measured min/unit exceeds the budget, whose
    absolute paths do not exist, or whose product target is empty; and refuses
    a recipient whose pane reads DEAD/QUOTA/BLOCKED. `stall_watch.py` runs the
-   reply clock. Put `预算:` and `UNITS:` on their own lines near the top.
+   reply clock. Put `预算:` and `UNITS:` on their own lines near the top. The
+   `预算:` number comes from `python ~/.claude/ipc/ipc_estimate.py estimate --role
+   <r> --brief <file>` (per-model p80 from the timing ledger, 2026-09-19), not
+   from a guess; if it prints INSUFFICIENT for the model, keep the 15-minute
+   default and slice. The budget also decides whether sibling CLEAN summaries
+   wait for this task (SKILL.md, RESULT-line protocol).
+   Every brief that names a product file also says how to close: "回复文件首行
+   `RESULT: <产物绝对路径>`,有问题或只做了一部分则不写 RESULT 行" (2026-09-19
+   RESULT-line protocol, SKILL.md caution 6) — the same absolute path the brief
+   declared, so `send`'s disk check and `stall_watch`'s artifact ground truth
+   agree on one file.
 
 ## Capacity-aware dispatch (hub A, adopted 2026-08-19)
 

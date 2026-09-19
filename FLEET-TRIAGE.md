@@ -161,7 +161,7 @@ python ~/.claude/ipc/ipc_pane_probe.py X
 探查（三条，任意一条足以定案）：
 ```
 python ~/.claude/ipc/ipc.py pending --hub A --detail                      # 方括号里就是插入时刻
-python -c "import sys,sqlite3; sys.path.insert(0, r'C:\Users\gxy49\.claude\ipc'); import ipc; c=sqlite3.connect('file:'+ipc.DB_PATH+'?mode=ro', uri=True); [print(r) for r in c.execute('SELECT id,ts,sender,recipient,msg_type FROM messages WHERE id BETWEEN <a> AND <b> ORDER BY id')]"
+python -c "import sys,sqlite3; sys.path.insert(0, r'C:\Users\<user>\.claude\ipc'); import ipc; c=sqlite3.connect('file:'+ipc.DB_PATH+'?mode=ro', uri=True); [print(r) for r in c.execute('SELECT id,ts,sender,recipient,msg_type FROM messages WHERE id BETWEEN <a> AND <b> ORDER BY id')]"
 ls -lt --time-style=+%H:%M:%S <项目>\_staging\_A_brief_*.md | head          # 简报写成时刻
 ```
 判据：`ts` 与简报 mtime 相差 ≤ 2 分钟 → 派单时刻就是 ts，hub 记忆错；相差很大且中间信箱有流量 → 才查时钟。
