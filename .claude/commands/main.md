@@ -2,7 +2,7 @@
 description: 把本终端设为主终端 A(hub),更新注册表归属,按需派活给 worker 并收回结果
 ---
 
-你现在是**主终端 A(星型 hub)**,是发起方/决策方。IPC 协议见项目 `CLAUDE.md`(项目未内嵌协议节时,以用户级 `multi-terminal-ipc` skill 为参考)。
+你现在是**主终端 A(星型 hub)**,是发起方/决策方。IPC 协议的唯一权威是用户级 `multi-terminal-ipc` skill(`~/.claude/skills/multi-terminal-ipc/SKILL.md`;2026-08-21 起项目 AGENTS.md/CLAUDE.md 不再重述协议,只写该部署自己的硬规则)。本命令只管 A 的角色流程。
 
 > 本文所有 `ipc.py` / `ipc_role.py` 均指用户级安装:
 > `python ~/.claude/ipc/ipc.py` / `python ~/.claude/ipc/ipc_role.py`。
@@ -21,7 +21,7 @@ python ~/.claude/ipc/ipc_role.py take A
 
 之后按 hub 职责协作:
 - **派活**:`send --from A --to B "<任务>"`;多 worker 一次派 `--to B,C`;广播活 worker `--to ALL`。派活默认加 `--require-watcher`(防黑洞)。任务正文含反引号/`$`/引号时**用 `--body-file <文件>`**,别走 shell 参数。
-- **收回复**:起 ONE 常驻 Monitor(`persistent=true`)跑 `watch --me A`——每条回复以 `NEW MSG #id from ...` 小信号到达,收到后 `peek --me A --tail 3` 读全文。**例外(2026-09-19 RESULT 行协议)**:worker 回复首行 `RESULT: <绝对路径>` 且 `send` 核盘通过的,盯哨不发 NEW MSG,而是攒到该轮派单结清后一次打出(只等预算截止落在 15 分钟窗口内的兄弟单;预算 40 分钟的长单和已超时的单不会拖住它) `DONE #N <- 角色 RESULT: 路径 (#id, no peek needed)`——照这一行记 ledger 即可,**不要 peek**;要看正文再 `peek --tail`。收到 NEW MSG 的才是要细读的(提问/部分完成/失败/路径核不过)。2026-08-21 起这个盯哨在引导时就该挂上(fleet 启动脚本对 A 也发 `/ipc-recover A`,其第 4 步即挂哨)——若发现没挂(如本命令在裸终端手动执行),现在补挂。Monitor 不可用时退回后台 Bash `recv --me A --block`(exit 0=有消息,2=空超时重挂),或 `--block --count N` 屏障式收齐 N 条。
+- **收回复**:起 ONE 常驻 Monitor(`timeout_ms: 1800000`;`persistent` 参数已不存在,Monitor 硬顶 30 分钟,到期通知一到就重挂,细则见 `/ipc-recover` 第 3 步)跑 `watch --me A`——每条回复以 `NEW MSG #id from ...` 小信号到达,收到后 `peek --me A --tail 3` 读全文。**例外(2026-09-19 RESULT 行协议)**:worker 回复首行 `RESULT: <绝对路径>` 且 `send` 核盘通过的,盯哨不发 NEW MSG,而是攒到该轮派单结清后一次打出(只等预算截止落在 15 分钟窗口内的兄弟单;预算 40 分钟的长单和已超时的单不会拖住它) `DONE #N <- 角色 RESULT: 路径 (#id, no peek needed)`——照这一行记 ledger 即可,**不要 peek**;要看正文再 `peek --tail`。收到 NEW MSG 的才是要细读的(提问/部分完成/失败/路径核不过)。2026-08-21 起这个盯哨在引导时就该挂上(fleet 启动脚本对 A 也发 `/ipc-recover A`,其第 4 步即挂哨)——若发现没挂(如本命令在裸终端手动执行),现在补挂。Monitor 不可用时退回后台 Bash `recv --me A --block`(exit 0=有消息,2=空超时重挂),或 `--block --count N` 屏障式收齐 N 条。
 - **查派单完成度**:`pending --hub A [--detail]`(空=全部完成;状态 QUEUED/IN_PROGRESS/STALE/FAILED)。
 - **协调类消息**(致谢/FYI/"重挂盯哨")一律 `--type note`——note 免租约免重派、不进 pending,也不要求 worker 回复。
 
@@ -46,7 +46,7 @@ python ~/.claude/ipc/ipc_role.py take A
   (标题角色==收件人、`预算: N 分钟` 必填且 ≤15、`UNITS: n`×实测吞吐是否超预算、路径存在、产物目标非空、
   标题/正文份数一致、guard-safe 形态),再跑 `ipc_pane_probe.py` 读收件人 **pane 状态行**的剩余上下文
   (DEAD/QUOTA/BLOCKED 直接拒发,<70% 警告)。两闸任一失败即不发;`-Force` 绕过须在简报里写原因;`-DryRun` 只跑闸。
-- 引导时除 `watch --me A` 外再起**第二个常驻 Monitor**:`python ~/.claude/ipc/stall_watch.py`
+- 引导时除 `watch --me A` 外再起**第二个常驻 Monitor**(同样 30 分钟到期须重挂):`python ~/.claude/ipc/stall_watch.py`
   (项目根 cwd)。它在每单派出后 15/30/45 分钟自动探 pane 并打一行裁决
   (`REPLY-CLOCK #id -> E 15m | ctx 31% flags=working tail=CHANGED | WORKING -> extend 15m`
   / `ACT NOW: DEAD-LOOP` / `TWO EXTENSIONS USED -> reassign`),A 只需照裁决处置。

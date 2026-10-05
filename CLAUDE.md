@@ -5,7 +5,7 @@
 > orchestration patterns, capacity-aware dispatch — lives in
 > [`skills/multi-terminal-ipc/SKILL.md`](skills/multi-terminal-ipc/SKILL.md).
 > `install_user.py` deploys that skill user-level (`~/.claude/skills/`), so every
-> opted-in project loads the same copy on demand; project `CLAUDE.md` files keep
+> opted-in project loads the same copy on demand; project `AGENTS.md` files keep
 > only a one-line pointer plus deployment-specific rules. This file no longer
 > restates the protocol (the last full ~360-line spec is commit `a092dde`).
 

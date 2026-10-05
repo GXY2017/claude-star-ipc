@@ -9,8 +9,10 @@
 # Usage:
 #   pwsh ~/.claude/ipc/ipc_wake_pane.ps1                 # wake E, default drain msg
 #   pwsh ~/.claude/ipc/ipc_wake_pane.ps1 -Role E -Message 'custom instruction'
-#   pwsh ~/.claude/ipc/ipc_wake_pane.ps1 -Role E -Model luna   # cheap-tier task: restart codex on gpt-5.6-luna
-# -Model (codex roles only): 'luna'|'terra'|'sol' or a full model id. Quota economics
+#   pwsh ~/.claude/ipc/ipc_wake_pane.ps1 -Role E -Model luna   # cheap-tier task: restart codex on gpt-6-luna
+# -Model (codex roles only): 'luna'|'sol'|'astra' (GPT-6 family, sol = gpt-6.1-sol since 2026-10-05; 'terra' = astra, there is no gpt-6-terra)
+# or a full model id. GPT-6 only since 2026-10-04: ~/.codex/AGENTS.md relies on the GPT-6
+# templates' built-in base rules, which gpt-5.6-* lack. Quota economics
 # (2026-08-08): Luna usage counts ~80% cheaper against the Codex subscription, so
 # simple dispatches (search digests, doc reading) go to luna; keep sol max for hard
 # tasks. Switching RESTARTS the codex TUI (fresh context — fine, every dispatch
@@ -24,7 +26,7 @@ param(
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\ipc_wezterm_common.ps1"
 
-$CodexRoles = @('C', 'E', 'CODEX')   # keep in sync with ipc_wezterm_launch.ps1 (C = codex since 2026-08-30)
+$CodexRoles = @('C', 'E', 'CODEX')   # keep in sync with ipc_wezterm_launch.ps1 (C = codex since 2026-08-30, luna max from 09-19, gpt-6-luna max from 10-04)
 $IpcPy = Join-Path $env:USERPROFILE '.claude\ipc\ipc.py'
 
 if (-not $Message) {
@@ -41,7 +43,7 @@ $livePanes = @(Get-WeztermPanes | ForEach-Object { $_.pane_id })
 if ($livePanes -notcontains $paneId) { throw "pane $paneId for role $Role is gone - relaunch via ipc_wezterm_launch.ps1" }
 
 if ($CodexRoles -contains $Role) {
-    $modelMap = @{ luna = 'gpt-5.6-luna'; terra = 'gpt-5.6-terra'; sol = 'gpt-5.6-sol' }
+    $modelMap = @{ luna = 'gpt-6-luna'; sol = 'gpt-6.1-sol'; astra = 'gpt-6-astra'; terra = 'gpt-6-astra' }   # newest per tier in ~/.codex/models_cache.json (2026-10-05: sol has 6.1, luna/astra do not)
     $targetModel = ''
     if ($Model) {
         $targetModel = if ($modelMap.ContainsKey($Model.ToLower())) { $modelMap[$Model.ToLower()] } else { $Model }
@@ -64,7 +66,7 @@ if ($CodexRoles -contains $Role) {
         Start-Sleep -Seconds 3
     }
     if ($targetModel -and ((Get-PaneText $paneId) -join "`n") -notmatch [regex]::Escape($targetModel)) {
-        # Footer shows the live model ("gpt-5.6-sol max · Context ..."); wrong one ->
+        # Footer shows the live model ("gpt-6-sol max · Context ..."); wrong one ->
         # restart on target. Ctrl+C QUITS the codex TUI - normally the trap, here the tool.
         for ($try = 0; $try -lt 2; $try++) {
             Send-PaneText $paneId ([string][char]3)

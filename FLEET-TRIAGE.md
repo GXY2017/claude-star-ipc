@@ -179,7 +179,7 @@ pwsh -NoProfile -File <scratch>\test_panekind.ps1        # 或：. ~/.claude/ipc
 python ~/.claude/ipc/fleet_get_text.py fleet1.sock <pane> 30   # 看 resume 提示与 PS 提示符的先后
 ```
 判据：`Get-PaneKind` 返回 `shell` = TUI 已不在，先起 TUI 再谈命令；`codex` = 不许 Ctrl+C、不许 claude 专用斜杠命令（`/clear`→`/new`，`/ipc-recover`→`$ipc-recover`）。
-处置：pane 里敲 `codex --model gpt-5.6-sol -c model_reasoning_effort=xhigh`（或裸 `codex`）起 TUI → `pwsh ~/.claude/ipc/ipc_wake_pane.ps1 -Role C -NoClear -Message '$ipc-recover C'`（**必须 `-NoClear`**）→ `ipc.py status --watch C` 出 ALIVE、`ipc_role.py status` owner 为会话 id 即成（codex 的 SessionStart 钩子会自己 claim）。
+处置：pane 里敲 `codex --model gpt-6-luna -c model_reasoning_effort=max`（C 的现行绑定，2026-10-04 起；或裸 `codex`）起 TUI → `pwsh ~/.claude/ipc/ipc_wake_pane.ps1 -Role C -NoClear -Message '$ipc-recover C'`（**必须 `-NoClear`**）→ `ipc.py status --watch C` 出 ALIVE、`ipc_role.py status` owner 为会话 id 即成（codex 的 SessionStart 钩子会自己 claim）。
 已修（共享代码）：`ipc_wezterm_common.ps1` 新增 `Get-PaneKind`（按 pane 自己的页脚/提示符形态判 codex/claude/shell），`Clear-PaneInput` 对 codex pane 直接返回不发 Ctrl+C；`_staging\_A_send_pane_command.ps1` 发前判 kind：shell → 拒发，codex → `/clear`→`/new`、`/exit`→`/quit`、claude 专用命令拒发、不 Ctrl+C；`ipc_newcycle.ps1:30-31` 的 codex 表补上 C（否则下次 newcycle 给 C 发 `/clear`）。
 
 ## T11. pane 满屏鼠标转义序列（TUI 死后未还原终端模式）——判 dead-tui，不是 unknown

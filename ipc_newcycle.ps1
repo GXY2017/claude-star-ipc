@@ -27,7 +27,7 @@ $Hub   = if ($env:IPC_HUB) { $env:IPC_HUB } else { 'A' }
 $IpcPy = Join-Path $env:USERPROFILE ".claude\ipc\ipc.py"
 
 # Non-claude TUIs need different commands; empty wake = nothing sent after clear.
-# Keep in sync with $CodexRoles in ipc_wezterm_launch.ps1 / ipc_dispatch.ps1 (C = codex since 2026-08-30, #1381).
+# Keep in sync with $CodexRoles in ipc_wezterm_launch.ps1 / ipc_dispatch.ps1 (C = codex since 2026-08-30, #1381; luna max from 09-19).
 $ClearCmd = @{ CODEX = '/new'; E = '/new'; C = '/new' }
 $WakeCmd  = @{ CODEX = ''; E = ''; C = '' }
 

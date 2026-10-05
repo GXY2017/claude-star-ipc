@@ -5,7 +5,10 @@ Data: ~/.claude/ipc/timing.jsonl — one line per first linked reply/fail, writt
 ipc.py send() (source=live) or by `backfill` from every project mailbox (source=
 backfill; those rows have no claimed_ts, so exec_min is None and total_min is used).
 Metadata only, no bodies. Model = the launcher's $ModelTag for the role at the time
-(live rows read it at write time; backfill uses ROLE_MODEL_HISTORY below).
+(live rows read it at write time; backfill uses ROLE_MODEL_HISTORY below). Live rows
+since 2026-09-19 also carry `variant` = model + parameters parsed from $LaunchCmd
+(ipc._role_variant, e.g. Codex/gpt-5.6-sol/xhigh); rate_for/estimate try the
+variant tier before the vendor tag, and `fail` rows never enter a duration sample.
 
   python ~/.claude/ipc/ipc_estimate.py backfill                 # (re)scan all mailboxes, dedupe
   python ~/.claude/ipc/ipc_estimate.py stats [--by model|role] [--since 2026-08-01]
@@ -43,7 +46,8 @@ BUDGET = re.compile(r"(?:预算|时间预算|BUDGET)\s*[:：]\s*(\d+)\s*(?:分�
 ROLE_MODEL_HISTORY = {
     "A": [("Claude", "2026-01-01", None)],
     "B": [("Kimi", "2026-01-01", None)],
-    "C": [("GLM-ollama", "2026-01-01", "2026-08-30"), ("Codex-sol", "2026-08-30", None)],
+    "C": [("GLM-ollama", "2026-01-01", "2026-08-30"), ("Codex-sol", "2026-08-30", "2026-09-19"),
+          ("Codex-luna", "2026-09-19", "2026-10-04"), ("Codex-gpt6-luna", "2026-10-04", None)],
     "D": [("DeepSeek", "2026-01-01", None)],
     "E": [("Codex", "2026-01-01", None)],
     "F": [("GLM-Zhipu", "2026-08-14", None)],
@@ -135,34 +139,55 @@ def backfill():
     print(f"backfill: +{added} rows -> {LOG} (total {len(load())})")
 
 
+def timed(r):
+    """A row that may feed a duration sample: has minutes AND did not fail.
+    (2026-09-19 review item 2: five fast `fail` rows formed a valid throughput
+    rate and drove the budget below what real work needs.) Fail rows still
+    count toward `fail%` in stats."""
+    return minutes(r) is not None and r.get("outcome") != "fail"
+
+
 def stats(by="model", since=None):
     rows = [r for r in load() if minutes(r) is not None and (not since or r["ts"] >= since)]
     groups = {}
     for r in rows:
         groups.setdefault(r.get(by) or "?", []).append(r)
-    print(f"{by:<14}{'n':>4}{'p50m':>7}{'p80m':>7}{'nU':>4}{'u/p50':>7}{'u/p80':>7}{'fail':>6}{'clean':>7}  (minutes; u/ = min per unit)")
+    print(f"{by:<28}{'n':>4}{'p50m':>7}{'p80m':>7}{'nU':>4}{'u/p50':>7}{'u/p80':>7}{'fail':>6}{'clean':>7}  (minutes; u/ = min per unit; durations exclude fail rows)")
     for g, rs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
-        mins = [minutes(r) for r in rs]
-        per_u = [minutes(r) / r["units"] for r in rs if r.get("units")]
+        ok = [r for r in rs if timed(r)]
+        mins = [minutes(r) for r in ok]
+        per_u = [minutes(r) / r["units"] for r in ok if r.get("units")]
         fail = sum(r.get("outcome") == "fail" for r in rs) / len(rs)
         clean_known = [r for r in rs if r.get("result") is not None]
         clean = (sum(r["result"] == "CLEAN" for r in clean_known) / len(clean_known)) if clean_known else None
-        print(f"{g:<14}{len(rs):>4}{pct(mins,50):>7.1f}{pct(mins,80):>7.1f}{len(per_u):>4}"
+        print(f"{g:<28}{len(rs):>4}{(pct(mins,50) or 0):>7.1f}{(pct(mins,80) or 0):>7.1f}{len(per_u):>4}"
               f"{(pct(per_u,50) or 0):>7.2f}{(pct(per_u,80) or 0):>7.2f}{fail:>6.0%}"
               f"{('  -' if clean is None else f'{clean:>7.0%}')}")
 
 
+def current_variant(role):
+    sys.path.insert(0, HERE)
+    import ipc  # noqa: E402
+    return ipc._role_variant(role)
+
+
+def _keys(role):
+    """[(field, value)] tiers, most specific first: exact model+params, then vendor tag."""
+    return [("variant", current_variant(role)), ("model", current_model(role))]
+
+
 def rate_for(role):
-    """(p50 minutes per unit, n) for the role's current model, or None if n < MIN_N.
-    p50 (typical rate) feeds the lint's hard "fits in 15 min" gate — the old static
-    table was a typical rate too; p80 there would refuse briefs that used to pass,
-    and backfill rows include queue wait. The p80 belongs to `estimate`'s 预算建议."""
-    model = current_model(role)
-    per_u = [minutes(r) / r["units"] for r in load()
-             if r.get("model") == model and r.get("units") and minutes(r) is not None]
-    if len(per_u) < MIN_N:
-        return None
-    return pct(per_u, 50), len(per_u)
+    """(p50 minutes per unit, n) for the role's current model+params, falling back
+    to the vendor tag; None if no tier reaches MIN_N. p50 (typical rate) feeds the
+    lint's hard "fits in 15 min" gate — the old static table was a typical rate
+    too; p80 there would refuse briefs that used to pass, and backfill rows include
+    queue wait. The p80 belongs to `estimate`'s 预算建议. Fail rows excluded."""
+    rows = [r for r in load() if timed(r) and r.get("units")]
+    for field, key in _keys(role):
+        per_u = [minutes(r) / r["units"] for r in rows if r.get(field) == key]
+        if len(per_u) >= MIN_N:
+            return pct(per_u, 50), len(per_u)
+    return None
 
 
 def estimate(role, units=None, chars=None, brief=None):
@@ -172,24 +197,26 @@ def estimate(role, units=None, chars=None, brief=None):
         m = UNITS.search(text) or FEN.search(text.splitlines()[0] if text else "")
         units = units or (int(m.group(1)) if m else None)
         chars = chars or len(text)
-    model = current_model(role)
-    rows = [r for r in load() if minutes(r) is not None]
-    mine = [r for r in rows if r.get("model") == model]
+    keys = _keys(role)
+    label = keys[0][1]
+    rows = [r for r in load() if timed(r)]
     tiers = []
-    if units:
-        per_u = [minutes(r) / r["units"] for r in mine if r.get("units")]
-        tiers.append(("per-unit/" + model, [units * v for v in per_u]))
-    tiers.append(("total/" + model, [minutes(r) for r in mine]))
+    for field, key in keys:
+        mine = [r for r in rows if r.get(field) == key]
+        if units:
+            per_u = [minutes(r) / r["units"] for r in mine if r.get("units")]
+            tiers.append((f"per-unit/{key}", [units * v for v in per_u]))
+        tiers.append((f"total/{key}", [minutes(r) for r in mine]))
     tiers.append(("total/all-models", [minutes(r) for r in rows]))
     for name, vals in tiers:
         if len(vals) >= MIN_N:
             p50, p80 = pct(vals, 50), pct(vals, 80)
-            print(f"EST role={role} model={model} units={units or '?'} chars={chars or '?'} "
+            print(f"EST role={role} model={label} units={units or '?'} chars={chars or '?'} "
                   f"basis={name} n={len(vals)} p50={p50:.0f}m p80={p80:.0f}m -> 预算建议: {max(1, round(p80))} 分钟"
-                  + ("" if name.startswith("per-unit") else "  (no per-unit history for this model yet)"))
+                  + ("" if name.startswith("per-unit") else "  (no per-unit history at this tier yet)"))
             return
         print(f"  {name}: n={len(vals)} INSUFFICIENT (< {MIN_N}), falling back")
-    print(f"EST role={role} model={model}: no history -> use the 15-minute default and slice")
+    print(f"EST role={role} model={label}: no history -> use the 15-minute default and slice")
 
 
 def main():
@@ -197,7 +224,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("backfill")
     s = sub.add_parser("stats")
-    s.add_argument("--by", choices=("model", "role", "project"), default="model")
+    s.add_argument("--by", choices=("variant", "model", "role", "project"), default="model")
     s.add_argument("--since", default=None)
     e = sub.add_parser("estimate")
     e.add_argument("--role", required=True)

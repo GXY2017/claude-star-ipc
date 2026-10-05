@@ -6,7 +6,7 @@ description: 恢复本终端的 IPC 待命(/clear、上下文压缩或 SessionSt
 
 > 本文所有 `ipc.py` / `ipc_role.py` 均指用户级安装:
 > `python ~/.claude/ipc/ipc.py` / `python ~/.claude/ipc/ipc_role.py`。
-> (遗留项目本地安装的项目才用项目根的 `ipc.py`;以项目 CLAUDE.md 的 Deployment 说明为准。)
+> (遗留项目本地安装的项目才用项目根的 `ipc.py`;以项目 AGENTS.md 的 Deployment 说明为准。)
 
 先理解机制(决定了恢复只需做什么):
 - **`/clear` 不释放角色**——`ipc_role.py` 在 clear 时早返回,注册表按 `session_id` 保留"本会话→角色"映射。`/clear` 只杀掉后台**盯哨进程**。
@@ -25,18 +25,19 @@ description: 恢复本终端的 IPC 待命(/clear、上下文压缩或 SessionSt
 
 2. **核对项目**:cwd 必须是启用了 IPC 的项目根——判据是**存在 `.claude/ipc.enabled`**(用户级部署的 opt-in 门),或遗留本地安装时项目根有 `ipc.py`。不符则停下并提示用户去正确目录重开,不要继续。(不要拿"项目根有没有 ipc.py"当用户级部署的判据——用户级安装下项目根本来就没有它。)
 
-3. **先挂盯哨,再干活**(worker 角色 B/C/D):用 **Monitor 工具**(`persistent: true`, `timeout_ms: 3600000`)跑
+3. **先挂盯哨,再干活**(worker 角色 B/C/D):用 **Monitor 工具**(`timeout_ms: 1800000`)跑
    `python ~/.claude/ipc/ipc.py watch --me <角色>`
    作常驻盯哨,然后**结束本轮**。
+   ⚠️ **Monitor 硬顶 30 分钟(2026-09-21 #1521 实测,Claude Code 2.1.278)**:`persistent` 参数已不存在,`timeout_ms` 超过 1800000 会被夹到 1800000;到期时 harness 按进程树杀掉 `watch` 并发一条到期通知——**收到通知立刻重挂**(同角色新盯哨按代际退掉旧的,幂等)。到期若落在任务执行期内,自 2026-09-21 起 `watch` 在认领任务时二次 fork 一个 busy-beater(刷 `_worker_<角色>.busy`,父 pid 先退出以躲过树杀)替你证明活着,reaper 不再把在途任务误 requeue;修前这正是 `QUEUED-STALLED attempts=1` 假警与 attempts=2 重认领的来源(根因报告 `宏观分析/_staging/_X_busybeater_rootcause.md`,补丁已入 `~/.claude/ipc/ipc.py`)。
    ⛔ **`watch` 的宿主只准 Monitor,禁止 Bash `run_in_background`**(2026-08-17 #1188 实测:后台 bash 的输出全部写进文件,harness 只在进程退出时通知会话——盯哨认领了任务、信号在文件里躺了 1h55m,会话毫不知情,任务在 `pending` 里假装 IN_PROGRESS)。后台 bash 只在第 3 步末的 `recv --block` 回退里合法(它送达即退出,退出即触发通知,机制上成立;`watch` 永不退出,机制上必然黑洞)。
    挂好盯哨后**核对注册表 claim**(见第 1 步末尾):owner 为 `-` 则 `ipc_role.py take <角色>`,否则 A 派单会被 `REFUSED-SQUATTER` 拒掉。**顺序要紧**:任务租约的 reaper 把"心跳在跳"与"租约未到期"做 AND 判定,若先 recv 清积压再挂哨,执行期间无心跳,在途任务会被误判 stale 而重新入队。挂哨后积压会在几秒内以信号形式到达(`NEW MSG #id from ...`,不带正文以防截断);**收到信号用 `python ~/.claude/ipc/ipc.py peek --me <角色> --tail 3` 读全文**,读完**先 `ack --me <角色> --task N` 再开工**(2026-08-17 起 ack 刷新 last_seen_ts;不 ack 的在途任务超 30 分钟会在 A 的 pending 里标 `IN-PROGRESS-SILENT` 疑似未开工),然后执行→`send --from <角色> --to A --in-reply-to N --body-file <结果文件>` 回 A(N=本单任务号;带任务号的 reply 本身就结清任务,不用再 `done`,也不要用 `--type note`——note 不结清,时钟会一直报警;多单在手而不带 `--in-reply-to` 会被 REFUSED-LINK 拒发)。**结果文件第一行写 `RESULT: <产物绝对路径>`**(多个产物多写几行,后面再接摘要;2026-09-19 起):`send` 会核盘上文件并打印 `RESULT CLEAN`/`UNVERIFIED: <原因>`,CLEAN 的回复 A 只收到一行 `DONE #N <- 角色 RESULT: 路径`、不读正文;有问题、只做了一部分、失败,就**不要写** RESULT 行,A 会全文读→同一 Monitor 继续听(不用重挂)。
    **一个信箱同一时刻只需一个盯哨**——对 `watch` 是**代码自愈**的:每个 `watch` 启动领一个代际号,起新 `watch --me <角色>` 会让**同角色**的旧/孤儿盯哨在下一轮 poll 自动退役(打印 `WATCHER ... retired` 后干净退出),孤儿不会黑洞本信箱。(双盯哨也不会重复投递:认领是原子单消费者,只是多余。)⚠️ 代际**按角色**:起 `watch --me B` **不会**退掉跑错的 `watch --me D`(见第 1 步)。
    **Monitor 不可用的 bash 回退**:后台 Bash 跑 `recv --me <角色> --block`,每次唤醒重挂(exit 0=有任务读之;exit 2=空超时直接重挂;被杀=先 `peek --tail 3` 查漏再重挂)。回退模式下任务一送达心跳即死,执行超过 1 分钟的任务要每隔几分钟跑一次 `ack --me <角色>`——ack 现在**同时续租约+刷心跳**,防 reaper 误收在途任务。
    > ⚠️ **本回退路径不要加 `--keep-heartbeat`**(2026-07-28 补记,防指令面漂移)。该 flag 是给 **Codex 的 recv supervisor** 用的:那种循环在 `recv` 返回后**立刻**在同一进程内重挂,空窗实测仅 2.7–5.6 秒,保留心跳可无缝交接。而本回退的"重挂"要跨一个 agent 轮次,间隔可能远超 `max_age`(8 秒),加了既救不回误判、又会在你实际已停止收听后仍被判活至多 8 秒——那正是协议要避免的黑洞。**Claude 侧主路径(常驻 Monitor 跑 `watch`)根本没有这个问题**:`watch` 从不返回,不存在删心跳的交接点。看到 Codex 配方里有这个 flag 而本文件没有,是**刻意的差异,不是漏改**。
 
-4. **A(hub)角色也挂常驻盯哨(2026-08-21 起,用户决定;旧规"A 按需收、不挂常驻盯哨"作废)**:与 worker 同法,用 **Monitor 工具**(`persistent: true`, `timeout_ms: 3600000`)跑
+4. **A(hub)角色也挂常驻盯哨(2026-08-21 起,用户决定;旧规"A 按需收、不挂常驻盯哨"作废)**:与 worker 同法,用 **Monitor 工具**(`timeout_ms: 1800000`;同样 30 分钟硬顶,到期通知一到就重挂,见第 3 步)跑
    `python ~/.claude/ipc/ipc.py watch --me A`
-   **再起第二个常驻 Monitor**(同参数)跑 `python ~/.claude/ipc/stall_watch.py`(cwd=项目根)——它是 15 分钟回复时钟的执行者:每单派出后 15/30/45 分钟自动探收件人 pane 并打一行 `REPLY-CLOCK … | WORKING -> extend 15m` / `ACT NOW: <原因>` / `TWO EXTENSIONS USED -> reassign`,A 照裁决处置即可(2026-08-30 起,见 `/main`「机械化」段)。
+   **再起第二个常驻 Monitor**(同参数,同样 30 分钟到期须重挂)跑 `python ~/.claude/ipc/stall_watch.py`(cwd=项目根)——它是 15 分钟回复时钟的执行者:每单派出后 15/30/45 分钟自动探收件人 pane 并打一行 `REPLY-CLOCK … | WORKING -> extend 15m` / `ACT NOW: <原因>` / `TWO EXTENSIONS USED -> reassign`,A 照裁决处置即可(2026-08-30 起,见 `/main`「机械化」段)。
    ——worker 回复以 `NEW MSG #id from ...` 信号到达,收到后 `python ~/.claude/ipc/ipc.py peek --me A --tail 3` 读全文。宿主同样**只准 Monitor,禁止后台 Bash**(第 3 步的 #1188 黑洞机制对 A 一样成立);Monitor 不可用时才退回后台 Bash `recv --me A --block`(送达即退出,每次唤醒重挂)。挂好后核对注册表:`ipc_role.py status` 里 A 的 owner 为 `-` 则补 `python ~/.claude/ipc/ipc_role.py take A`。与 worker 的差异:A 收的是**回复不是任务**——不需要 ack/done,不受租约 reaper 影响;收完按 hub 职责(`/main`)综合裁决、继续派活。注册表对 hub 的豁免不变:A 心跳死也**不会**被 reclaim-dead/claim 清扫回收,hub 身份只能显式 `take A` 转移——所以 A 盯哨死了 status 会显示 hub 心跳 down,但角色不丢,重挂即可。
 
-5. **罕见:钩子从未运行 / 注册表丢了你的槽**(不是 /clear,是 hook 脚本异常)——你仍能用 `--me <角色>` 正常收发(recv/watch 不依赖注册表),但后果不止"`--to ALL` 广播漏掉你":**A 的 `--require-watcher` 派单会对无 owner 的你直接 `REFUSED-SQUATTER`**(2026-08-17 起)。首选轻修法:`python ~/.claude/ipc/ipc_role.py take <角色>` 一条命令补上 claim(placeholder "manual" 也算有效 owner)。重修法:**直接关掉本窗、重开终端**,让 SessionStart 钩子重新分配槽;或对确认已死的占槽跑 `python ~/.claude/ipc/ipc_role.py reclaim-dead`(只回收心跳已死的 **worker** 槽;hub 槽豁免——hub 按设计不挂盯哨,心跳死≠hub 死,故可随时安全盲跑,2026-07-03 起。ghost 槽通常也无需手动清:任何终端 SessionStart 的 claim() 都会顺手全量清扫)。**不要在本恢复流程里跑 `ipc_role.py reset`**——`reset()` 会**清空整个注册表**(把活着的 A/C 也一起抹掉,导致角色错乱);它是需人工确认"所有终端都已死"时才用的运维命令,不属常规恢复。
+5. **罕见:钩子从未运行 / 注册表丢了你的槽**(不是 /clear,是 hook 脚本异常)——你仍能用 `--me <角色>` 正常收发(recv/watch 不依赖注册表),但后果不止"`--to ALL` 广播漏掉你":**A 的 `--require-watcher` 派单会对无 owner 的你直接 `REFUSED-SQUATTER`**(2026-08-17 起)。首选轻修法:`python ~/.claude/ipc/ipc_role.py take <角色>` 一条命令补上 claim(placeholder "manual" 也算有效 owner)。重修法:**直接关掉本窗、重开终端**,让 SessionStart 钩子重新分配槽;或对确认已死的占槽跑 `python ~/.claude/ipc/ipc_role.py reclaim-dead`(只回收心跳已死的 **worker** 槽;hub 槽豁免——hub 心跳死≠hub 死(盯哨可能到期未重挂,见第 4 步),故可随时安全盲跑,2026-07-03 起。ghost 槽通常也无需手动清:任何终端 SessionStart 的 claim() 都会顺手全量清扫)。**不要在本恢复流程里跑 `ipc_role.py reset`**——`reset()` 会**清空整个注册表**(把活着的 A/C 也一起抹掉,导致角色错乱);它是需人工确认"所有终端都已死"时才用的运维命令,不属常规恢复。

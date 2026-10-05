@@ -12,6 +12,9 @@ hub-manage-not-operate-15min-slices, fleet-worker-capacity):
      picked an old input because the product was only named, not pathed)
   N  "N 份" in the title vs the first "N 份" in the body must agree     (#1079: title 12, body 8) [WARN]
   G  code blocks must not use `cd X && ...` / heredoc / brace expansion (guard-safe shell rule) [WARN]
+  C  a `完成判据:` line or section is required: what the worker checks before replying and
+     what A checks on receipt (2026-10-02, book "Build an AI Agent" §7.2 plan items carry
+     completion criteria; §9.4.2 delegation input is validated before it is sent)
 
 Usage:  python ~/.claude/ipc/ipc_brief_lint.py <brief.md> --role E [--max-min 15] [--rate E=3.0]
 Exit 0 = pass (warnings allowed), 2 = FAIL (dispatch must stop unless -Force).
@@ -42,6 +45,7 @@ NEGATED_BEFORE = re.compile(r"(不要|不得|不准|不能|不许|禁止|别|勿
 CD_COMPOUND = re.compile(r"\bcd\s+[^\n]*&&")
 HEREDOC = re.compile(r"<<\s*'?[A-Z_]+'?")
 BRACE = re.compile(r"\{[^{}\n]*,[^{}\n]*\}")
+CRITERIA = re.compile(r"(完成判据|验收标准|DONE[-_ ]WHEN|ACCEPTANCE)\s*[:：]?", re.I)
 
 
 def main():
@@ -100,6 +104,10 @@ def main():
             warns.append(f"U 估算 {est:.0f} 分钟（{rate[role]} 分钟/份，{rate_src}）> 你写的预算 {budget} 分钟")
     elif not units:
         warns.append("U 没写 `UNITS: n`，无法按实测吞吐校验单量")
+
+    # C completion criteria
+    if not CRITERIA.search(text):
+        fails.append("C 缺 `完成判据:`（每个子任务一行可核验的完成条件，worker 交付前自查、A 收货时照此验收）")
 
     # P paths
     for tok in sorted(set(ABS_PATH.findall(text))):

@@ -36,7 +36,7 @@ if (-not (Test-Path $BodyFile)) { throw "body file not found: $BodyFile" }
 # --- 0a. brief lint (mechanical; each check is a 2026-08-29 incident) ---
 #   header role == -Role (#1144 F's brief sent to C) · `预算: N 分钟` present and <= MaxMinutes
 #   (#1138 18 reports) · UNITS x measured rate fits · paths exist · no empty product target
-#   (#1097) · title/body "N 份" agree (#1079) · guard-safe shell shapes.
+#   (#1097) · title/body "N 份" agree (#1079) · guard-safe shell shapes · `完成判据:` present.
 $lintOut = (& python (Join-Path $PSScriptRoot 'ipc_brief_lint.py') $BodyFile --role $Role --max-min $MaxMinutes 2>&1) -join "`n"
 Write-Host $lintOut
 if ($LASTEXITCODE -ne 0) {
@@ -74,7 +74,7 @@ if ($probe) {
 }
 if ($DryRun) { Write-Host "DRY RUN: gates passed for $Role - nothing sent"; exit 0 }
 # Keep in sync with $CodexRoles in ipc_wezterm_launch.ps1.
-$CodexRoles = @('C', 'E', 'CODEX')   # C = codex since 2026-08-30
+$CodexRoles = @('C', 'E', 'CODEX')   # C = codex since 2026-08-30 (luna max from 09-19)
 $isCodex = $CodexRoles -contains $Role
 
 function Get-WatcherState([string]$r) {
@@ -110,10 +110,29 @@ if ($state -ne 'ALIVE') {
     }
 }
 
+# --- 1b. append the knowledge boundary + closing protocol by code (2026-10-02) ---
+#   Book "Build an AI Agent" §2.3.1 (system prompt states the knowledge cutoff) and §3.2.3
+#   (values code already knows are injected by code, not copied by the model). The hub's
+#   brief file stays untouched; the queued body is a temp copy with this footer.
+$footer = @"
+
+---
+（以下由 ipc_dispatch.ps1 自动附加）
+今天是 $(Get-Date -Format 'yyyy-MM-dd')。你的训练数据有截止日期：此后的事实、价格、版本、文件内容一律检索或读盘，不得凭记忆补。
+收尾协议（回复正文第一行，三选一）：
+- 产物完成并通过上面的完成判据 → RESULT: <产物绝对路径>（每个产物一行）
+- 做不到（缺权限/缺数据/工具失败且无替代） → UNSOLVABLE: <原因与已尝试的办法>
+- 发现简报的前提本身错了（目标、口径、输入与实际不符） → REPLAN: <哪条前提错了 + 证据>
+只做了一部分、有疑问：不写以上任何一行，直接说明。
+"@
+$sendFile = Join-Path ([IO.Path]::GetTempPath()) ("ipc-brief-{0}-{1}.md" -f $Role, (Get-Date -Format 'yyyyMMddHHmmss'))
+[IO.File]::WriteAllText($sendFile, ([IO.File]::ReadAllText($BodyFile) + $footer), [Text.UTF8Encoding]::new($false))
+
 # --- 2. queue the task (no --require-watcher: freshly parked heartbeats lose its <8s race) ---
-$sendArgs = @('send', '--from', $From, '--to', $Role, '--body-file', $BodyFile)
+$sendArgs = @('send', '--from', $From, '--to', $Role, '--body-file', $sendFile)
 if ($SubmitId) { $sendArgs += @('--submit-id', $SubmitId) }
 $out = (& python $ipc @sendArgs 2>&1) -join "`n"
+Remove-Item $sendFile -ErrorAction SilentlyContinue   # temp copy; the body now lives in the mailbox DB
 Write-Host $out
 if ($out -notmatch '(?:SENT|DUP)\s+#(\d+)') { throw "send failed: $out" }
 $taskId = $Matches[1]

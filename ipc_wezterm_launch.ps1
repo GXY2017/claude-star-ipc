@@ -21,9 +21,10 @@ param(
 . "$PSScriptRoot\ipc_wezterm_common.ps1"
 
 # Pick the project before touching anything else. With no -Project this shows
-# the same history-derived menu as `cc project`; the default (Enter, and the
-# headless fallback) is the HOME DIR per the revised launch-dir rule 2026-08-11
-# (memory home-dir-launch-default) - pass -Project for project-scoped fleets.
+# the same history-derived menu as `cc project`; Enter selects the HOME DIR
+# per the revised launch-dir rule 2026-08-11 (memory home-dir-launch-default).
+# Claude sessions and headless callers must pass -Project explicitly; otherwise
+# the checks below throw before spawning any panes.
 $insideClaude = @(Get-ChildItem env: | Where-Object { $_.Name -like 'CLAUDE*' }).Count -gt 0
 if (-not $Project) {
     # User rule 2026-08-13: EVERY wezterm launch asks which project. Callers with
@@ -58,16 +59,28 @@ $Roles = @($Roles | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim(
 # launch that role until you fill it in.
 # User lineup 2026-08-03: A=Anthropic hub, B=Kimi, C=GLM via ollama cloud, D=DeepSeek.
 # C rebound 2026-08-30 (user): codex gpt-5.6-sol, reasoning xhigh.
+# C rebound 2026-09-19 (user): codex gpt-5.6-luna, reasoning max — cheaper codex
+#   tokens than sol. (A same-day GLM-5.3-Flash binding was dropped within the hour:
+#   Zhipu's night offer, docs.bigmodel.cn/cn/coding-plan/notice/event-glm-5.3-flash,
+#   ran 09-03..09-20 23:00-09:00 and is x2 quota in Claude Code, free only in ZCode.)
+# C rebound 2026-10-04 (user): codex gpt-6-luna, reasoning max. The GPT-6 model templates
+#   carry the base behavior rules (slop list, bias to action, ...) that gpt-5.6-* lack,
+#   so ~/.codex/AGENTS.md no longer restates them. Quota ratio vs 5.6-luna not measured yet.
+# A rebound 2026-10-05 (user /model in the A pane on 10-04): Opus 5.5. Its window is 1M
+#   natively: `claude -p --model claude-opus-5-5 --output-format json` reports
+#   modelUsage contextWindow=1000000 with or without [1m], and A's transcript ran to 689K
+#   uncompacted. E's ~/.codex/config.toml moved to gpt-6.1-sol high the same day;
+#   C stays gpt-6-luna max (models_cache.json lists no gpt-6.1-luna).
 # F added 2026-08-14: GLM via Zhipu direct (claude-glm profile fn, glm-5.3[1m]).
 # All four in --permission-mode auto (user decision 2026-08-03: manual mode stalls
 # unattended panes on tool-approval prompts). Wrapper fns forward extra args to claude;
 # ollama forwards what follows `--` to the integration.
 $LaunchCmd = @{
-    A     = "claude --model 'claude-opus-5[1m]' --permission-mode auto"   # user pick 2026-08-03: hub on Opus 5; [1m] added 2026-09-14 (fixed ctx was 206K > 200K, auto-compact loop)
+    A     = 'claude --model claude-opus-5-5 --permission-mode auto'   # user pick 2026-08-03: hub on Opus; Opus 5.5 from 2026-10-05, 1M native (was claude-opus-5[1m] 09-14..10-05: fixed ctx 206K > 200K caused an auto-compact loop, so A needs a 1M window)
     B     = "claude-kimi 'k3[1m]' --permission-mode auto"    # positional -Model MUST come first or it swallows the flag (ValidateSet)
-    C     = 'codex --model gpt-5.6-sol -c model_reasoning_effort=xhigh'  # user 2026-08-30: C = codex sol xhigh (was GLM via ollama cloud); flags pin it even if ~/.codex/config.toml defaults change
+    C     = 'codex --model gpt-6-luna -c model_reasoning_effort=max'  # user 2026-10-04: C = codex gpt-6-luna max (was gpt-5.6-luna max 09-19..10-04, sol xhigh 08-30..09-19); flags pin it even if ~/.codex/config.toml defaults change
     D     = 'claude-ds --permission-mode auto'               # profile fn, DeepSeek env block
-    E     = 'codex'      # codex CLI slot (letter binding 2026-08-03)
+    E     = 'codex'      # codex CLI slot (letter binding 2026-08-03); model/effort follow ~/.codex/config.toml (gpt-6.1-sol high since 2026-10-05)
     F     = 'claude-glm --permission-mode auto'              # profile fn, Zhipu direct (glm-5.3[1m]); added 2026-08-14
     CODEX = 'codex'      # legacy named channel, redundant with E since 2026-08-03
     DS    = 'claude-ds'  # legacy named channel, redundant with D since 2026-08-03
@@ -77,9 +90,14 @@ $LaunchCmd = @{
 # the bare letter.
 $ModelTag = @{
     # Vendor names only, no version — models get switched/upgraded, version tags go stale.
+    # The per-model-and-parameter key for timing stats is NOT this table: ipc.py
+    # _role_variant() parses $LaunchCmd above (--model / model_reasoning_effort /
+    # quoted positional model; bare `codex` reads ~/.codex/config.toml) and writes
+    # it as `variant` in timing.jsonl (2026-09-19). Keep launch flags explicit
+    # on the $LaunchCmd line if a role's model must be attributable.
     A     = 'Claude'
     B     = 'Kimi'
-    C     = 'Codex-sol'  # 2026-08-30: second codex pane, sol xhigh (E stays the luna/sol-switchable one)
+    C     = 'Codex-gpt6-luna'  # 2026-10-04: second codex pane, gpt-6-luna max (was Codex-luna = gpt-5.6-luna 09-19..10-04, Codex-sol 08-30..09-19; E stays the config.toml-driven one)
     D     = 'DeepSeek'
     E     = 'Codex'
     F     = 'GLM-Zhipu'
@@ -92,7 +110,7 @@ $ModelTag = @{
 # -> ipc_role.py claim), so it needs $env:IPC_ROLE like everyone else - without
 # it, an inherited IPC_ROLE squats that role (X-eviction bug, 2026-08-12) and a
 # clean env roulette-claims the lowest free slot.
-$CodexRoles = @('C','E','CODEX')   # C joined 2026-08-30; keep in sync with ipc_dispatch.ps1 / ipc_wake_pane.ps1 / ipc_fleet1_restart.ps1
+$CodexRoles = @('C','E','CODEX')   # C codex since 2026-08-30 (luna max from 09-19); keep in sync with ipc_dispatch.ps1 / ipc_wake_pane.ps1 / ipc_fleet1_restart.ps1 / ipc_newcycle.ps1
 $Hub = if ($env:IPC_HUB) { $env:IPC_HUB } else { 'A' }
 
 $Project = (Resolve-Path $Project).Path

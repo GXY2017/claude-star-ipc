@@ -49,7 +49,7 @@ $IpcPy = Join-Path $env:USERPROFILE '.claude\ipc\ipc.py'
 # `pwsh -File` passes "-Roles A,B" as one literal string; normalize.
 $Roles = @($Roles | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $Hub = if ($env:IPC_HUB) { $env:IPC_HUB } else { 'A' }
-$CodexRoles = @('C','E','CODEX')   # keep in sync with ipc_wezterm_launch.ps1 (C = codex since 2026-08-30)
+$CodexRoles = @('C','E','CODEX')   # keep in sync with ipc_wezterm_launch.ps1 (C = codex since 2026-08-30, luna max from 09-19)
 
 # --- 0. this is a WHOLE-FLEET restart; -Roles is the relaunch list, never the teardown scope ---
 # 2026-09-03 11:14: hub A ran `-Roles C` meaning "give C a fresh session"; step 2 killed the

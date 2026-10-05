@@ -21,7 +21,7 @@
 param(
     [switch]$Force,
     [switch]$Detached,
-    [string]$Project   # empty = ask (console) / home dir (headless), per rule 2026-08-11
+    [string]$Project   # empty = ask (console) / error (headless, incl. Claude sessions)
 )
 $ErrorActionPreference = 'Stop'
 
@@ -44,8 +44,9 @@ Get-ChildItem env: | Where-Object { $_.Name -match '^WEZTERM_' } |
 # take the fallback. Ask here, in the process the human is looking at, and hand
 # the answer down via -Project.
 if (-not $Project) {
-    # Default (Enter / headless) = HOME DIR, per the revised launch-dir rule
-    # 2026-08-11 (memory home-dir-launch-default). Pass -Project for real
+    # Interactive default (Enter) = HOME DIR, per the revised launch-dir rule
+    # 2026-08-11 (memory home-dir-launch-default). Headless callers must pass -Project.
+    # Pass -Project for real
     # project work. X still claims its role at home: IPC_ROLE (set below) is a
     # sufficient opt-in (ipc_role.py:92) - the missing ipc.enabled gate only
     # affects bare sessions launched there without IPC_ROLE.

@@ -11,7 +11,7 @@ Role assignment is first-come-first-served in a STAR topology with A at the hub:
 the first session becomes A (master), and each later session takes the next free
 worker slot (B, C, D...). Workers respond to A and stop; they never message each
 other — this star rule is a CONVENTION carried by the injected role prompts +
-CLAUDE.md, NOT enforced by ipc.py (a neutral mailbox). A tiny on-disk registry
+the multi-terminal-ipc skill, NOT enforced by ipc.py (a neutral mailbox). A tiny on-disk registry
 (ipc_roles.json next to this script's parent)
 tracks who owns what, keyed by Claude's session_id. To add more worker slots,
 extend ROLES below.
@@ -114,7 +114,7 @@ def _master_context(hub):
         f"[IPC role: you are master terminal {hub} (master / star hub)] This project uses "
         f"ipc.py(_ipc.db) to collaborate with worker terminals (star topology: "
         f"you are the sole hub; workers don't talk to each other). Protocol details: the "
-        f"project CLAUDE.md's IPC section if present, else the multi-terminal-ipc skill. "
+        f"project AGENTS.md's IPC section if present, else the multi-terminal-ipc skill. "
         f"You are the initiator/decider. Dispatch to one worker: "
         f"`python ipc.py send --from {hub} --to <worker> \"<task>\"`; to several at once: `--to B,C`; "
         f"broadcast to all live workers: `--to ALL`. [2026-08-21, user decision] Park your "
@@ -139,7 +139,7 @@ def _worker_context(role, hub):
         f"[IPC role: you are worker terminal {role} (subordinate / worker)] This project "
         f"uses ipc.py(_ipc.db) to collaborate with master terminal {hub} (star topology: you "
         f"talk only to {hub}, never to other workers). Protocol details: the project "
-        f"CLAUDE.md's IPC section if present, else the multi-terminal-ipc skill. Enter "
+        f"AGENTS.md's IPC section if present, else the multi-terminal-ipc skill. Enter "
         f"standby immediately — WATCHER FIRST, then work: (1) start ONE persistent Monitor "
         f"(the Monitor tool, persistent=true) running `python ipc.py watch --me {role}` as "
         f"your standby watcher, then end this turn. Starting the watcher BEFORE touching any "

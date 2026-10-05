@@ -149,9 +149,9 @@ After `/clear` or context compaction, a worker recovers with `/ipc-recover B`
 (role survives; only the watcher needs rebuilding).
 
 The full protocol — task leases and the reaper, the heartbeat split
-(`.alive`/`.busy`), barrier sizing, recovery — is specified in
-[`CLAUDE.md`](CLAUDE.md), which Claude Code auto-loads so the terminals follow it
-themselves.
+(`.alive`/`.busy`), barrier sizing, recovery — is specified in the operating skill
+[`skills/multi-terminal-ipc/SKILL.md`](skills/multi-terminal-ipc/SKILL.md), which
+`install_user.py` deploys user-level so every terminal loads the same copy.
 
 ## Files
 
@@ -166,8 +166,8 @@ themselves.
 | `ipc_brief_lint.py` / `ipc_pane_probe.py` / `ipc_timing.py` / `stall_watch.py` | hub-side tooling (2026-08-29..31): lint a dispatch brief before it is sent, probe a pane's real liveness (context % / stall flags, not just heartbeat), pair dispatch→reply timing by `in_reply_to`, 15-minute stall watchdog for the hub |
 | `ipc_estimate.py` | per-model duration ledger (2026-09-19): `send()` appends one metadata row per first linked reply/fail to `~/.claude/ipc/timing.jsonl`; `backfill` rescans every mailbox, `stats` prints p50/p80 per model, `estimate --role R --brief f.md` suggests the brief's `预算:` line (n≥5 per tier, else INSUFFICIENT + fallback); the brief lint takes its per-unit rate from the same ledger |
 | `fleet_list_panes.py` / `fleet_get_text.py` / `FLEET-TRIAGE.md` | read-only pane inventory / screen tail per mux socket (hard timeout, `--no-auto-start`), and the symptom→command→verdict triage checklist that uses them |
-| `skills/multi-terminal-ipc/SKILL.md` + `references/` | operating skill; `references/onboarding.md` (enable in a project) and `references/orchestration-and-dispatch.md` (handoff / advisor / committee patterns, dispatch gates) |
-| `CLAUDE.md` | the protocol the terminals follow |
+| `skills/multi-terminal-ipc/SKILL.md` + `references/` | operating skill (single protocol authority); `references/`: `onboarding.md` (enable in a project), `bring-up.md` (role claim, guard, registry), `command-details.md` (flags, JSON outputs, dispatch gates and clocks), `state-and-lifecycle.md` (delivery guarantees, task lifecycle, deployment topologies), `fleet-operations.md` (fleet scripts, launch menu, role bindings), `orchestration-and-dispatch.md` (handoff / advisor / committee patterns, brief standard) |
+| `CLAUDE.md` | repo facts for working on this repo; points to the skill for the protocol |
 | `install_user.py` | **recommended** user-level installer (idempotent) |
 | `migrate_ipc.py`, `install_ipc.py` | legacy: mailbox migration / per-project install |
 | `codex_ipc_worker.ps1`, `examples/ipc-keepalive.cmd` | legacy (decommissioned 2026-08-03): unattended worker daemon — still functional, no longer the reference workflow |

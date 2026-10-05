@@ -9,7 +9,7 @@ it so ipc_dispatch.ps1 (gate) and stall_watch.py (15-min reply clock) never rely
 human reading a percentage.
 
 Status-line formats handled (verified 2026-08-30 on fleet1):
-  codex          : "gpt-5.6-luna max · Context 79% left · ~\\Downloads\\..."
+  codex          : "gpt-6-luna max · Context 79% left · ~\\Downloads\\..."
   kimi / glm     : "[k3[1m]] pdfpeek | Ctx 62% left"
   claude+statusline.js: "ctx 12.3% (25k/200k)"   <- USED %, converted to left
 

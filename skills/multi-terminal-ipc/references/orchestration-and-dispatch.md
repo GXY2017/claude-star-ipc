@@ -82,12 +82,20 @@ rules (guard-safe constraints verbatim; preprocessed inputs ship as files).
    <r> --brief <file>` (per-model p80 from the timing ledger, 2026-09-19), not
    from a guess; if it prints INSUFFICIENT for the model, keep the 15-minute
    default and slice. The budget also decides whether sibling CLEAN summaries
-   wait for this task (SKILL.md, RESULT-line protocol).
+   wait for this task (`references/command-details.md` § Worker: RESULT-line protocol detail).
    Every brief that names a product file also says how to close: "回复文件首行
    `RESULT: <产物绝对路径>`,有问题或只做了一部分则不写 RESULT 行" (2026-09-19
    RESULT-line protocol, SKILL.md caution 6) — the same absolute path the brief
    declared, so `send`'s disk check and `stall_watch`'s artifact ground truth
    agree on one file.
+5. **Every brief carries `完成判据:`** (2026-10-02, book "Build an AI Agent"
+   §7.2 / §9.4.2): one checkable line per sub-task, e.g. "12 份全部追加进
+   <路径>，每份含来源 URL". The worker self-checks against it before replying;
+   A accepts against it on receipt. `ipc_brief_lint.py` check C refuses a brief
+   without it. Do not write the closing protocol or today's date into the brief:
+   `ipc_dispatch.ps1` appends both (RESULT / UNSOLVABLE / REPLAN, knowledge
+   cutoff). On a `[REPLAN]` reply, A fixes the premise and writes a new brief;
+   on `[UNSOLVABLE]`, A reroutes or reports — never re-sends the same brief.
 
 ## Capacity-aware dispatch (hub A, adopted 2026-08-19)
 
@@ -127,3 +135,14 @@ Dispatch policy:
 - **Shape batches so cost is predictable**: preprocessed inputs ship as files,
   briefs are self-contained, and batch sizes come from measured saturation
   (e.g. zsxq: 2 calendar days = 4 posts = one saturated batch), not optimism.
+
+## Worker context and queue length (`SKILL.md` § 注意事项 17)
+
+Moved verbatim from `SKILL.md` on 2026-10-03 (lint-skills size rule); the rule line stays there.
+
+17. **A worker is one context window; a long token-heavy serial queue exhausts it
+    mid-queue** (B died after card 1/6, 2026-06-28 — returned results do not free the
+    worker's context). Dispatch 2–3 items per batch and re-dispatch the remainder;
+    workers write each product to a file and keep a one-line result in context; a
+    dozen mechanical items go to subagents/Workflow, not one serial worker.
+    [[C--Users-<user>-Downloads-AI-----::ipc-worker-queue-context-limit]]

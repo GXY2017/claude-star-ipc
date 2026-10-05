@@ -40,7 +40,7 @@ Topology: STAR with A at the hub is a CONVENTION, not enforced by this script.
 A = master (initiates/decides); B, C, D... = workers (respond, then stop). The
 "workers talk only to A, never to each other" rule that keeps the anti-echo
 invariant linear (not N-squared) is enforced by the role prompts injected at
-SessionStart + the CLAUDE.md protocol — `send` itself is a neutral mailbox and
+SessionStart + the multi-terminal-ipc skill — `send` itself is a neutral mailbox and
 will deliver any sender->recipient pair (intentional: keeps test names and future
 topologies open). Multi-recipient/ALL fan-out lets A dispatch or broadcast from
 the hub; each recipient gets its own row with its own `handled` flag, so a
@@ -104,7 +104,7 @@ def _project_root():
                           or dn.startswith(user_claude + os.sep))
         if not is_user_config and any(
                 os.path.exists(os.path.join(d, m))
-                for m in ("CLAUDE.md", ".claude", ".git")):
+                for m in ("AGENTS.md", "CLAUDE.md", ".claude", ".git")):  # AGENTS.md: 2026-10-04 rule
             return d
         parent = os.path.dirname(d)
         if parent == d:
@@ -332,6 +332,17 @@ def _spawn_busy_beater(me):
     kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
           "stderr": subprocess.DEVNULL, "close_fds": True}
     if os.name == "nt":
+        # Double fork (2026-09-21, #1521): the Monitor host kills its command as a
+        # process TREE by walking ParentProcessId, so a direct child - even
+        # DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB - dies with the watcher
+        # (measured: beater pid 42112 died at TaskStop; a grandchild via this
+        # launcher, pid 20708, kept beating). The launcher exits at once, so the
+        # daemon's parent pid is dead before any tree walk can reach it.
+        launcher = ("import subprocess,sys;subprocess.Popen(sys.argv[1:],"
+                    "creationflags=0x00000208,stdin=subprocess.DEVNULL,"
+                    "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
+                    "close_fds=True)")
+        argv = [sys.executable, "-c", launcher] + argv
         kw["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | NEW_GROUP
     else:
         kw["start_new_session"] = True
@@ -496,7 +507,8 @@ def _conn():
         # 2026-09-19 RESULT-line protocol: a worker's linked reply whose body
         # opens with `RESULT: <absolute path>` lines is verified at send time
         # (path exists, is a file, mtime >= the task's dispatch ts) and stamped
-        # result='CLEAN' / 'UNVERIFIED: <why>' (NULL = no RESULT line). The hub
+        # result='CLEAN' / 'UNVERIFIED: <why>' / 'UNSOLVABLE: <why>' /
+        # 'REPLAN: <why>' (NULL = no status line). The hub
         # watcher holds CLEAN replies (announced=0) instead of signalling
         # `NEW MSG` and flushes them as one-line `DONE #task <- X RESULT: path`
         # summaries — the hub never has to peek the body. announced defaults
@@ -1000,15 +1012,46 @@ def _claim_one(conn, me):
 # <path>" and never signals the body. Everything else (no RESULT line, a missing or
 # stale path) keeps the old NEW MSG signal so the hub reads it in full. Ground truth
 # is the disk, not the worker's prose.
-_RESULT_LINE = re.compile(r"^\s*RESULT\s*[:：]\s*(.+?)\s*$", re.M)
+_RESULT_LINE = re.compile(r"^\s*RESULT\s*[:：]\s*(.+?)\s*$")   # single line, anchored; see _result_paths
+# 2026-10-02 (book "Build an AI Agent" §2.4.2 is_solvable / §7.4 need_replan): a reply
+# may instead OPEN with `UNSOLVABLE: <why>` (cannot be done; no guessing from memory)
+# or `REPLAN: <which premise of the brief is wrong + evidence>` (the brief must be
+# rewritten, not re-sent). Both stay non-CLEAN, so the hub reads the full body; the
+# status is stored in `result` and tagged on the NEW MSG signal.
+_STATUS_LINE = re.compile(r"^\s*(UNSOLVABLE|REPLAN)\s*[:：]\s*(.*?)\s*$", re.I)
 _HOLD_SECS = float(os.environ.get("IPC_HOLD_SECS", "900"))   # max wait for a CLEAN reply = the 15-min slice rule
+
+
+def _result_paths(body):
+    """Paths from the RESULT lines that OPEN the body: leading blank lines are
+    skipped, then consecutive RESULT lines are collected, and the first other
+    line ends the header. A RESULT line buried in prose is prose, not a claim.
+    (2026-09-19 review item 1: the earlier re.M finditer matched anywhere, so a
+    "尚未完成、需要澄清" reply that quoted a valid path was marked CLEAN and the
+    hub only ever saw the one-line DONE summary.)"""
+    out = []
+    for line in (body or "").splitlines():
+        if not line.strip():
+            if out:
+                break
+            continue
+        m = _RESULT_LINE.match(line)
+        if not m:
+            break
+        out.append(m.group(1).strip("`'\" "))
+    return out
 
 
 def _verify_result(conn, body, task_id):
     """Return 'CLEAN', 'UNVERIFIED: <why>' or None (no RESULT line) for a linked
-    reply body. CLEAN iff >=1 RESULT line and every path is absolute, an existing
-    regular file, and modified at/after the parent task's dispatch ts."""
-    paths = [m.group(1).strip("`'\" ") for m in _RESULT_LINE.finditer(body or "")]
+    reply body. CLEAN iff the body OPENS with >=1 RESULT line and every path is
+    absolute, an existing regular file, and modified at/after the parent task's
+    dispatch ts. A body opening with UNSOLVABLE:/REPLAN: returns that status."""
+    first = next((l for l in (body or "").splitlines() if l.strip()), "")
+    ms = _STATUS_LINE.match(first)
+    if ms:
+        return f"{ms.group(1).upper()}: {ms.group(2) or '(no reason given)'}"
+    paths = _result_paths(body)
     if not paths:
         return None
     row = conn.execute("SELECT ts FROM messages WHERE id=?", (task_id,)).fetchone()
@@ -1024,10 +1067,6 @@ def _verify_result(conn, body, task_id):
         if os.path.getmtime(p) < dispatched - 60:   # 60 s clock/rounding slack
             return f"UNVERIFIED: older than task #{task_id}: {p}"
     return "CLEAN"
-
-
-def _result_paths(body):
-    return [m.group(1).strip("`'\" ") for m in _RESULT_LINE.finditer(body or "")]
 
 
 def _open_hub_tasks(conn, hub):
@@ -1100,6 +1139,49 @@ def _role_model(role):
     return _MODEL_TAG_CACHE.get(role.upper(), role)
 
 
+_LAUNCH_CMD_CACHE = {}
+
+
+def _role_variant(role):
+    """Model AND parameters the role was launched with, e.g. 'Codex/gpt-5.6-sol/xhigh',
+    'Claude/claude-opus-5[1m]', 'Kimi/k3[1m]'. Parsed from the launcher's
+    `$LaunchCmd` line (`--model X`, a quoted positional model, and
+    `model_reasoning_effort=Y`); a bare `codex` falls back to ~/.codex/config.toml's
+    `model` / `model_reasoning_effort` read at write time; a bare claude wrapper
+    records 'default'. Best effort by construction: an in-pane /model switch or a
+    usage-limit downgrade is invisible here (2026-09-19 review item 3 — $ModelTag
+    alone lumped every E model and effort under 'Codex')."""
+    tag = _role_model(role)
+    if not _LAUNCH_CMD_CACHE:
+        try:
+            with open(os.path.join(_HERE, "ipc_wezterm_launch.ps1"), encoding="utf-8") as f:
+                text = f.read()
+            block = re.search(r"\$LaunchCmd\s*=\s*@\{(.*?)\n\}", text, re.S)
+            for m in re.finditer(r"^\s*(\w+)\s*=\s*(['\"])(.*?)\2", block.group(1) if block else "", re.M):
+                _LAUNCH_CMD_CACHE[m.group(1).upper()] = m.group(3)
+        except OSError:
+            pass
+        _LAUNCH_CMD_CACHE.setdefault("_", "")   # sentinel: parsed once even if empty
+    cmd = _LAUNCH_CMD_CACHE.get(role.upper(), "")
+    mm = (re.search(r"--model\s+['\"]?([^\s'\"]+)", cmd)
+          or re.match(r"^\S+\s+'([^']+)'", cmd))          # claude-kimi 'k3[1m]' positional
+    me = re.search(r"model_reasoning_effort=['\"]?(\w+)", cmd)
+    model = mm.group(1) if mm else None
+    effort = me.group(1) if me else None
+    if cmd.split()[:1] == ["codex"] and not (model and effort):
+        try:
+            with open(os.path.join(os.path.expanduser("~"), ".codex", "config.toml"),
+                      encoding="utf-8") as f:
+                cfg = f.read()
+            cm = re.search(r'^model\s*=\s*"([^"]+)"', cfg, re.M)
+            ce = re.search(r'^model_reasoning_effort\s*=\s*"([^"]+)"', cfg, re.M)
+            model = model or (cm.group(1) if cm else None)
+            effort = effort or (ce.group(1) if ce else None)
+        except OSError:
+            pass
+    return "/".join([tag, model or "default"] + ([effort] if effort else []))
+
+
 def _log_timing(conn, reply_id, task_id, worker, outcome, result, reply_ts):
     """Append one metadata-only line to the user-level timing ledger when a
     worker's linked reply/fail lands: the durable input for ipc_estimate.py
@@ -1125,6 +1207,7 @@ def _log_timing(conn, reply_id, task_id, worker, outcome, result, reply_ts):
             "ts": reply_ts, "project": (os.path.basename(_HERE) if _LEGACY else
                    os.path.basename(os.path.dirname(_STATE_DIR.rstrip("/\\")))),
             "task": task_id, "role": worker, "model": _role_model(worker),
+            "variant": _role_variant(worker),   # model + params; stats/estimate prefer it
             "dispatch_ts": d_ts,
             "queue_min": round((claimed - d) / 60, 1) if (claimed and d) else None,
             "exec_min": round((r - (claimed or d)) / 60, 1) if (claimed or d) else None,
@@ -1242,7 +1325,7 @@ def _reap_stale(conn, me=None, hub=None):
       attempts < MAX_ATTEMPTS -> requeue: handled=0, lease_until=NULL (re-exposed;
         attempts kept, will ++ on next claim)
       attempts >= MAX_ATTEMPTS -> tombstone='failed' (stop re-running; guards
-        non-idempotent tasks from infinite re-runs — CLAUDE.md concern)
+        non-idempotent tasks from infinite re-runs — multi-terminal-ipc skill concern)
     Runs as a plain UPDATE under the write lock; the atomic claim UPDATE...RETURNING
     is a separate, later statement, so the single-consumer invariant holds (R4).
     R5 (BUG 1 fix): the msg_type='task' filter is mandatory — send() tags EVERY row
@@ -1327,11 +1410,10 @@ def recv(me):
         # to the caller. task_done is False for ordinary replies in a hub's inbox
         # (nothing links to a reply), so only requeued-done tasks are dropped.
         rows = [r for r in rows if not task_done(conn, r[0])]
-    # Handing over a task starts the busy heartbeat. Placed here (the claim path
-    # used by one-shot recv AND by the bash-fallback recv --block) rather than in
-    # watch(), which never returns and therefore never stops beating .alive — the
-    # Monitor path was never exposed to this failure. msg_type is column 4 of the
-    # RETURNING tuple.
+    # Handing over a task starts the busy heartbeat. Same in watch() since
+    # 2026-09-21 (#1521): the Monitor host kills the watcher at its 30-min cap,
+    # so "watch never returns" no longer holds and the Monitor path IS exposed.
+    # msg_type is column 4 of the RETURNING tuple.
     if any(r[4] == "task" for r in rows):
         _spawn_busy_beater(me)
     return sorted(rows, key=lambda r: r[0])  # RETURNING order is unspecified
@@ -1356,7 +1438,7 @@ def recv_block(me, timeout, interval, count=1, keep_heartbeat=False):
     hand (which silently breaks when the count is lost on compaction). On
     timeout it returns the k<N collected so far; A diffs the senders it got
     against the recipients it fanned out to, to find who is absent, then
-    probes/re-dispatches those (see CLAUDE.md). count<=1 keeps the original
+    probes/re-dispatches those (see the multi-terminal-ipc skill). count<=1 keeps the original
     "return on first message" behaviour unchanged.
     """
     deadline = time.monotonic() + timeout
@@ -1698,6 +1780,7 @@ def watch(me, interval, allow_file_stdout=False):
     if not _emit(f"WATCHER #{my_gen} for {me} online ({anchors})"):
         return  # stdout dead before we ever advertised: nothing to clean up
     while True:
+        claimed_task = False
         try:
             with _conn() as conn:
                 cur = _current_gen(conn, me)
@@ -1789,15 +1872,34 @@ def watch(me, interval, allow_file_stdout=False):
                     # Absolute path in the hint: under the user-level install
                     # a bare `python ipc.py` copy-pasted from this signal
                     # fails (ipc.py is not in the project cwd).
+                    tag = ""
+                    if result and result.split(":", 1)[0] in ("UNSOLVABLE", "REPLAN"):
+                        tag = f" [{result.split(':', 1)[0]}]"
                     if not _emit(
-                            f"NEW MSG #{mid} from {sender} ({len(body)} chars) "
+                            f"NEW MSG #{mid} from {sender} ({len(body)} chars){tag} "
                             f'— read full: python "{os.path.abspath(__file__)}" '
                             f"peek --me {me} --tail 3"):
                         raise _StdoutDead(mid)
+                    if mtype == "task":
+                        claimed_task = True
                 # Held CLEAN replies: flush when the fan-out is complete or the
                 # hold timed out (stdout death here just retries next poll —
                 # the hold is durable in the DB).
                 _flush_held(conn, me)
+            if claimed_task:
+                # 2026-09-21 (#1521 root cause): the Monitor host caps a watcher
+                # at 30 min (Claude Code 2.1.278 clamps timeout_ms to 1800000)
+                # and kills it regardless of the task in flight. The worker
+                # cannot re-arm until its turn ends, so a Monitor-path worker
+                # mid-task executes with NO heartbeat: .alive stale, .busy never
+                # written (this path used to skip the beater on the premise that
+                # "watch never returns"). _lease_alive then fails at +24s, the
+                # hub's pending() requeues the row (QUEUED-STALLED attempts=1),
+                # and the re-armed watcher re-claims it (attempts=2, #1488/#1494/
+                # #1499). Fork the same detached beater recv() forks: it is
+                # DETACHED_PROCESS, outlives this watcher, and exits on its own
+                # once the task is done/failed/cancelled or its lease has fallen.
+                _spawn_busy_beater(me)
         except _StdoutDead as e:
             # Leaving the `with _conn()` block via this exception rolled the
             # claim back: the un-signalled message is QUEUED again, attempts
@@ -2096,9 +2198,11 @@ def main():
                             print(f"RESULT {r[0]}  (task #{r[1]}; CLEAN = hub gets a "
                                   f"one-line DONE summary, no body read)")
                         elif r and r[1] is not None:
-                            print(f"RESULT none  (no `RESULT: <absolute path>` line — hub "
-                                  f"will read the full body; add one when the task "
-                                  f"produced a file)")
+                            print(f"RESULT none  (body does not OPEN with a `RESULT: "
+                                  f"<absolute path>` line — hub will read the full body; "
+                                  f"put one on the first line when the task produced a file, "
+                                  f"`UNSOLVABLE: <why>` when it cannot be done, "
+                                  f"`REPLAN: <wrong premise>` when the brief itself is wrong)")
                 else:
                     print(f"DUP #{mid}  {args.sender}->{tgt}  "
                           f"(submit-id {args.submit_id!r} already queued/answered; "
