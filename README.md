@@ -12,8 +12,9 @@ Set-Location claude-star-ipc
 python install_user.py
 ```
 
-Set `$LaunchCmd` in `~/.claude/ipc/ipc_wezterm_launch.ps1` to the CLI commands
-available on your machine for each role you want to launch.
+In `~/.claude/ipc/ipc_wezterm_launch.ps1`, configure `$LaunchCmd` for each role's
+CLI and model, and `$Roles` for the default fleet. Pass `-Roles` at launch to
+choose a different fleet.
 
 ## Use
 
@@ -24,10 +25,10 @@ Set-Location "D:/path/to/project"
 python "$HOME/.claude/ipc/ipc_role.py" enable
 ```
 
-Launch hub A and worker B in that project:
+Launch the whole fleet in that project, using your configured role list:
 
 ```powershell
-pwsh "$HOME/.claude/ipc/ipc_wezterm_launch.ps1" -Project "D:/path/to/project" -Roles A,B
+pwsh "$HOME/.claude/ipc/ipc_wezterm_launch.ps1" -Project "D:/path/to/project" -Roles A,B,C,D,E,F
 ```
 
 The launcher starts each pane and submits its recovery command automatically.
