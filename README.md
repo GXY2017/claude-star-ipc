@@ -82,19 +82,16 @@ layout; `install_ipc.py` is the superseded per-project installer.
 
 ### 1. Launch the terminals
 
-Open one terminal per role from the project root. The `SessionStart` hook
-auto-assigns roles first-come-first-served (first window = A, then B, C…), or pin a
-role explicitly with `IPC_ROLE=B claude`. **Type one line (e.g. "ok") in each worker
-window** — a hook can inject instructions but can't fire the first tool call; after
-that one keystroke the worker parks its watcher and runs autonomously.
+**Fleet startup is automated; no manual input is needed in each worker window.**
+Run the WezTerm launcher from the project root, or pass `-Project <path>`. It
+spawns one pane per role with `IPC_ROLE` preset and each role's own launch command,
+waits for each CLI to be ready, then automatically submits `/ipc-recover <role>`
+(Codex: `$ipc-recover <role>`). This starts each pane's watcher and verifies its
+role claim, including the hub.
 
-With WezTerm, one command does all of this — spawns one pane per role with
-`IPC_ROLE` preset and each role's own launch command. You don't have to run it
-yourself: **an AI terminal can operate WezTerm** — ask any agent session (e.g.
-Claude Code) to run the launcher, and it can then drive the panes over
-`wezterm cli` (inject a wake line into a DOWN worker, read a pane's screen to
-diagnose it, batch-reset the fleet between task cycles), verifying every step
-via screen readback:
+**An AI terminal can operate WezTerm**: ask an agent session to run the launcher.
+It can then use `wezterm cli` to wake a DOWN worker, read a pane's screen to
+diagnose it, and batch-reset the fleet between task cycles:
 
 ```powershell
 pwsh ~/.claude/ipc/ipc_wezterm_launch.ps1 -Roles A,B,C,D,E
@@ -177,8 +174,6 @@ The full protocol — task leases and the reaper, the heartbeat split
 - **Single machine.** Local SQLite file + heartbeat files; not networked.
 - **Workers are serial.** One task at a time per worker; for synchronized parallel
   joins inside one context, use subagents instead.
-- **One manual keystroke per worker window** (harness floor — hooks can't fire a
-  worker's first tool call). The WezTerm scripts automate the keystroke, and another AI can handle WezTerm.
 - Role names must match `[A-Za-z0-9_]+` (they become heartbeat filenames).
 
 ## License
