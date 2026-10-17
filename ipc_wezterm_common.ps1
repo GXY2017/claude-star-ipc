@@ -403,3 +403,62 @@ function Wait-PaneReady([int]$PaneId, [int]$TimeoutSec = 40) {
     }
     return $false
 }
+
+# --- dispatch gate helpers (2026-10-15 efficiency review P1) ---
+# ipc_dispatch.ps1 used to classify `ipc.py status --watch` by substring
+# (ALIVE before BUSY, exit code ignored), so `ALIVE+BUSY` and
+# `ALIVE [SQUATTER...]` both passed as a parked watcher. These helpers read the
+# structured output instead. Pure functions take the parsed object so they can
+# be regression-tested without python or a mailbox (evals/test_ipc_states.py).
+
+function ConvertFrom-IpcJsonLine([string[]]$Lines) {
+    # ipc.py may print warnings before its JSON line (stderr merged by 2>&1);
+    # take the LAST line that parses as a JSON object, else $null.
+    $json = $null
+    foreach ($l in @($Lines)) {
+        $t = "$l".Trim()
+        if ($t.StartsWith('{')) { try { $json = $t | ConvertFrom-Json } catch { } }
+    }
+    return $json
+}
+
+function Resolve-IpcDispatchGate($Verdict) {
+    # Verdict = parsed `status --watch R --json` (or $null when unparseable).
+    # Returns PARKED | BUSY | REPARK. BUSY covers busy-only AND alive+busy
+    # (dispatch never queues a second task on a working role; the core `send`
+    # keeps its own QUEUED-BUSY behaviour for callers that want it). REPARK
+    # covers DOWN and SQUATTER (fresh heartbeat with no registry owner).
+    if ($null -eq $Verdict) { return 'REPARK' }
+    if ($Verdict.busy) { return 'BUSY' }
+    if ($Verdict.parked) { return 'PARKED' }
+    return 'REPARK'
+}
+
+function Get-IpcWatcherVerdict([string]$IpcPy, [string]$Role) {
+    $raw = & python $IpcPy status --watch $Role --json 2>&1
+    $v = ConvertFrom-IpcJsonLine @($raw)
+    if ($null -eq $v) { $v = [pscustomobject]@{ role = $Role; state = 'UNPARSEABLE'; busy = $false; parked = $false; reason = (@($raw) -join ' ') } }
+    return $v
+}
+
+function Get-IpcTaskState([string]$IpcPy, [int]$TaskId) {
+    $raw = & python $IpcPy task --id $TaskId --json 2>&1
+    $v = ConvertFrom-IpcJsonLine @($raw)
+    if ($null -eq $v) { $v = [pscustomobject]@{ id = $TaskId; state = 'UNKNOWN'; terminal = $false; reason = (@($raw) -join ' ') } }
+    return $v
+}
+
+function Resolve-IpcClaimOutcome($TaskState) {
+    # TaskState = parsed `task --id N --json`. Returns CLAIMED (worker has it or
+    # already finished: IN_PROGRESS / IN-PROGRESS-SILENT / DONE), FAILED
+    # (FAILED / CANCELLED: terminal, stop now and say why), or WAIT for every
+    # other state. STALE and NEEDS-REVIEW stay WAIT on purpose: a heartbeat lapse
+    # inside the confirm window is not terminal - the next reap may requeue the
+    # task and a watcher re-claims it - so the loop reports it only at the deadline.
+    if ($null -eq $TaskState) { return 'WAIT' }
+    switch -Regex ("$($TaskState.state)") {
+        '^(IN_PROGRESS|IN-PROGRESS-SILENT|DONE)$' { return 'CLAIMED' }
+        '^(FAILED|CANCELLED)$'                    { return 'FAILED' }
+        default                                   { return 'WAIT' }
+    }
+}

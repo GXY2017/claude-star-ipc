@@ -21,8 +21,8 @@ python ~/.claude/ipc/ipc_role.py take A
 
 之后按 hub 职责协作:
 - **派活**:`send --from A --to B "<任务>"`;多 worker 一次派 `--to B,C`;广播活 worker `--to ALL`。派活默认加 `--require-watcher`(防黑洞)。任务正文含反引号/`$`/引号时**用 `--body-file <文件>`**,别走 shell 参数。
-- **收回复**:起 ONE 常驻 Monitor(`timeout_ms: 1800000`;`persistent` 参数已不存在,Monitor 硬顶 30 分钟,到期通知一到就重挂,细则见 `/ipc-recover` 第 3 步)跑 `watch --me A`——每条回复以 `NEW MSG #id from ...` 小信号到达,收到后 `peek --me A --tail 3` 读全文。**例外(2026-09-19 RESULT 行协议)**:worker 回复首行 `RESULT: <绝对路径>` 且 `send` 核盘通过的,盯哨不发 NEW MSG,而是攒到该轮派单结清后一次打出(只等预算截止落在 15 分钟窗口内的兄弟单;预算 40 分钟的长单和已超时的单不会拖住它) `DONE #N <- 角色 RESULT: 路径 (#id, no peek needed)`——照这一行记 ledger 即可,**不要 peek**;要看正文再 `peek --tail`。收到 NEW MSG 的才是要细读的(提问/部分完成/失败/路径核不过)。2026-08-21 起这个盯哨在引导时就该挂上(fleet 启动脚本对 A 也发 `/ipc-recover A`,其第 4 步即挂哨)——若发现没挂(如本命令在裸终端手动执行),现在补挂。Monitor 不可用时退回后台 Bash `recv --me A --block`(exit 0=有消息,2=空超时重挂),或 `--block --count N` 屏障式收齐 N 条。
-- **查派单完成度**:`pending --hub A [--detail]`(空=全部完成;状态 QUEUED/IN_PROGRESS/STALE/FAILED)。
+- **收回复**:起 ONE 常驻 Monitor(`timeout_ms: 1800000`;`persistent` 参数已不存在,Monitor 硬顶 30 分钟,到期通知一到就重挂,细则见 `/ipc-recover` 第 3 步)跑 `watch --me A`——每条回复以 `NEW MSG #id from ...` 小信号到达,收到后 `peek --me A --id <id>` 读全文(信号里的 id;一批多条就列全部——固定 `--tail 3` 会漏掉前面的)。**例外(2026-09-19 RESULT 行协议)**:worker 回复首行 `RESULT: <绝对路径>` 且 `send` 核盘通过的,盯哨不发 NEW MSG,而是攒到该轮派单结清后一次打出(只等预算截止落在 15 分钟窗口内的兄弟单;预算 40 分钟的长单和已超时的单不会拖住它) `DONE #N <- 角色 RESULT: 路径 (#id, no peek needed)`——照这一行记 ledger 即可,**不要 peek**;要看正文再 `peek --me A --id <id>`(DONE 行里的 #id)。收到 NEW MSG 的才是要细读的(提问/部分完成/失败/路径核不过)。2026-08-21 起这个盯哨在引导时就该挂上(fleet 启动脚本对 A 也发 `/ipc-recover A`,其第 4 步即挂哨)——若发现没挂(如本命令在裸终端手动执行),现在补挂。Monitor 不可用时退回后台 Bash `recv --me A --block`(exit 0=有消息,2=空超时重挂),或 `--block --count N` 屏障式收齐 N 条。
+- **查派单完成度**:`pending --hub A [--detail]`(状态 QUEUED / QUEUED-STALLED / IN_PROGRESS / IN-PROGRESS-SILENT / STALE / NEEDS-REVIEW;失败与取消的单会离开 pending,所以"空"只说明没有在途单,结清与否用 `task --id N` 确认)。
 - **协调类消息**(致谢/FYI/"重挂盯哨")一律 `--type note`——note 免租约免重派、不进 pending,也不要求 worker 回复。
 
 铁律:

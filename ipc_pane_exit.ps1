@@ -1,3 +1,4 @@
+#Requires -Version 7
 # 干净地关掉一个角色的 pane，并收回它的盯哨。
 #
 #   pwsh ~/.claude/ipc/ipc_pane_exit.ps1 -Role F              # 退出 + 释放角色 + 确认 watcher 退休

@@ -185,7 +185,7 @@ try {
     Push-Location $Project
 
     # --- 4. relaunch ---
-    & pwsh "$PSScriptRoot\ipc_wezterm_launch.ps1" -Roles ($Roles -join ',') -Project $Project
+    & $script:PaneShell "$PSScriptRoot\ipc_wezterm_launch.ps1" -Roles ($Roles -join ',') -Project $Project
     if ($LASTEXITCODE -ne 0) { throw "ipc_wezterm_launch.ps1 exited $LASTEXITCODE" }
 
     # --- 5. verify parks: tight probes, one scripted repair per role ---
@@ -221,9 +221,9 @@ try {
                 if ($r -eq $Hub) {
                     # Hub repair: re-run the boot command; the default wake message
                     # carries worker semantics (recv/execute/done) that don't apply.
-                    & pwsh "$PSScriptRoot\ipc_wake_pane.ps1" -Role $r -NoClear -Message "/ipc-recover $r"
+                    & $script:PaneShell "$PSScriptRoot\ipc_wake_pane.ps1" -Role $r -NoClear -Message "/ipc-recover $r"
                 } else {
-                    & pwsh "$PSScriptRoot\ipc_wake_pane.ps1" -Role $r
+                    & $script:PaneShell "$PSScriptRoot\ipc_wake_pane.ps1" -Role $r
                 }
                 $repaired[$r] = $true
             }

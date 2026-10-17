@@ -26,6 +26,13 @@ CLI:
     python ipc.py send --from A --to B "msg" --submit-id fx7    # idempotent: same key never double-queues (safe re-dispatch)
     python ipc.py send --from A --to B "msg" --no-requeue       # fail-closed: stale lease parks as NEEDS-REVIEW, never auto-requeued
     python ipc.py status --watch B           # is B's --block watcher parked? ALIVE/DOWN
+    python ipc.py status --watch B --json    # one JSON object: alive/busy/owner_valid/parked/
+                                             # reason — scripts gate on `parked`, never on
+                                             # substring-matching the text line (2026-10-15)
+    python ipc.py task --id 123 [--json]     # lifecycle state of ONE task by id: QUEUED |
+                                             # IN_PROGRESS | DONE | FAILED | CANCELLED |
+                                             # NEEDS-REVIEW | STALE | UNKNOWN. Read-only (no
+                                             # reap, no archive); exit 1 when UNKNOWN
     python ipc.py peek --me B [--tail 5]     # show recent thread WITHOUT marking read
     python ipc.py recv/peek/pending ... --json  # NDJSON envelopes instead of text lines:
                                              # recv/peek {id,ts,from,type,task,session,body};
@@ -1275,6 +1282,51 @@ def pending(hub):
         return out
 
 
+# Lifecycle states that end a task: nothing further will happen to the row.
+_TERMINAL_STATES = frozenset({"DONE", "FAILED", "CANCELLED"})
+
+
+def task_status(tid):
+    """State of ONE task by id, as a dict (2026-10-15 efficiency review P1).
+    Why a per-task query: ipc_dispatch.ps1 used to confirm a claim by grepping
+    `pending` for `#id .*IN_PROGRESS`, but pending omits done tasks, so a task
+    finished before the first check could never match and was reported as
+    "queued but not yet claimed" (exit 1) — a false alarm on the fastest path.
+    Same derivation as pending (task_state over the row), but READ-ONLY: no
+    _reap_stale, no _auto_archive, so a probe loop never mutates the mailbox.
+    STALE here means "lease dead, not yet reaped"; the next recv/pending/reap
+    turns it into a requeue or FAILED. Returns state UNKNOWN (with reason) for
+    a missing id or a non-task row; `terminal` is True for DONE/FAILED/CANCELLED."""
+    if not os.path.exists(DB_PATH):
+        return {"id": tid, "state": "UNKNOWN", "terminal": False,
+                "reason": f"no mailbox at {DB_PATH}"}
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT id, sender, recipient, ts, handled, lease_until, tombstone, "
+            "attempts, no_requeue, last_seen_ts, msg_type, result, claimed_ts "
+            "FROM messages WHERE id=?", (tid,)).fetchone()
+        if not row:
+            return {"id": tid, "state": "UNKNOWN", "terminal": False,
+                    "reason": "no such message id"}
+        (rid, sender, recipient, ts, handled, lease_until, tombstone, attempts,
+         norq, seen, msg_type, result, claimed_ts) = row
+        if msg_type != "task":
+            return {"id": tid, "state": "UNKNOWN", "terminal": False,
+                    "reason": f"message #{tid} is a {msg_type}, not a task"}
+        st = task_state(conn, rid, recipient, handled, lease_until, tombstone,
+                        norq, ts=ts, last_seen_ts=seen)
+        replies = conn.execute(
+            "SELECT id, sender, msg_type FROM messages WHERE in_reply_to=? "
+            "ORDER BY id", (rid,)).fetchall()
+    return {
+        "id": rid, "state": st, "terminal": st in _TERMINAL_STATES,
+        "from": sender, "to": recipient, "ts": ts, "attempts": attempts,
+        "result": result, "claimed_ts": claimed_ts,
+        "replies": [{"id": i, "from": s, "type": t} for i, s, t in replies],
+        "reason": None,
+    }
+
+
 _ARCHIVE_THRESHOLD = 300   # start trimming once the table exceeds this many rows
 _ARCHIVE_KEEP = 150        # rows always kept (same guard as `archive --keep`)
 
@@ -1878,7 +1930,7 @@ def watch(me, interval, allow_file_stdout=False):
                     if not _emit(
                             f"NEW MSG #{mid} from {sender} ({len(body)} chars){tag} "
                             f'— read full: python "{os.path.abspath(__file__)}" '
-                            f"peek --me {me} --tail 3"):
+                            f"peek --me {me} --id {mid}"):
                         raise _StdoutDead(mid)
                     if mtype == "task":
                         claimed_task = True
@@ -1917,9 +1969,94 @@ def watch(me, interval, allow_file_stdout=False):
         time.sleep(interval)
 
 
-def peek(me, tail):
-    """Show the last `tail` messages involving `me` without marking read."""
+_BATCH_KEEP = 100  # numbered recv --json batches kept per role (oldest pruned)
+_BATCH_RE = re.compile(r"^_recv_(?P<me>[A-Za-z0-9_]+)_batch_(?P<n>\d+)\.jsonl$")
+
+
+def _batch_path(me, n):
+    return os.path.join(_STATE_DIR, f"_recv_{me}_batch_{n:06d}.jsonl")
+
+
+def _batch_numbers(me):
+    """Sorted batch numbers saved for `me` (empty when none)."""
+    out = []
+    try:
+        names = os.listdir(_STATE_DIR)
+    except OSError:
+        return out
+    for name in names:
+        m = _BATCH_RE.match(name)
+        if m and m.group("me") == me:
+            out.append(int(m.group("n")))
+    return sorted(out)
+
+
+def _batch_complete(me, n):
+    """False for a number _reserve_batch took but _write_batch never filled (the
+    receiver died between the two): the file exists and is empty. A complete
+    batch always holds at least one line (an empty recv saves nothing)."""
+    try:
+        return os.path.getsize(_batch_path(me, n)) > 0
+    except OSError:
+        return False
+
+
+def _next_batch(me):
+    nums = _batch_numbers(me)
+    return (nums[-1] + 1) if nums else 1
+
+
+def _reserve_batch(me):
+    """Atomically claim the next batch number for `me`: create the numbered file
+    with O_EXCL and move on when another receiver already took that number
+    (2026-10-16 review: two interleaved receivers both computed 1 and the
+    second overwrote the first). The reserved file stays empty until
+    _write_batch fills it, so a reader sees either nothing or the full batch."""
+    n = _next_batch(me)
+    while True:
+        try:
+            os.close(os.open(_batch_path(me, n), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            return n
+        except FileExistsError:
+            n += 1
+
+
+def _write_batch(me, n, lines):
+    """Complete copy of one `recv --json` batch for `me`: one envelope per line,
+    into the file reserved by _reserve_batch (never another number's file).
+    Called BEFORE the envelopes are printed: the rows are already claimed and
+    the caller's output channel may break or truncate; the file does not, and
+    `peek --batch [N]` / `--batches` read it back. When the save itself fails
+    (OSError) the caller still prints the envelopes with batch=null and names the
+    claimed ids on stderr (BATCH-SAVE-FAILED): then the printed output is the only
+    copy and bodies come from `peek --id`. Files beyond _BATCH_KEEP per role are
+    pruned, oldest first."""
+    path = _batch_path(me, n)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("".join(line + "\n" for line in lines))
+    os.replace(tmp, path)
+    for old in _batch_numbers(me)[:-_BATCH_KEEP]:
+        try:
+            os.remove(_batch_path(me, old))
+        except OSError:
+            pass
+
+
+def peek(me, tail, ids=None):
+    """Show the last `tail` messages involving `me` without marking read.
+    With `ids`, show exactly those rows (still only ones involving `me`) in id
+    order: the per-message signals name an id, and a batch recv can claim more
+    rows than any fixed --tail covers (2026-10-16 Codex review)."""
     with _conn() as conn:
+        if ids:
+            marks = ",".join("?" * len(ids))
+            return conn.execute(
+                "SELECT id, ts, sender, recipient, body, handled, msg_type, "
+                "in_reply_to, session, result FROM messages "
+                f"WHERE (recipient=? OR sender=?) AND id IN ({marks}) ORDER BY id",
+                (me, me, *ids),
+            ).fetchall()
         rows = conn.execute(
             "SELECT id, ts, sender, recipient, body, handled, msg_type, "
             "in_reply_to, session, result FROM messages "
@@ -2015,6 +2152,11 @@ def main():
                         "fan-out (--to B,C,D) so one blocking call collects all N "
                         "replies; the tally lives in the process, not across A's "
                         "context. On timeout returns however many arrived (k<N).")
+    r.add_argument("--no-body", action="store_true",
+                   help="with --json: body is emitted as \"\" and body_chars carries its length, so a "
+                        "receiver that only routes signals never sees message text (bodies can hold "
+                        "lines that look like protocol output, and long bodies push ids past an "
+                        "output cap); read the text afterwards with peek --id (2026-10-16)")
     r.add_argument("--json", action="store_true",
                    help="emit one JSON envelope per message (NDJSON) instead of "
                         "the plain text line: id/ts/from/type/task/session/body. "
@@ -2038,6 +2180,15 @@ def main():
     k = sub.add_parser("peek")
     k.add_argument("--me", required=True)
     k.add_argument("--tail", type=int, default=5)
+    k.add_argument("--batch", nargs="?", const=-1, type=int, default=None, metavar="N",
+                   help="print one complete recv --json batch for --me from the state dir: the latest "
+                        "without N, batch N otherwise (one line per message; --json for the raw "
+                        "envelopes). The recovery path when a receiver's tool output was truncated; "
+                        "every envelope carries its batch number")
+    k.add_argument("--batches", action="store_true",
+                   help="list the saved recv --json batches for --me (number, count, id range)")
+    k.add_argument("--id", type=int, nargs="+", dest="ids",
+                   help="show exactly these message ids (from NEW MSG / DONE signals) instead of --tail")
     k.add_argument("--json", action="store_true",
                    help="emit one JSON envelope per message (NDJSON): "
                         "id/ts/from/to/type/task/session/unread/body")
@@ -2049,6 +2200,20 @@ def main():
     st.add_argument("--watch", required=True,
                     help="terminal whose --block watcher to probe, e.g. B")
     st.add_argument("--max-age", type=float, default=8.0)
+    st.add_argument("--json", action="store_true",
+                    help="emit one JSON object instead of the text line: "
+                         "role/state/alive/busy/squatter/owner_valid/parked/"
+                         "reason/pid/session/busy_pid/claimed. `parked` is "
+                         "the single dispatch gate (alive, not busy, owned). "
+                         "Exit code unchanged.")
+
+    tk = sub.add_parser("task",
+                        help="lifecycle state of one task by id (read-only: "
+                             "no reap, no archive). Exit 1 when UNKNOWN.")
+    tk.add_argument("--id", type=int, required=True, dest="task")
+    tk.add_argument("--json", action="store_true",
+                    help="emit one JSON object: id/state/terminal/from/to/ts/"
+                         "attempts/result/claimed_ts/replies")
 
     pd = sub.add_parser("pending",
                         help="list tasks the hub dispatched that have no reply yet "
@@ -2261,14 +2426,53 @@ def main():
                 # barrier could add exit 4; 3 stays reserved for send REFUSED.)
                 sys.exit(2)
         else:
+            if args.json:
+                # Reserve the number, persist the complete batch, THEN print: the
+                # rows are already claimed, and a broken or capped output channel
+                # must not be the only copy (2026-10-16 review: BrokenPipeError
+                # while printing left no file).
+                # The rows are claimed (handled=1 committed) before any of this
+                # runs, so a save failure (permissions, disk full, locked file)
+                # must never swallow the envelopes: print them regardless and put
+                # the failure plus the claimed ids on stderr (2026-10-17 audit).
+                ids = " ".join(str(mid) for mid, *_ in rows)
+
+                def envelopes(batch_no):
+                    return [
+                        json.dumps({"id": mid, "ts": ts, "from": sender, "type": mtype,
+                                    "task": irt, "session": sess, "result": result,
+                                    "body": "" if args.no_body else body,
+                                    "body_chars": len(body or ""), "batch": batch_no,
+                                    # RESULT paths travel with --no-body too, so a hub reading
+                                    # envelopes can log DONE without a peek (2026-10-17 audit)
+                                    "paths": _result_paths(body) if (mtype == "reply" and result == "CLEAN") else []},
+                                   ensure_ascii=False)
+                        for mid, ts, sender, body, mtype, irt, sess, result in rows]
+
+                def save_failed(stage, e):
+                    # One line, every claimed id spelled out (a range cannot say which
+                    # ids belong to the batch), no batch number to recover from.
+                    print(f"BATCH-SAVE-FAILED {stage}: {type(e).__name__}: {e}; the envelopes "
+                          f"printed below are the only copy (batch=null); bodies via "
+                          f"peek --me {args.me} --id {ids}", file=sys.stderr)
+
+                try:
+                    batch_no = _reserve_batch(args.me)
+                except OSError as e:
+                    batch_no = None
+                    save_failed("reserve", e)
+                batch_lines = envelopes(batch_no)
+                if batch_no is not None:
+                    try:
+                        _write_batch(args.me, batch_no, batch_lines)
+                    except OSError as e:
+                        save_failed(f"write batch {batch_no}", e)
+                        batch_lines = envelopes(None)  # no file carries this number
+                for line in batch_lines:
+                    print(line)
+                rows = []  # printed above; the text loop below has nothing left to do
             for mid, ts, sender, body, mtype, irt, sess, result in rows:
-                if args.json:
-                    print(json.dumps(
-                        {"id": mid, "ts": ts, "from": sender, "type": mtype,
-                         "task": irt, "session": sess, "result": result,
-                         "body": body},
-                        ensure_ascii=False))
-                elif mtype == "reply" and result == "CLEAN":
+                if mtype == "reply" and result == "CLEAN":
                     # RESULT-line protocol on the recv path (bash-fallback /
                     # codex hub): same one-line summary as the watch path, the
                     # body stays available via peek. announced stays at its
@@ -2279,13 +2483,65 @@ def main():
                           f"(#{mid}, body via peek if needed)")
                 else:
                     print(f"#{mid} [{ts}] {sender}: {body}")
+    elif args.cmd == "peek" and (args.batch is not None or args.batches):
+        _require_valid(args.me, "--me")
+        nums = _batch_numbers(args.me)
+        if args.batches:
+            if not nums:
+                print("NONE (no saved batch: recv --json has not run for this role here)")
+            for n in nums:
+                if not _batch_complete(args.me, n):
+                    print(f"batch {n}: reserved, never written (recv --json interrupted)")
+                    continue
+                path = _batch_path(args.me, n)
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        lines = [ln for ln in f if ln.strip()]
+                    first = json.loads(lines[0]) if lines else {}
+                    last = json.loads(lines[-1]) if lines else {}
+                    print(f"batch {n}: {len(lines)} message(s) ids {first.get('id')}..{last.get('id')} "
+                          f"first ts {first.get('ts')}")
+                except (OSError, ValueError) as e:
+                    print(f"batch {n}: unreadable ({type(e).__name__})")
+        else:
+            # Default = the latest COMPLETE batch; a number _reserve_batch took but
+            # _write_batch never filled is reported, never returned as an empty
+            # success (2026-10-17 audit: exit 0 with empty stdout hid the real batch).
+            err = sys.stderr if args.json else sys.stdout
+            complete = [n for n in nums if _batch_complete(args.me, n)]
+            n = args.batch if args.batch >= 0 else (complete[-1] if complete else None)
+            if not nums or n not in nums:
+                print("NONE (no saved batch" + ("" if nums else ": recv --json has not run for this role here")
+                      + (f"; available: {nums[0]}..{nums[-1]}" if nums else "") + ")", file=err)
+                sys.exit(1)
+            if n not in complete:
+                print(f"NONE (batch {n} reserved but never written: recv --json was interrupted"
+                      + (f"; latest complete is {complete[-1]}" if complete else "") + ")", file=err)
+                sys.exit(1)
+            with open(_batch_path(args.me, n), encoding="utf-8") as f:
+                lines = [ln.rstrip("\n") for ln in f if ln.strip()]
+            for line in lines:
+                if args.json:
+                    print(line)
+                    continue
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    print(line)
+                    continue
+                print(f"#{o['id']} [{o['ts']}] {o['from']}: {o['type']} task={o.get('task')} "
+                      f"result={o.get('result')} chars={o.get('body_chars')}")
+            # --json keeps stdout pure NDJSON (an automated recovery parses every
+            # line); the human summary goes to stderr there (2026-10-16 review).
+            print(f"BATCH {n} ({len(lines)} message(s), saved by recv --json; latest complete is {complete[-1]}); "
+                  f"bodies via peek --id", file=err)
     elif args.cmd == "watch":
         _require_valid(args.me, "--me")
         watch(args.me, args.interval,
               allow_file_stdout=args.allow_file_stdout)  # never returns; Monitor owns the lifetime
     elif args.cmd == "peek":
         _require_valid(args.me, "--me")
-        rows = peek(args.me, args.tail)
+        rows = peek(args.me, args.tail, args.ids)
         if not rows:
             if not args.json:
                 print("NONE")
@@ -2391,11 +2647,53 @@ def main():
         if squatter:
             state += " [SQUATTER: no registry owner — require-watcher will " \
                      "refuse; run /ipc-recover in this role's pane]"
-        print(f"{args.watch} watcher: {state}{who}")
+        if args.json:
+            # Structured verdict (2026-10-15 efficiency review P1): the text
+            # line carries compound states (ALIVE+BUSY, ALIVE [SQUATTER...])
+            # that ipc_dispatch.ps1 used to substring-match as plain ALIVE,
+            # so a busy or ownerless worker passed its "is it parked?" gate.
+            # `parked` is the one field scripts gate on; the rest explains why.
+            # Exit code below is identical to the text path.
+            parked = bool(alive and not busy and not squatter)
+            if parked:
+                reason = "parked: heartbeat fresh, no task in flight, registry owner present"
+            elif not alive and busy:
+                reason = "busy: no parked watcher, task in flight (queue only)"
+            elif alive and busy:
+                reason = "busy: watcher alive but a task is in flight (do not dispatch a second one)"
+            elif squatter:
+                reason = "squatter: heartbeat fresh but no registry owner (run /ipc-recover in the pane)"
+            else:
+                reason = "down: no fresh heartbeat and no task in flight (re-park)"
+            bident = _busy_identity(args.watch) if busy else None
+            print(json.dumps({
+                "role": args.watch, "state": state, "alive": bool(alive),
+                "busy": bool(busy), "squatter": bool(squatter),
+                "owner_valid": not squatter, "parked": parked, "reason": reason,
+                "pid": (ident or {}).get("pid"),
+                "session": (ident or {}).get("session") or None,
+                "busy_pid": (bident or {}).get("pid"),
+                "claimed": [tid for tid, _lu in claimed],
+            }, ensure_ascii=False))
+        else:
+            print(f"{args.watch} watcher: {state}{who}")
         # Exit code: as before (alive -> 0) EXCEPT a squatter now exits 1, so
         # scripts gating on it agree with the send gate. Busy-only stays 1,
         # unchanged from the original semantics.
         sys.exit(0 if (alive and not squatter) else 1)
+    elif args.cmd == "task":
+        info = task_status(args.task)
+        if args.json:
+            print(json.dumps(info, ensure_ascii=False))
+        elif info["state"] == "UNKNOWN":
+            print(f"UNKNOWN  #{args.task} ({info['reason']})")
+        else:
+            line = (f"#{info['id']} [{info['ts']}] {info['from']}->{info['to']}  "
+                    f"[{info['state']}]  attempts={info['attempts']}")
+            if info["result"]:
+                line += f"  result={info['result']}"
+            print(line)
+        sys.exit(0 if info["state"] != "UNKNOWN" else 1)
     elif args.cmd == "pending":
         _require_valid(args.hub, "--hub")
         rows = pending(args.hub)

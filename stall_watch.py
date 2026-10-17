@@ -36,7 +36,7 @@ import ipc_pane_probe as probe  # noqa: E402
 IPC = os.path.join(HERE, "ipc.py")
 BAD = ("QUEUED-STALLED", "IN-PROGRESS-SILENT", "NEEDS-REVIEW")
 MILESTONES = (15, 30, 45)
-ACT_FLAGS = ("recv_loop", "permission_prompt", "quota_banner")
+ACT_FLAGS = ("recv_loop", "permission_prompt", "quota_banner", "notice_overlay")
 
 
 def pending_json(cwd, hub):
@@ -165,6 +165,8 @@ def main():
                 action = f"PROBE-FAILED: cannot read pane ({why}) - no verdict; use the artifact ground truth on this line"
             elif p["verdict"].startswith(("DEAD", "QUOTA", "BLOCKED")):
                 action = f"ACT NOW: {p['verdict']}"
+                if p["verdict"] == "BLOCKED-NOTICE":
+                    action += " -> dismiss: wezterm cli --no-auto-start send-text --no-paste --pane-id <pane> $'\\r' (Codex update prompt: Esc), then re-probe"
             elif p and any(f in p["flags"] for f in ACT_FLAGS):
                 action = "ACT NOW: " + ",".join(f for f in p["flags"] if f in ACT_FLAGS)
             elif m >= 45:

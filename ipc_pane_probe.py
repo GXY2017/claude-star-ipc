@@ -186,6 +186,8 @@ def parse(text):
     banners = list(banner_blocks(tail))          # shape gate: only error banners can carry these words
     if PERMISSION.search(joined):
         flags.append("permission_prompt")         # prompts are their own shape (dialog lines), unchanged
+    if NOTICE.search(joined):
+        flags.append("notice_overlay")            # harness notice / update prompt over the TUI; Enter (Codex update prompt: Esc) dismisses it (2026-10-17)
     if any(QUOTA.search(b) for b in banners):
         flags.append("quota_banner")
     if ERROR.search(joined):
@@ -197,6 +199,12 @@ def parse(text):
     return ctx, src, flags, tail_hash, (tail[-1][:120] if tail else "")
 
 
+# Notice overlays seen so far: Claude Code release notices ("We're changing auto mode ..."), the Codex
+# update prompt ("enter continue · esc skip" / "Update now"), "Press Enter to continue". The pane
+# looks alive (spinner, last command) but the model never gets the next tool result until dismissed.
+NOTICE = re.compile(r"We're changing|Press Enter to continue|enter continue|esc skip|Update now \(runs|Skip until next version", re.I)
+
+
 def verdict(ctx, flags):
     if "mouse_junk" in flags:
         return "DEAD-TUI"          # TUI gone, terminal modes unrestored - nothing dispatchable here
@@ -206,6 +214,8 @@ def verdict(ctx, flags):
         return "QUOTA"
     if "permission_prompt" in flags:
         return "BLOCKED-PROMPT"
+    if "notice_overlay" in flags:
+        return "BLOCKED-NOTICE"      # dismiss with Enter (Codex update prompt: Esc), then re-probe
     if ctx is None:
         return "UNKNOWN"
     if ctx <= DEAD_CTX and "recv_loop" in flags:

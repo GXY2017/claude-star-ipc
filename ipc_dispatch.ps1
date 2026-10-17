@@ -1,3 +1,4 @@
+#Requires -Version 7
 # One-shot dispatch to a worker role: re-park its watcher if needed, queue the
 # task idempotently, nudge codex-family workers to actually start, and confirm
 # the claim. Encodes the traps from memory solution-codex-pane-operation:
@@ -77,27 +78,25 @@ if ($DryRun) { Write-Host "DRY RUN: gates passed for $Role - nothing sent"; exit
 $CodexRoles = @('C', 'E', 'CODEX')   # C = codex since 2026-08-30 (luna max from 09-19)
 $isCodex = $CodexRoles -contains $Role
 
-function Get-WatcherState([string]$r) {
-    $o = (& python $ipc status --watch $r 2>&1) -join ' '
-    if ($o -match 'ALIVE') { return 'ALIVE' }
-    if ($o -match 'BUSY')  { return 'BUSY' }
-    return 'DOWN'
-}
-
 # --- 1. ensure the watcher is parked ---
-$state = Get-WatcherState $Role
-if ($state -eq 'BUSY') { throw "$Role is BUSY on another task - not dispatching a second one" }
-if ($state -ne 'ALIVE') {
+# 2026-10-15: gate on the structured verdict (status --json -> Resolve-IpcDispatchGate
+# in ipc_wezterm_common.ps1). The old substring match read `ALIVE+BUSY` and
+# `ALIVE [SQUATTER...]` as a parked watcher (efficiency review P1).
+$verdict = Get-IpcWatcherVerdict $ipc $Role
+$gate = Resolve-IpcDispatchGate $verdict
+Write-Host "[$Role] watcher $($verdict.state) - $($verdict.reason)"
+if ($gate -eq 'BUSY') { throw "$Role is BUSY on another task ($($verdict.state)) - not dispatching a second one" }
+if ($gate -ne 'PARKED') {
     $fleet = Get-FleetForRole $Role   # X lives on fleet2 (2026-08-30 #1262)
-    if (-not (Resolve-WeztermSocket -Fleet $fleet)) { throw "$Role watcher DOWN and no $fleet wezterm socket to re-park it" }
+    if (-not (Resolve-WeztermSocket -Fleet $fleet)) { throw "$Role watcher $($verdict.state) and no $fleet wezterm socket to re-park it" }
     $pane = Get-PaneIdForRole $Role   # override-aware (socket detour, 2026-08-30 #1235)
-    Write-Host "[$Role] watcher DOWN - re-parking via pane $pane"
+    Write-Host "[$Role] watcher $($verdict.state) - re-parking via pane $pane"
     if ($isCodex) { Submit-PaneText $pane "`$ipc-recover $Role" 800 }
     else          { Submit-PaneText $pane 'standby' 800 }
     $deadline = (Get-Date).AddSeconds($ParkTimeoutSec)
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 10
-        if ((Get-WatcherState $Role) -eq 'ALIVE') { break }
+        if ((Resolve-IpcDispatchGate (Get-IpcWatcherVerdict $ipc $Role)) -eq 'PARKED') { break }
     }
     # Not fatal: some workers answer the wake line without actually parking a
     # blocking recv (observed on the GLM/ollama pane - it prints "Standing by."
@@ -147,7 +146,14 @@ if (-not $Nudge) {
     $Nudge = "A 给你派了任务 #$taskId。$pull" + "立刻开始动手执行，不要只回执、不要只做计划；" +
              "本单预算 $MaxMinutes 分钟内交付；每做完一份就追加落盘；每约 10 分钟跑一次 python `"$ipc`" ack --me $Role --task $taskId 续租，全部做完再 send 汇报给 $From（正文用 --body-file，并带 --in-reply-to $taskId 关联）。"
 }
-Start-Sleep -Seconds 15   # give a parked watcher time to deliver first
+# Give a parked watcher time to deliver first, but stop waiting as soon as the
+# task is claimed (2026-10-15: was a flat 15 s sleep). The nudge still goes out
+# even when claimed: codex recv's then idles, so "claimed" is not "started".
+$deadline = (Get-Date).AddSeconds(15)
+while ((Get-Date) -lt $deadline) {
+    if ((Resolve-IpcClaimOutcome (Get-IpcTaskState $ipc $taskId)) -ne 'WAIT') { break }
+    Start-Sleep -Seconds 3
+}
 # The task is already SENT: a nudge failure must be loud but must not read as "task lost".
 # A parked watcher (B/F/X today) delivers without the nudge; a watcher-less role will NOT wake.
 try {
@@ -158,11 +164,18 @@ try {
 }
 
 # --- 4. confirm the claim ---
+# 2026-10-15: query the task by id (`task --id N --json`) instead of grepping
+# `pending` for IN_PROGRESS - pending omits done tasks, so a task finished before
+# the first check used to read as "not yet claimed" (efficiency review P1).
+# DONE counts as claimed; FAILED/CANCELLED/NEEDS-REVIEW/STALE stop with a reason.
 $deadline = (Get-Date).AddSeconds(120)
-while ((Get-Date) -lt $deadline) {
-    Start-Sleep -Seconds 10
-    $p = (& python $ipc pending --hub $From --detail 2>&1) -join "`n"
-    if ($p -match "#$taskId .*IN_PROGRESS") { Write-Host "task #$taskId IN_PROGRESS - claimed by $Role"; exit 0 }
+while ($true) {
+    $ts = Get-IpcTaskState $ipc $taskId
+    $outcome = Resolve-IpcClaimOutcome $ts
+    if ($outcome -eq 'CLAIMED') { Write-Host "task #$taskId $($ts.state) - claimed by $Role"; exit 0 }
+    if ($outcome -eq 'FAILED')  { Write-Host "task #$taskId $($ts.state) - NOT running; check: python `"$ipc`" task --id $taskId"; exit 1 }
+    if ((Get-Date) -ge $deadline) { break }
+    Start-Sleep -Seconds 5
 }
-Write-Host "task #$taskId queued but not yet claimed - check: python `"$ipc`" pending --hub $From --detail"
+Write-Host "task #$taskId $($ts.state) but not yet claimed after 120 s - check: python `"$ipc`" pending --hub $From --detail"
 exit 1
