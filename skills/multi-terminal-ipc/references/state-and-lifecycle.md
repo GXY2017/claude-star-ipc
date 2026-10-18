@@ -37,7 +37,13 @@ IN_PROGRESS); unresolved NEEDS-REVIEW rows are also never auto-archived. Requeue
 **done-dropped at claim** (claimed silently, never redelivered), so a phantom
 requeue can't make a worker redo finished work. The mailbox also self-trims:
 past 300 rows, handled/terminal history is lazily archived inside
-recv/watch/pending (newest 150 always kept).
+recv/watch/pending (newest 150 always kept). Since 2026-10-17 archived rows are
+moved, not deleted: they go to the table `messages_archive` in the same `_ipc.db`
+(same columns plus `archived_ts`, key (id, archived_ts); exactly the copied ids
+are removed, in one transaction; the manual `archive --keep N` does the same),
+and `peek --id` / `task --id` read the newest version back with `[archived]`. Unfinished tasks and
+held CLEAN replies are never moved. The archive is unbounded and keeps bodies: it
+is the durable record for analysis (a manual prune would be a future command).
 
 ## Deployment topologies (where state lives)
 

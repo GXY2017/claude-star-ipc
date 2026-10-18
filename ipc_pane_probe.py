@@ -5,13 +5,15 @@ Why it exists (2026-08-29 postmortem, memory codex-context-zero-recv-loop): the 
 registry / heartbeat said E was live while its pane showed `Context 0% left` and an
 endless `recv --block` loop; A dispatched three tasks into that hole. Heartbeat is the
 wrong lens — the pane status line is the only truthful capacity signal. This probe reads
-it so ipc_dispatch.ps1 (gate) and stall_watch.py (15-min reply clock) never rely on a
+it so ipc_dispatch.ps1 (gate) and the hub reply clock (ipc.py clock_tick) never rely on a
 human reading a percentage.
 
-Status-line formats handled (verified 2026-08-30 on fleet1):
+Status-line formats handled (verified 2026-08-30 on fleet1; 2026-10-18 rows added):
   codex          : "gpt-6-luna max · Context 79% left · ~\\Downloads\\..."
+  codex (10-18)  : "GPT-6-Astra medium · ~ · 5h 92% left · weekly 99% left · Context 15% used"   <- USED %
   kimi / glm     : "[k3[1m]] pdfpeek | Ctx 62% left"
   claude+statusline.js: "ctx 12.3% (25k/200k)"   <- USED %, converted to left
+  claude+statusline.js (10-18): "deepseek-flash · <user> · DeepSeek $0.02 谷 · ctx 8% 83k · cache 100%"   <- USED %
 
 Usage:
   python ~/.claude/ipc/ipc_pane_probe.py E            # one role, human line
@@ -42,7 +44,8 @@ DEAD_CTX = 20      # <= this % left: refuse dispatch
 WARN_CTX = 70      # <  this % left: heavy batches not allowed (capacity policy 2026-08-19)
 
 CTX_LEFT = re.compile(r"\b(?:Context|Ctx)\s+(\d{1,3})%\s+left", re.I)
-CTX_USED = re.compile(r"\bctx\s+(\d{1,3}(?:\.\d+)?)%\s*\(", re.I)
+# used-% forms: "ctx 12.3% (", "ctx 8% 83k", "Context 15% used" (5h/weekly "% left" quota fields never match)
+CTX_USED = re.compile(r"\b(?:ctx|Context)\s+(\d{1,3}(?:\.\d+)?)%\s*(?:\(|used\b|\d+(?:\.\d+)?[kKmM]\b)", re.I)
 RECV_CALL = re.compile(r"ipc\.py\"?\s+recv\s+--me\s+\w+\s+--block")
 RECV_NONE = re.compile(r"NONE \(timeout\)")
 WORKING = re.compile(r"(Working \(|esc to interrupt|Esc to cancel|…\s*\(\d+[ms]|Sketching|Thinking|Brewing|Pondering)", re.I)

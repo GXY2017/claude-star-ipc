@@ -41,7 +41,10 @@ CLI:
                                              # (grok-build headless-envelope + sessionId ideas:
                                              # reply session != task claimant => worker
                                              # /clear-ed, its context is gone, re-brief)
-    python ipc.py archive [--keep 50]        # trim handled rows, keep the last N
+    python ipc.py archive [--keep 50]        # move handled rows to messages_archive, keep the last N
+    python ipc.py grade --task N --verdict rework --reason quality [--used-new brief]
+                                             # hub's hand on the timing ledger: mark a used-but-
+                                             # reworked reply (or undo with --verdict pass); see grade()
 
 Topology: STAR with A at the hub is a CONVENTION, not enforced by this script.
 A = master (initiates/decides); B, C, D... = workers (respond, then stop). The
@@ -58,6 +61,7 @@ SQL values and on-disk heartbeat filenames (_watcher_<name>.alive), so the CLI
 rejects path-separator/traversal characters before any filesystem touch.
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -66,6 +70,7 @@ import sqlite3
 import stat as stat_mod
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -527,6 +532,13 @@ def _conn():
         # --budget) so the hub watcher can tell "may finish soon" from "long".
         ("claimed_ts", "REAL"),
         ("budget_min", "INTEGER"),
+        # 2026-10-17 routing ledger: task_type = the brief's `类型:` value
+        # (whitelist TASK_TYPES, else 未分类; tasks only); new_items = count of
+        # the reply's NEW: items; anchor = `#task<N>.<sender>` on a linked
+        # reply/fail, quotable in later briefs. NULL on older rows.
+        ("task_type", "TEXT"),
+        ("new_items", "INTEGER"),
+        ("anchor", "TEXT"),
     ):
         if col not in have:
             conn.execute(f"ALTER TABLE messages ADD COLUMN {col} {ddl}")
@@ -678,7 +690,7 @@ def task_done(conn, tid):
         return False
     # 2026-09-05: the closing reply/ack must come from the task's own recipient
     # (Codex design review, overall item 3: a reply from another worker that
-    # named this task id used to complete it). Mirrored in _ARCHIVE_DELETE.
+    # named this task id used to complete it). Mirrored in _ARCHIVE_WHERE.
     return conn.execute(
         "SELECT 1 FROM messages r JOIN messages t ON t.id=r.in_reply_to "
         "WHERE r.in_reply_to=? AND r.msg_type IN ('reply','ack') "
@@ -860,7 +872,7 @@ def send(sender, recipient, body, *, in_reply_to=None, msg_type=None, hop=None,
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lease_secs = None if (lease is None or lease <= 0) else int(lease)
     lease_until = None if lease_secs is None else time.time() + lease_secs
-    with _conn() as conn:
+    with _txn() as conn:
         if msg_type is None:
             msg_type = "reply" if (sender != HUB and recipient == HUB) else "task"
         worker_to_hub = (sender != HUB and recipient == HUB
@@ -904,17 +916,24 @@ def send(sender, recipient, body, *, in_reply_to=None, msg_type=None, hop=None,
         result = None
         if worker_to_hub and in_reply_to is not None and msg_type == "reply":
             result = _verify_result(conn, body, in_reply_to)
-        budget_min = None
+        budget_min = task_type = new_items = anchor = None
         if msg_type == "task":
             budget_min = budget if budget is not None else _extract_budget(body)
+            task_type = task_type_of(body)
+        if worker_to_hub and in_reply_to is not None and msg_type in ("reply", "fail"):
+            anchor = _anchor(in_reply_to, sender)
+            if msg_type == "reply":
+                new_items = count_new_items(body)
         cur = conn.execute(
             "INSERT OR IGNORE INTO messages "
             "(ts, sender, recipient, body, in_reply_to, msg_type, status, hop, ttl, "
-            "lease_until, lease_secs, submit_id, no_requeue, session, result, budget_min) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "lease_until, lease_secs, submit_id, no_requeue, session, result, budget_min, "
+            "task_type, new_items, anchor) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (ts, sender, recipient, body, in_reply_to, msg_type, "sent", hop, ttl,
              lease_until, lease_secs, submit_id, 1 if no_requeue else 0,
-             os.environ.get("CLAUDE_SESSION_ID") or None, result, budget_min),
+             os.environ.get("CLAUDE_SESSION_ID") or None, result, budget_min,
+             task_type, new_items, anchor),
         )
         if cur.rowcount == 0 and submit_id is not None:
             dup = _dup_by_submit_id(conn, sender, recipient, submit_id)
@@ -928,7 +947,8 @@ def send(sender, recipient, body, *, in_reply_to=None, msg_type=None, hop=None,
             conn.execute("UPDATE messages SET last_seen_ts=? WHERE id=?",
                          (time.time(), in_reply_to))
         if worker_to_hub and in_reply_to is not None and msg_type in ("reply", "fail"):
-            _log_timing(conn, cur.lastrowid, in_reply_to, sender, msg_type, result, ts)
+            _log_timing(conn, cur.lastrowid, in_reply_to, sender, msg_type, result, ts,
+                        new_items=new_items or 0)
         return cur.lastrowid, True, queued_busy
 
 
@@ -1007,7 +1027,7 @@ def _claim_one(conn, me):
         "WHERE id=("
         "  SELECT id FROM messages WHERE recipient=? AND handled=0 "
         "  ORDER BY id LIMIT 1"
-        ") RETURNING id, ts, sender, body, msg_type, in_reply_to, result",
+        ") RETURNING id, ts, sender, body, msg_type, in_reply_to, result, new_items",
         (_now, _now, _now, me),
     ).fetchone()
 
@@ -1076,6 +1096,117 @@ def _verify_result(conn, body, task_id):
     return "CLEAN"
 
 
+# ---- Routing ledger fields (2026-10-17, memory ipc-record-dedup-plan-20261017) ----
+# Brief field `类型: <type>` (also `类型：`, `type:`, `TYPE:`), one value from the
+# whitelist below; anything else is recorded as 未分类. Single authority for the
+# whitelist: ipc_brief_lint.py (rule T) and ipc_estimate.py import it from here.
+TASK_TYPES = ("取数", "脚本", "写作", "检索", "评审", "代码")
+UNTYPED = "未分类"
+# Both spellings anchored at line start; optional prefix of blanks, list markers,
+# quote marks and heading hashes (`## 类型: 取数`, `- **类型:** 取数`).
+_TYPE_CN = re.compile(r"^[ \t>*\-#]*类型[ \t*]*[:：][ \t*]*`?([^\s`*，,;；。（(]*)", re.M)
+_TYPE_EN = re.compile(r"^[ \t>*\-#]*type[ \t*]*[:：][ \t*]*`?([^\s`*，,;；。（(]*)", re.M | re.I)
+_TYPE_SCAN_LINES = 40     # the field belongs in the brief's head, never in its tail
+
+
+def _unfenced(lines):
+    """`lines` without fenced code blocks (``` / ~~~). A fence still open at the
+    end hides nothing: its opening marker is taken as stray and the lines after
+    it are kept. Shared by parse_task_type and count_new_items."""
+    keep, fence_at = [], None
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith(("```", "~~~")):
+            fence_at = i if fence_at is None else None
+            continue
+        if fence_at is None:
+            keep.append(line)
+    if fence_at is not None:                    # unclosed: do not swallow the rest
+        keep += lines[fence_at + 1:]            # no marker can follow an unclosed fence
+    return keep
+
+
+def parse_task_type(body):
+    """Raw value of the brief's first `类型:` line within its first 40 lines,
+    fenced code blocks removed first (_unfenced), so a YAML `type: object` in an
+    example never reads as the field. The English `type:` spelling counts only
+    when no 类型 line exists. None when absent, "" when present but empty."""
+    text = "\n".join(_unfenced((body or "").splitlines()[:_TYPE_SCAN_LINES]))
+    m = _TYPE_CN.search(text) or _TYPE_EN.search(text)
+    return m.group(1) if m else None
+
+
+def task_type_of(body):
+    """The whitelisted type of a brief, else UNTYPED (a force-sent brief)."""
+    t = parse_task_type(body)
+    return t if t in TASK_TYPES else UNTYPED
+
+
+# Worker reply: optional NEW section, placed by protocol after the RESULT lines but
+# counted wherever it appears in the body (the RESULT header itself cannot hold
+# one: its first non-RESULT line ends it). A line `NEW:` (also `**NEW:**`,
+# `## NEW`) opens the section and each following `- ` / `* ` / `1. ` line is one
+# item until the first other non-blank line; a `NEW: <text>` line is one item by
+# itself. Uppercase NEW only, so prose "new:" never counts. Lenient by design:
+# zero when absent, never an error. Parsed ONCE, in send(); readers use the
+# stored `new_items` column.
+_NEW_HEAD = re.compile(r"^\s*(?:#+\s*)?\**\s*NEW\s*\**\s*[:：]\s*\**\s*(.*?)\s*$")
+_NEW_HEADING = re.compile(r"^\s*#+\s*NEW\s*$")
+_NEW_ITEM = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+\S")
+
+
+def count_new_items(body):
+    """Items of the NEW section(s). The one rule (also in operational-cautions
+    caution 6 and the ipc_dispatch.ps1 footer): items are `- ` bullets under a
+    `NEW:` line; text after `NEW:` on that same line counts as one item only when
+    no bullet follows. Lenient details: `* ` and `1. ` bullets count too; a bullet
+    deeper than the shallowest bullet seen so far in the section, or any indented
+    non-bullet line, continues the current item; the section ends at a
+    non-indented, non-empty, non-bullet line. Fenced code blocks are removed first
+    (_unfenced), so a quoted `NEW:` example in a fence counts nothing."""
+    count, in_sec, base, inline, bullets = 0, False, None, 0, 0
+
+    def close():
+        return inline if not bullets else 0
+
+    for line in _unfenced((body or "").splitlines()):
+        m = _NEW_HEAD.match(line)
+        if m or _NEW_HEADING.match(line):
+            if in_sec:
+                count += close()
+            in_sec, base, bullets = True, None, 0
+            inline = 1 if (m and m.group(1)) else 0
+            continue
+        if not in_sec or not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" \t"))
+        bullet = _NEW_ITEM.match(line) is not None
+        if bullet and (base is None or indent <= base):
+            base = indent if base is None else min(base, indent)
+            bullets += 1
+            count += 1
+        elif indent == 0 and not bullet:
+            count += close()
+            in_sec, inline, bullets = False, 0, 0
+    if in_sec:
+        count += close()
+    return count
+
+
+def _anchor(task_id, sender):
+    """Quotable reference to one worker's reply on one task (`#task12.B`)."""
+    return f"#task{task_id}.{sender}"
+
+
+def _summary_suffix(task_id, sender, n_new, mid, me):
+    """Tail of the hub's one-line DONE summary (watch flush and recv): the reply's
+    anchor, and for a reply carrying NEW items (stored count) the count plus the
+    peek that shows them (a CLEAN reply's body is otherwise never read)."""
+    if task_id is None:
+        return ""
+    new = f" +NEW {n_new}: peek --me {me} --id {mid}" if n_new else ""
+    return f"{new}  anchor {_anchor(task_id, sender)}"
+
+
 def _open_hub_tasks(conn, hub):
     rows = conn.execute(
         "SELECT id FROM messages WHERE sender=? AND msg_type='task' "
@@ -1087,7 +1218,9 @@ _BUDGET_LINE = re.compile(r"(?:预算|时间预算|BUDGET)\s*[:：]\s*(\d+)\s*(?
 _UNITS_LINE = re.compile(r"UNITS\s*[:：]\s*(\d+)", re.I)
 _FEN = re.compile(r"(\d+)\s*份")
 _DEFAULT_BUDGET_MIN = 15          # user rule 2026-08-29: every dispatch <= 15 min
-TIMING_LOG = os.path.join(_HERE, "timing.jsonl")   # user-level (~/.claude/ipc): models are cross-project
+# user-level (~/.claude/ipc): models are cross-project. IPC_TIMING_PATH points a
+# test run at a copy; ipc_estimate.py honours the same variable.
+TIMING_LOG = os.environ.get("IPC_TIMING_PATH") or os.path.join(_HERE, "timing.jsonl")
 
 
 def _extract_budget(body):
@@ -1189,43 +1322,401 @@ def _role_variant(role):
     return "/".join([tag, model or "default"] + ([effort] if effort else []))
 
 
-def _log_timing(conn, reply_id, task_id, worker, outcome, result, reply_ts):
+GRADE_REASONS = ("tool", "context", "quota", "misread", "quality")
+USED_NEW = ("brief", "conclusion", "routing", "rule", "task", "scope-closed", "none")
+_GRADE_FIELDS = ("verdict", "reason", "used_new", "findings")
+# findings (2026-10-18, user: review results are checked in full "这样可以比较哪个模型更准确"):
+# A's per-finding check of a review reply, {"held": h, "false": f, "unchecked": u};
+# ipc_estimate.py accuracy aggregates it per model.
+
+
+def _findings_arg(text):
+    """argparse type for --findings HELD,FALSE,UNCHECKED (three non-negative ints, sum > 0)."""
+    try:
+        h, f, u = (int(x) for x in text.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected HELD,FALSE,UNCHECKED, e.g. 12,2,1")
+    if min(h, f, u) < 0 or h + f + u == 0:
+        raise argparse.ArgumentTypeError("counts must be >= 0 and not all zero")
+    return {"held": h, "false": f, "unchecked": u}
+
+# Ledger keys (2026-10-17; the one statement every reader and writer follows):
+#   * a BASE row is identified by (project, task, dispatch_ts) and at most one is
+#     ever appended per task row (ledger_append_new skips when the key exists).
+#     The dispatch_ts part keeps a re-created mailbox, whose ids restart at 1,
+#     from colliding with an old row of the same project. Consequence: redispatch
+#     is recorded from attempts > 1 only; a reply / rework / second reply cycle on
+#     one task leaves one row and relies on `grade --verdict rework`.
+#   * `grade` looks a task up by (project, task), takes the newest base row and
+#     APPENDS a correction row {"grade": true, project, task, dispatch_ts, + only
+#     the fields given}. The file is append-only: nothing rewrites it, so an
+#     append from another project's send() can never be lost.
+#   * readers fold corrections into their base row (fold_ledger): matched on the
+#     base key, applied in file order, field by field, the latest wins. EVERY
+#     reader must fold: a raw grep / jq / wc over timing.jsonl counts correction
+#     rows (`"grade": true`) as tasks and shows pre-grade verdicts.
+#   * every read-dedupe-append runs under _ledger_lock (sidecar `<ledger>.lock`),
+#     so a hub cancel and a worker reply on the same task cannot both append a
+#     base row. The dedupe scan reads the whole file: O(n) per append, ~1 ms per
+#     1000 rows, acceptable at a few appends per minute. If the lock is not won
+#     within 10 s, rows are appended WITHOUT the dedupe and flagged
+#     `"lock_timeout": true`; fold_ledger keeps the first base row per key, so the
+#     worst case is a flagged, ignored duplicate, never a silent one. A flush whose
+#     append fails (OSError) parks its rows in `<ledger stem>.pending.jsonl`; the
+#     next ledger_append_new drains that file first.
+#     Known cost / TODO: every append reads the whole ledger for the dedupe; once
+#     it passes ~20k rows, read only the tail or keep a key sidecar.
+#   * no ledger I/O while the SQLite write lock is held: rows are built inside a
+#     transaction (_ledger_build defers them) and appended by _ledger_flush only
+#     after the commit (_txn wraps every such `with _conn()`), dropped on rollback.
+#     A row built outside any _txn (a caller bug) is appended at once with a
+#     stderr note rather than lost or left waiting.
+
+
+_LEDGER_LOCK_TIMEOUT = 10.0   # seconds to wait for the ledger lock before the flagged fallback
+
+
+@contextlib.contextmanager
+def _ledger_lock(timeout=None):
+    """Exclusive lock on the sidecar `<ledger>.lock` (msvcrt on Windows, flock
+    elsewhere) around a read-dedupe-append. Yields True when held. After
+    `timeout` seconds it yields False with a stderr warning (the ledger must never
+    block or break a send); ledger_append_new then skips the dedupe and flags its
+    rows `lock_timeout: true` instead of racing unlocked."""
+    fh, locked = None, False
+    try:
+        fh = open(TIMING_LOG + ".lock", "a+b")
+        deadline = time.monotonic() + (_LEDGER_LOCK_TIMEOUT if timeout is None else timeout)
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    sys.stderr.write("[timing] ledger lock timed out; rows appended "
+                                     "flagged lock_timeout, no dedupe\n")
+                    break
+                time.sleep(0.05)
+    except OSError as e:
+        sys.stderr.write(f"[timing] ledger lock unavailable ({e}); rows appended "
+                         f"flagged lock_timeout, no dedupe\n")
+    try:
+        yield locked
+    finally:
+        if fh is not None:
+            try:
+                if locked:
+                    if os.name == "nt":
+                        import msvcrt
+                        fh.seek(0)
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            fh.close()
+
+
+def _ledger_project():
+    """Ledger `project` key: ~/.claude/projects/<project-key>/ipc -> the key."""
+    return (os.path.basename(_HERE) if _LEGACY else
+            os.path.basename(os.path.dirname(_STATE_DIR.rstrip("/\\"))))
+
+
+def _ledger_key(r):
+    return (r.get("project"), r.get("task"), r.get("dispatch_ts"))
+
+
+def _ledger_rows():
+    """Every parseable ledger line, file order (newest last), base rows and grade
+    corrections alike; [] when absent. Read once per operation."""
+    out = []
+    try:
+        with open(TIMING_LOG, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(r, dict):
+                        out.append(r)
+    except OSError:
+        pass
+    return out
+
+
+def fold_ledger(rows):
+    """Base rows with their grade corrections applied (see the key comment above).
+    ipc_estimate.load() and grade() read the ledger through this. Only the FIRST
+    base row per key is kept: a later one can only be a `lock_timeout` duplicate."""
+    base, corr, seen = [], {}, set()
+    for r in rows:
+        if r.get("grade"):
+            corr.setdefault(_ledger_key(r), []).append(r)
+        elif _ledger_key(r) not in seen:
+            seen.add(_ledger_key(r))
+            base.append(r)
+    for b in base:
+        for c in corr.get(_ledger_key(b), ()):
+            b.update({k: c[k] for k in _GRADE_FIELDS if k in c})
+    return base
+
+
+def _auto_verdict(outcome, attempts, result):
+    """Code-set verdict, most decisive first: fail (fail reply, cancel, reaper
+    auto-fail) > redispatch (claimed more than once) > unsolvable / replan (the
+    reply's opening status line, as already parsed into `result` by
+    _verify_result) > pass. Only `rework` needs the hub's hand (grade); a missed
+    grade records an extra pass."""
+    if outcome in ("fail", "cancel"):
+        return "fail"
+    if (attempts or 0) > 1:
+        return "redispatch"
+    status = (result or "").split(":", 1)[0]
+    return status.lower() if status in ("UNSOLVABLE", "REPLAN") else "pass"
+
+
+def _ledger_append(rec):
+    """Raw append of one line. Callers hold _ledger_lock."""
+    with open(TIMING_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def ledger_append_new(recs):
+    """Append the base rows whose key (project, task, dispatch_ts) the ledger does
+    not hold yet: one locked read for the whole batch, then one append. Returns
+    the rows written. send/cancel/reap pass one row; ipc_estimate backfill many.
+    Without the lock (timeout) every row is appended with `lock_timeout: true`
+    and no dedupe: the worst case is a flagged possible duplicate, which
+    fold_ledger drops (first base row per key wins), never a silent one. Rows
+    parked in the spill file by a failed flush are drained first, through the
+    same dedupe, and the spill file is removed once they are written."""
+    spill = _ledger_spill_path()
+    with _ledger_lock() as locked:
+        parked = []
+        if os.path.exists(spill):
+            with open(spill, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        parked.append(json.loads(line))
+                    except ValueError:
+                        pass
+        batch = [r for r in parked if isinstance(r, dict)] + list(recs)
+        if locked:
+            have = {_ledger_key(r) for r in _ledger_rows() if not r.get("grade")}
+            out = []
+            for rec in batch:
+                if _ledger_key(rec) not in have:
+                    have.add(_ledger_key(rec))
+                    out.append(rec)
+        else:
+            out = [dict(rec, lock_timeout=True) for rec in batch]
+        if out:
+            with open(TIMING_LOG, "a", encoding="utf-8") as f:
+                f.write("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in out))
+        if parked:
+            os.remove(spill)
+    return out
+
+
+def _ledger_spill_path():
+    """`<ledger stem>.pending.jsonl` beside the ledger: rows whose append failed."""
+    return os.path.splitext(TIMING_LOG)[0] + ".pending.jsonl"
+
+
+_LEDGER_PENDING = []   # base rows built inside a DB transaction, appended after its commit
+_TXN_DEPTH = [0]       # open _txn blocks in this process; _ledger_build refuses at 0
+
+
+def _ledger_flush():
+    """Append the deferred base rows (ledger_append_new skips any key the ledger
+    already holds: a reply after a cancel or reaper-fail row writes nothing, an
+    existing verdict is never changed). Called by _txn after the commit, never
+    under the SQLite write lock. Never raises."""
+    if not _LEDGER_PENDING:
+        return
+    recs = list(_LEDGER_PENDING)
+    del _LEDGER_PENDING[:]
+    try:
+        ledger_append_new(recs)
+    except OSError as e:
+        # Ledger not writable right now: park the rows; the next successful
+        # ledger_append_new drains them (2026-10-17 review).
+        spill = _ledger_spill_path()
+        try:
+            with _ledger_lock():
+                with open(spill, "a", encoding="utf-8") as f:
+                    f.write("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in recs))
+            sys.stderr.write(f"[timing] ledger append failed ({e}); {len(recs)} row(s) parked "
+                             f"in {spill}, drained by the next append\n")
+        except OSError as e2:
+            sys.stderr.write(f"[timing] not logged: {e}; parking failed too: {e2}\n")
+    except Exception as e:  # noqa: BLE001 — the ledger must never break the caller
+        try:
+            sys.stderr.write(f"[timing] not logged: {e}\n")
+        except (OSError, ValueError):
+            pass
+
+
+@contextlib.contextmanager
+def _txn():
+    """`with _conn() as conn` plus the ledger rule: rows deferred inside the block
+    are appended only after the commit (by the outermost _txn), and dropped when
+    it rolls back."""
+    _TXN_DEPTH[0] += 1
+    try:
+        with _conn() as conn:
+            yield conn
+    except BaseException:
+        del _LEDGER_PENDING[:]
+        raise
+    finally:
+        _TXN_DEPTH[0] -= 1
+    if _TXN_DEPTH[0] == 0:
+        _ledger_flush()
+
+
+def _ledger_build(conn, task_id, worker, outcome, result, end_ts, new_items=0):
+    """Defer the base row for task_id ended at end_ts (reads only; the append
+    happens in _ledger_flush after the caller's commit). Returns the row.
+    Outside a _txn block the row is appended at once through ledger_append_new
+    (never left waiting for an unrelated later command), with a stderr note that
+    the caller should use _txn."""
+    t = conn.execute("SELECT ts, claimed_ts, body, budget_min, attempts, task_type "
+                     "FROM messages WHERE id=?", (task_id,)).fetchone()
+    if not t:
+        return None
+    d_ts, claimed, brief, budget, attempts, task_type = t
+    project = _ledger_project()
+    d = _ts_epoch(d_ts)
+    r = _ts_epoch(end_ts) or time.time()
+    units = _UNITS_LINE.search(brief or "")
+    fen = _FEN.search((brief or "").splitlines()[0] if brief else "")
+    rec = {
+        "ts": end_ts, "project": project,
+        "task": task_id, "role": worker, "model": _role_model(worker),
+        "variant": _role_variant(worker),   # model + params; stats/estimate prefer it
+        "dispatch_ts": d_ts,
+        "queue_min": round((claimed - d) / 60, 1) if (claimed and d) else None,
+        "exec_min": round((r - (claimed or d)) / 60, 1) if (claimed or d) else None,
+        "total_min": round((r - d) / 60, 1) if d else None,
+        "brief_chars": len(brief or ""),
+        "units": int(units.group(1)) if units else (int(fen.group(1)) if fen else None),
+        "budget_min": budget, "attempts": attempts,
+        "outcome": outcome, "result": result, "source": "live",
+        # 2026-10-17 routing fields (ipc_estimate.py rank): type from the brief,
+        # verdict set by code (grade appends rework), NEW count, anchor for briefs.
+        # a task dispatched before the upgrade has no task_type column value:
+        # read the type from its brief
+        "type": task_type or task_type_of(brief),
+        "verdict": _auto_verdict(outcome, attempts, result),
+        "reason": None, "new_items": new_items, "used_new": "none",
+        "anchor": _anchor(task_id, worker),
+    }
+    if _TXN_DEPTH[0] == 0:
+        sys.stderr.write(f"[timing] ledger row for task #{task_id} built outside _txn: "
+                         f"appended now; the caller should use _txn\n")
+        ledger_append_new([rec])
+        return rec
+    _LEDGER_PENDING.append(rec)
+    return rec
+
+
+def grade(task_id, verdict=None, reason=None, used_new=None, findings=None):
+    """The hub's hand on the ledger (2026-10-17): mark the newest row for task_id in
+    THIS project `rework` with a reason (a reply A used but had to redo), undo that
+    with `pass`, and/or record `used_new` (how A used the reply's NEW items), by
+    APPENDING a correction row (see the key comment). rework/pass apply only over
+    pass/rework: fail, redispatch, replan and unsolvable come from code and stand.
+    Only fields that would change are written; when none would, nothing is
+    appended. Returns (folded row, correction row or None for a no-op); raises
+    LookupError (no row) or ValueError (verdict refused, or the ledger lock not
+    won in time: grading never reads and appends on an unlocked snapshot)."""
+    project = _ledger_project()
+    with _ledger_lock() as locked:
+        if not locked:
+            raise ValueError(f"ledger lock not acquired within {_LEDGER_LOCK_TIMEOUT:g} s; "
+                             f"nothing appended, retry the grade")
+        rows = [r for r in fold_ledger(_ledger_rows())
+                if r.get("project") == project and r.get("task") == task_id]
+        if not rows:
+            raise LookupError(f"no ledger row for task #{task_id} in project {project} "
+                              f"({TIMING_LOG}); rows are written when a linked reply/fail "
+                              f"lands, or when a claimed task is cancelled or auto-failed")
+        target = rows[-1]
+        current = target.get("verdict") or "pass"
+        if verdict is not None and current not in ("pass", "rework"):
+            raise ValueError(f"task #{task_id} verdict is {current!r}, set by code "
+                             f"(attempts / outcome / status line); --verdict rework|pass "
+                             f"applies only to a pass or rework row (--used-new still works)")
+        want = {}
+        if verdict is not None:
+            want["verdict"] = verdict
+            want["reason"] = reason if verdict == "rework" else None
+        if used_new is not None:
+            want["used_new"] = used_new
+        if findings is not None:
+            want["findings"] = findings
+        current_vals = {"verdict": current, "reason": target.get("reason"),
+                        "used_new": target.get("used_new") or "none",
+                        "findings": target.get("findings")}
+        changes = {k: v for k, v in want.items() if current_vals[k] != v}
+        if not changes:
+            return target, None
+        corr = {"ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "project": project,
+                "task": task_id, "dispatch_ts": target.get("dispatch_ts"), "grade": True,
+                **changes}
+        _ledger_append(corr)
+    target.update(changes)
+    return target, corr
+
+
+def _log_terminal(conn, task_id, outcome):
+    """Ledger row for a task that ended WITHOUT a linked reply/fail: the hub
+    cancelled it (outcome cancel) or the reaper failed it after MAX_ATTEMPTS
+    (outcome fail); verdict fail, and its minutes never enter a duration sample
+    (ipc_estimate.timed). Only a claimed task gets one: an unclaimed cancel says
+    nothing about the worker. When the task already has a row (it was answered,
+    or failed by its worker) nothing is written: a cancel never overwrites an
+    existing verdict. Never raises."""
+    try:
+        row = conn.execute("SELECT recipient, claimed_ts, attempts, msg_type "
+                           "FROM messages WHERE id=?", (task_id,)).fetchone()
+        if not row or row[3] != "task" or (row[1] is None and not row[2]):
+            return
+        _ledger_build(conn, task_id, row[0], outcome, None,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    except Exception as e:  # noqa: BLE001 — the ledger must never break cancel/reap
+        try:
+            sys.stderr.write(f"[timing] terminal row not logged: {e}\n")
+        except (OSError, ValueError):
+            pass
+
+
+def _log_timing(conn, reply_id, task_id, worker, outcome, result, reply_ts,
+                new_items=0):
     """Append one metadata-only line to the user-level timing ledger when a
     worker's linked reply/fail lands: the durable input for ipc_estimate.py
     (the mailbox self-archives past 300 rows, so it cannot be the history).
-    Only the FIRST linked reply/fail per task is logged. Never raises."""
+    Only the FIRST linked reply/fail per task is logged, and none when the task
+    row already has a ledger row (cancel / reaper fail; checked at flush). The row
+    is deferred and appended after the caller's commit (_txn). Never raises."""
     try:
         prior = conn.execute(
             "SELECT 1 FROM messages WHERE in_reply_to=? AND sender=? "
             "AND msg_type IN ('reply','fail') AND id<?", (task_id, worker, reply_id)).fetchone()
         if prior:
             return
-        t = conn.execute("SELECT ts, claimed_ts, body, budget_min, attempts FROM messages "
-                         "WHERE id=?", (task_id,)).fetchone()
-        if not t:
-            return
-        d_ts, claimed, body, budget, attempts = t
-        d = _ts_epoch(d_ts)
-        r = _ts_epoch(reply_ts) or time.time()
-        units = _UNITS_LINE.search(body or "")
-        fen = _FEN.search((body or "").splitlines()[0] if body else "")
-        rec = {
-            # user-level layout: ~/.claude/projects/<project-key>/ipc -> the key
-            "ts": reply_ts, "project": (os.path.basename(_HERE) if _LEGACY else
-                   os.path.basename(os.path.dirname(_STATE_DIR.rstrip("/\\")))),
-            "task": task_id, "role": worker, "model": _role_model(worker),
-            "variant": _role_variant(worker),   # model + params; stats/estimate prefer it
-            "dispatch_ts": d_ts,
-            "queue_min": round((claimed - d) / 60, 1) if (claimed and d) else None,
-            "exec_min": round((r - (claimed or d)) / 60, 1) if (claimed or d) else None,
-            "total_min": round((r - d) / 60, 1) if d else None,
-            "brief_chars": len(body or ""),
-            "units": int(units.group(1)) if units else (int(fen.group(1)) if fen else None),
-            "budget_min": budget, "attempts": attempts,
-            "outcome": outcome, "result": result, "source": "live",
-        }
-        with open(TIMING_LOG, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        _ledger_build(conn, task_id, worker, outcome, result, reply_ts, new_items=new_items)
     except Exception as e:  # noqa: BLE001 — the ledger must never break a send
         try:
             sys.stderr.write(f"[timing] not logged: {e}\n")
@@ -1241,7 +1732,7 @@ def _flush_held(conn, me, force=False):
     DB, so a watcher restart resumes the hold instead of losing the summary.
     Returns False if stdout died (rows stay held; retried next poll)."""
     held = conn.execute(
-        "SELECT id, ts, sender, body, in_reply_to FROM messages "
+        "SELECT id, ts, sender, body, in_reply_to, new_items FROM messages "
         "WHERE recipient=? AND announced=0 ORDER BY id", (me,)).fetchall()
     if not held:
         return True
@@ -1250,9 +1741,11 @@ def _flush_held(conn, me, force=False):
         deadline = oldest + _HOLD_SECS
         if time.time() < deadline and _hold_needed(conn, me, deadline):
             return True
-    for mid, _ts, sender, body, task in held:
+    for mid, _ts, sender, body, task, n_new in held:
         paths = ", ".join(_result_paths(body)) or "?"
-        if not _emit(f"DONE #{task} <- {sender} RESULT: {paths} (#{mid}, no peek needed)"):
+        tail = _summary_suffix(task, sender, n_new, mid, me)
+        note = "" if n_new else ", no peek needed"
+        if not _emit(f"DONE #{task} <- {sender} RESULT: {paths} (#{mid}{note}){tail}"):
             return False
         conn.execute("UPDATE messages SET announced=1 WHERE id=?", (mid,))
     return True
@@ -1264,7 +1757,7 @@ def pending(hub):
     done exactly) and derives a lifecycle state per row so the hub can read
     QUEUED / IN_PROGRESS / STALE / FAILED at a glance. Lazily reaps first.
     Returns [(id, recipient, ts, state, attempts)]."""
-    with _conn() as conn:
+    with _txn() as conn:
         _reap_stale(conn, hub=hub)
         rows = conn.execute(
             "SELECT t.id, t.recipient, t.ts, t.handled, t.lease_until, t.tombstone, "
@@ -1298,39 +1791,79 @@ def task_status(tid):
     turns it into a requeue or FAILED. Returns state UNKNOWN (with reason) for
     a missing id or a non-task row; `terminal` is True for DONE/FAILED/CANCELLED."""
     if not os.path.exists(DB_PATH):
-        return {"id": tid, "state": "UNKNOWN", "terminal": False,
-                "reason": f"no mailbox at {DB_PATH}"}
+        return _task_info(tid, "UNKNOWN", reason=f"no mailbox at {DB_PATH}")
     with _conn() as conn:
         row = conn.execute(
             "SELECT id, sender, recipient, ts, handled, lease_until, tombstone, "
             "attempts, no_requeue, last_seen_ts, msg_type, result, claimed_ts "
             "FROM messages WHERE id=?", (tid,)).fetchone()
         if not row:
-            return {"id": tid, "state": "UNKNOWN", "terminal": False,
-                    "reason": "no such message id"}
+            arch = _archived_task_status(conn, tid)
+            if arch is not None:
+                return arch
+            return _task_info(tid, "UNKNOWN", reason="no such message id")
         (rid, sender, recipient, ts, handled, lease_until, tombstone, attempts,
          norq, seen, msg_type, result, claimed_ts) = row
         if msg_type != "task":
-            return {"id": tid, "state": "UNKNOWN", "terminal": False,
-                    "reason": f"message #{tid} is a {msg_type}, not a task"}
+            return _task_info(tid, "UNKNOWN", reason=f"message #{tid} is a {msg_type}, not a task",
+                              sender=sender, recipient=recipient, ts=ts)
         st = task_state(conn, rid, recipient, handled, lease_until, tombstone,
                         norq, ts=ts, last_seen_ts=seen)
         replies = conn.execute(
             "SELECT id, sender, msg_type FROM messages WHERE in_reply_to=? "
             "ORDER BY id", (rid,)).fetchall()
+    return _task_info(rid, st, sender=sender, recipient=recipient, ts=ts, attempts=attempts,
+                      result=result, claimed_ts=claimed_ts, replies=replies)
+
+
+def _task_info(tid, state, reason=None, archived=False, sender=None, recipient=None,
+               ts=None, attempts=None, result=None, claimed_ts=None, replies=()):
+    """The one shape every `task --id` answer has (text printer and --json alike):
+    all keys present, null where unknown (2026-10-17 review)."""
     return {
-        "id": rid, "state": st, "terminal": st in _TERMINAL_STATES,
+        "id": tid, "state": state, "terminal": state in _TERMINAL_STATES,
         "from": sender, "to": recipient, "ts": ts, "attempts": attempts,
         "result": result, "claimed_ts": claimed_ts,
         "replies": [{"id": i, "from": s, "type": t} for i, s, t in replies],
-        "reason": None,
+        "reason": reason, "archived": archived,
     }
+
+
+def _archived_task_status(conn, tid):
+    """task_status for an id that left `messages` for `messages_archive`, or None.
+    Only finished work is ever archived (see _ARCHIVE_WHERE), so the state is
+    CANCELLED / FAILED / DONE; replies are read from both tables."""
+    if not _has_archive(conn):
+        return None
+    row = conn.execute(
+        "SELECT id, sender, recipient, ts, tombstone, attempts, msg_type, result, "
+        "claimed_ts FROM messages_archive WHERE id=? ORDER BY archived_ts DESC LIMIT 1",
+        (tid,)).fetchone()   # newest archived version of this id
+    if not row:
+        return None
+    rid, sender, recipient, ts, tombstone, attempts, msg_type, result, claimed_ts = row
+    if msg_type != "task":
+        return _task_info(tid, "UNKNOWN", archived=True,
+                          reason=f"message #{tid} is an archived {msg_type}, not a task",
+                          sender=sender, recipient=recipient, ts=ts)
+    replies = sorted(conn.execute(
+        "SELECT id, sender, msg_type FROM messages WHERE in_reply_to=? UNION "
+        "SELECT id, sender, msg_type FROM messages_archive WHERE in_reply_to=?",
+        (rid, rid)).fetchall())
+    closed = any(t in ("reply", "ack") and s == recipient for _i, s, t in replies)
+    st = {"cancelled": "CANCELLED", "failed": "FAILED"}.get(
+        tombstone, "DONE" if closed else "UNKNOWN")
+    return _task_info(rid, st, archived=True,
+                      reason=None if st != "UNKNOWN" else "archived task without a closing reply",
+                      sender=sender, recipient=recipient, ts=ts, attempts=attempts,
+                      result=result, claimed_ts=claimed_ts, replies=replies)
 
 
 _ARCHIVE_THRESHOLD = 300   # start trimming once the table exceeds this many rows
 _ARCHIVE_KEEP = 150        # rows always kept (same guard as `archive --keep`)
 
-# Shared delete condition for archive()/_auto_archive so the two can't drift.
+# Shared archive condition for archive()/_auto_archive so the two can't drift
+# (2026-10-17: rows matching it are moved to messages_archive, no longer deleted).
 # handled=1 normally means history, but an UNRESOLVED --no-requeue task is
 # handled=1 too (the fail-closed claim stays in place while it awaits review) —
 # active work, never archivable. The NOT EXISTS mirrors task_done()'s
@@ -1343,28 +1876,136 @@ _ARCHIVE_KEEP = 150        # rows always kept (same guard as `archive --keep`)
 # reaper skips a task whose worker heartbeat is fresh and lease valid, then
 # this archive runs on the same path (Codex re-test 2026-09-05: 310 rows
 # during one live task deleted it). Production frequency unmeasured.
-_ARCHIVE_DELETE = (
-    "DELETE FROM messages WHERE (handled=1 OR tombstone IS NOT NULL) AND id<=? "
+_ARCHIVE_WHERE = (
+    "(handled=1 OR tombstone IS NOT NULL) AND id<=? "
     "AND announced=1 "   # 2026-09-19: a held CLEAN reply (announced=0) is unsummarised work, never history
     "AND NOT (tombstone IS NULL AND msg_type='task' "
     "AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.in_reply_to=messages.id "
-    "AND r.msg_type IN ('reply','ack') AND r.sender=messages.recipient))"
+    "AND r.msg_type IN ('reply','ack') AND r.sender=messages.recipient)) "
+    # 2026-10-17 review: a reply/ack stays while its task is QUEUED (requeued
+    # before the late reply landed). The task cannot be archived then, and the
+    # worker's next claim must still see the reply to done-drop it (task_done
+    # reads `messages` only); moving the reply would get the task redone.
+    "AND NOT (msg_type IN ('reply','ack') AND EXISTS (SELECT 1 FROM messages t "
+    "WHERE t.id=messages.in_reply_to AND t.handled=0 AND t.tombstone IS NULL))"
 )
+
+
+def _has_archive(conn):
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='messages_archive'").fetchone() is not None
+
+
+def _ensure_archive(conn):
+    """Create messages_archive lazily (2026-10-17: trimmed rows are moved, not
+    deleted) and add any column `messages` gained since; returns the column list
+    the move copies. Same columns as messages plus archived_ts; primary key
+    (id, archived_ts), so an id archived again (a re-created mailbox restarts
+    ids) is a new version, never a conflict. An archive made by the first
+    2026-10-17 cut (id alone as key) is migrated once, rows kept."""
+    cols = [(r[1], r[2]) for r in conn.execute("PRAGMA table_info(messages)")]
+    info = {r[1]: r[5] for r in conn.execute("PRAGMA table_info(messages_archive)")}
+    if info and not info.get("archived_ts"):          # old key: id alone
+        conn.execute("ALTER TABLE messages_archive RENAME TO messages_archive_v1")
+        info = {}
+    if not info:
+        conn.execute("CREATE TABLE messages_archive (id INTEGER NOT NULL, "
+                     "archived_ts TEXT NOT NULL, PRIMARY KEY (id, archived_ts))")
+    have = {r[1] for r in conn.execute("PRAGMA table_info(messages_archive)")}
+    for name, typ in cols:
+        if name not in have:
+            conn.execute(f"ALTER TABLE messages_archive ADD COLUMN {name} {typ or ''}")
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='messages_archive_v1'").fetchone():
+        old = [r[1] for r in conn.execute("PRAGMA table_info(messages_archive_v1)")]
+        have = {r[1] for r in conn.execute("PRAGMA table_info(messages_archive)")}  # after ADD COLUMN
+        keep = [c for c in old if c in have and c != "archived_ts"]
+        conn.execute(f"INSERT INTO messages_archive ({', '.join(keep)}, archived_ts) "
+                     f"SELECT {', '.join(keep)}, "
+                     f"{'COALESCE(archived_ts, ?)' if 'archived_ts' in old else '?'} "
+                     f"FROM messages_archive_v1",
+                     (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),))
+        conn.execute("DROP TABLE messages_archive_v1")
+    return [name for name, _typ in cols]
+
+
+_ARCHIVE_CHUNK = 500       # ids per statement, well under SQLite's variable limit
+
+
+def _archive_move(conn, cutoff):
+    """Move history rows (id <= cutoff, _ARCHIVE_WHERE) from messages to
+    messages_archive inside the caller's transaction: collect the matching ids,
+    INSERT exactly those rows (one new version each, archived_ts = now), DELETE
+    exactly those ids. No per-row comparison, so the recv/watch/pending write
+    transaction stays short. The archive is unbounded and keeps bodies (it is the
+    durable record for analysis; a manual prune would be a future command).
+    The write lock is taken FIRST (a no-op UPDATE): the id scan, copy and delete
+    then run under it, so another process's commit cannot land in between (in
+    WAL that would make the INSERT fail on a stale snapshot and roll the move
+    back; ids themselves are never reused, AUTOINCREMENT). Returns rows moved."""
+    conn.execute("UPDATE messages SET id=id WHERE 0")   # take RESERVED before reading
+    cols = ", ".join(_ensure_archive(conn))
+    ids = [r[0] for r in conn.execute(
+        f"SELECT id FROM messages WHERE {_ARCHIVE_WHERE}", (cutoff,))]
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    moved = 0
+    for k in range(0, len(ids), _ARCHIVE_CHUNK):
+        chunk = ids[k:k + _ARCHIVE_CHUNK]
+        marks = ",".join("?" * len(chunk))
+        conn.execute(f"INSERT INTO messages_archive ({cols}, archived_ts) "
+                     f"SELECT {cols}, ? FROM messages WHERE id IN ({marks})",
+                     (stamp, *chunk))
+        moved += conn.execute(f"DELETE FROM messages WHERE id IN ({marks})", chunk).rowcount
+    return moved
+
+
+def _archive_guarded(conn, cutoff, fatal=False):
+    """_archive_move inside a SAVEPOINT: any error rolls back only the move. The
+    automatic trim (fatal=False) warns on stderr and returns 0, so a trim problem
+    never fails recv / watch / pending (the pre-2026-10-17 one-statement DELETE
+    never did); the manual `archive` command (fatal=True) re-raises after the
+    rollback so the operator sees a non-zero exit."""
+    try:
+        conn.execute("SAVEPOINT ipc_archive")
+    except sqlite3.Error as e:
+        if fatal:
+            raise
+        sys.stderr.write(f"[archive] skipped: {type(e).__name__}: {e}\n")
+        return 0
+    moved, err = 0, None
+    try:
+        moved = _archive_move(conn, cutoff)
+    except Exception as e:  # noqa: BLE001 — a trim must never break the caller
+        err = e
+        try:
+            conn.execute("ROLLBACK TO ipc_archive")
+        except sqlite3.Error:
+            pass
+        if not fatal:
+            sys.stderr.write(f"[archive] skipped: {type(e).__name__}: {e}\n")
+    try:
+        conn.execute("RELEASE ipc_archive")
+    except sqlite3.Error:
+        pass
+    if fatal and err is not None:
+        raise err
+    return moved
 
 
 def _auto_archive(conn, threshold=_ARCHIVE_THRESHOLD, keep=_ARCHIVE_KEEP):
     """Lazy self-trim, same philosophy as the lazy reaper: piggybacks on
     recv/watch/pending instead of needing a cron. Once the table exceeds
-    `threshold` rows, delete handled/terminal rows older than the newest `keep`
-    (identical condition to archive(): unread requeued rows are active work and
-    are never touched). Done-dropped rows are handled=1, so they age out here."""
+    `threshold` rows, move handled/terminal rows older than the newest `keep`
+    into messages_archive (identical condition to archive(): unread requeued rows
+    are active work and are never touched). Done-dropped rows are handled=1, so
+    they age out here. `peek --id` / `task --id` read the archive back."""
     if conn.execute("SELECT count(*) FROM messages").fetchone()[0] <= threshold:
         return
     row = conn.execute(
         "SELECT id FROM messages ORDER BY id DESC LIMIT 1 OFFSET ?", (keep,)
     ).fetchone()
     if row:
-        conn.execute(_ARCHIVE_DELETE, (row[0],))
+        _archive_guarded(conn, row[0])
 
 
 def _reap_stale(conn, me=None, hub=None):
@@ -1428,6 +2069,7 @@ def _reap_stale(conn, me=None, hub=None):
         else:
             conn.execute("UPDATE messages SET tombstone='failed' WHERE id=?", (rid,))
             failed.append(rid)
+            _log_terminal(conn, rid, "fail")   # verdict fail in the timing ledger
     _auto_archive(conn)
     return requeued, failed, review
 
@@ -1446,7 +2088,7 @@ def recv(me):
     preserved). Rows that already have a reply/ack linked (finished work the
     reaper requeued while the worker executed watcher-less) are claimed but NOT
     returned — redelivering them would redo a completed task."""
-    with _conn() as conn:
+    with _txn() as conn:
         _reap_stale(conn, me=me)
         _now = time.time()
         rows = conn.execute(
@@ -1455,7 +2097,8 @@ def recv(me):
             "lease_until=CASE WHEN lease_secs IS NULL THEN lease_until "
             "ELSE ? + lease_secs END "
             "WHERE recipient=? AND handled=0 "
-            "RETURNING id, ts, sender, body, msg_type, in_reply_to, session, result",
+            "RETURNING id, ts, sender, body, msg_type, in_reply_to, session, result, "
+            "new_items",
             (_now, _now, _now, me),
         ).fetchall()
         # Done-drop: claimed (handled=1, so archive can sweep it) but not handed
@@ -1726,14 +2369,24 @@ def _stdout_is_regular_file():
         return False
 
 
+_emit_lock = threading.Lock()  # the hub's reply-clock thread prints too: keep lines whole
+
+
 def _emit(line):
     """Print one watcher line; False if stdout is dead (EPIPE/EINVAL/closed).
     Never raises: emission failure is a liveness signal, not an error."""
     try:
-        print(line, flush=True)
+        with _emit_lock:
+            print(line, flush=True)
         return True
     except (OSError, ValueError):  # ValueError: I/O operation on closed file
         return False
+
+
+def _gen_still(role, gen):
+    """True while no newer watcher generation exists for `role`."""
+    with _conn() as conn:
+        return _current_gen(conn, role) <= gen
 
 
 def _orphan_exit(me, reason):
@@ -1754,6 +2407,313 @@ def _orphan_exit(me, reason):
             f.write(f"{datetime.now().isoformat()} pid={os.getpid()} {reason}\n")
     except OSError:
         pass
+
+
+# --- hub reply clock (2026-10-18: stall_watch.py folded in; DeepSeek review
+# #task3.D, user "按DS 方案修改"; v2 after the Codex review #task5.E). The hub's
+# watch() starts clock_tick about once a minute on a daemon thread, so A keeps
+# ONE Monitor and a slow wezterm probe (25 s timeout) never stalls the hub's
+# heartbeat or claims; a Codex hub (recv --json supervisor, whose parser must
+# not see clock lines) runs the same tick as `ipc.py clock --block`.
+# Verdicts are stall_watch's, but quiet: only lines the hub must act on are
+# printed (STALLED TASK, ACT NOW, PROBE-FAILED, TWO EXTENSIONS USED,
+# CLOCK-ERROR); a healthy milestone extends silently. The pane is probed once
+# for a baseline and once per due milestone (stall_watch probed every 60 s);
+# activity between two checks = a different tail hash. The newest artifact is
+# printed on the line as ground truth but never counts as activity: any writer
+# (backup, sync, the hub editing a file the brief names) would mask a stall
+# (DeepSeek #task7.D); a tail that went a -> b -> a therefore reads idle, which
+# costs one look, not a missed stall. A milestone whose probe failed prints
+# PROBE-FAILED once and stays due, so a pane that comes back DEAD after
+# unreadable checks is still judged (#task7.D). Per-task state lives in _clock_<hub>.json:
+# stall_watch kept it in memory, so every 30-minute Monitor re-arm repeated
+# CLOCK-START and passed milestones and could call a working pane "idle &
+# unchanged". A tick whose watcher was superseded (generation) neither prints
+# nor saves; a failed print sets _clock_stdout_dead so watch() orphan-exits.
+_CLOCK_EVERY = 60.0
+_CLOCK_MILESTONES = (15, 30, 45)
+_CLOCK_BAD = ("QUEUED-STALLED", "IN-PROGRESS-SILENT", "NEEDS-REVIEW")
+_CLOCK_ACT_FLAGS = ("recv_loop", "permission_prompt", "quota_banner", "notice_overlay")
+_CLOCK_ABS_PATH = re.compile(r"[A-Za-z]:\\[^\s`'\"()（）,，。;；|<>]+")  # same shape as ipc_brief_lint
+_clock_last_error = None
+_clock_stdout_dead = threading.Event()
+
+
+class _ClockAbort(Exception):
+    """Stop this tick without saving: stdout died or the watcher was superseded."""
+
+
+def _clock_path(hub):
+    return os.path.join(_STATE_DIR, f"_clock_{hub}.json")
+
+
+def _clock_load(hub):
+    try:
+        with open(_clock_path(hub), encoding="utf-8") as f:
+            data = json.load(f)
+        tasks = data.get("tasks") if isinstance(data, dict) else None
+        return tasks if isinstance(tasks, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _clock_entry(raw):
+    """One task's clock state, normalized: a malformed entry restarts that
+    task's clock instead of raising for the whole batch."""
+    t = raw if isinstance(raw, dict) else {}
+
+    def milestones(v):
+        return sorted({m for m in v if isinstance(m, int) and m in _CLOCK_MILESTONES}) if isinstance(v, list) else []
+    bad = t.get("bad")
+    out = {"reported": milestones(t.get("reported")),   # milestones with a verdict
+           "pf": milestones(t.get("pf")),               # milestones whose PROBE-FAILED was printed
+           "bad": [b for b in bad if isinstance(b, str)] if isinstance(bad, list) else []}
+    for k in ("hash", "to"):
+        if isinstance(t.get(k), str):
+            out[k] = t[k]
+    return out
+
+
+def _clock_save(hub, tasks):
+    path = _clock_path(hub)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"tasks": tasks}, f)
+    os.replace(tmp, path)
+
+
+def _clock_owner_path(hub):
+    return os.path.join(_STATE_DIR, f"_clock_{hub}.owner")
+
+
+def _clock_mark_owner(hub):
+    """watch()'s main loop marks that it runs the hub clock, once a tick. The
+    main loop, not the tick thread: a tick slowed by unreadable panes must not
+    age the mark (#task9.D N2). Not the heartbeat: recv --block beats it too."""
+    try:
+        with open(_clock_owner_path(hub), "w", encoding="utf-8") as f:
+            f.write(f"{os.getpid()}\n")
+    except OSError:
+        pass
+
+
+def _clock_watch_owns(hub):
+    """True if a hub watch() marked the clock within three ticks. A mark from
+    the future (clock set back) does not count (#task9.D N3)."""
+    try:
+        age = time.time() - os.path.getmtime(_clock_owner_path(hub))
+    except OSError:
+        return False
+    return 0 <= age < 3 * _CLOCK_EVERY
+
+
+def _artifact_best(tid):
+    """(path, mtime, size) of the newest existing file named by absolute path in
+    task #tid's brief, or None. Inputs (reference PDFs) are old, products are
+    fresh, so 'newest wins' picks the product; a directory token contributes its
+    newest direct child. Wezterm-free: readable when panes are not."""
+    try:
+        with _conn() as conn:
+            row = conn.execute("SELECT body FROM messages WHERE id=?", (tid,)).fetchone()
+        body = row[0] if row and row[0] else ""
+    except Exception:  # noqa: BLE001 — ground truth is advisory; never break the clock
+        body = ""
+    best = None
+    for tok in set(_CLOCK_ABS_PATH.findall(body)):
+        p = tok.rstrip("\\.:")
+        if os.path.isfile(p):
+            cands = [p]
+        elif os.path.isdir(p):
+            try:
+                cands = [os.path.join(p, f) for f in os.listdir(p)]
+            except OSError:
+                cands = []
+        else:
+            cands = []
+        for c in cands:
+            try:
+                st = os.stat(c)
+            except OSError:
+                continue
+            if os.path.isfile(c) and (best is None or st.st_mtime > best[1]):
+                best = (c, st.st_mtime, st.st_size)
+    return best
+
+
+def _artifact_text(best, now):
+    if not best:
+        return "no-artifact"
+    age = (now.timestamp() - best[1]) / 60
+    return (f"artifact={os.path.basename(best[0])} "
+            f"mtime={datetime.fromtimestamp(best[1]).strftime('%H:%M:%S')} "
+            f"({age:.0f}m ago) {best[2]}B")
+
+
+def _clock_action(p, m, changed):
+    """Verdict for one due milestone; None = healthy (extend silently).
+    changed=None means "no baseline yet": only verdicts that need no history
+    (probe failure, DEAD/QUOTA/BLOCKED, act flags, 45 min) can fire."""
+    if not p or p.get("error") or p.get("tail_hash") is None:
+        # 2026-08-30 (X, #1175): probe failure is NOT data. Say why the pane is
+        # unreadable and decide nothing.
+        why = (p.get("error") if p else "probe returned nothing") or "no pane text"
+        return f"PROBE-FAILED: cannot read pane ({why}) - no verdict; use the artifact ground truth on this line"
+    if p["verdict"].startswith(("DEAD", "QUOTA", "BLOCKED")):
+        action = f"ACT NOW: {p['verdict']}"
+        if p["verdict"] == "BLOCKED-NOTICE":
+            action += (" -> dismiss: wezterm cli --no-auto-start send-text --no-paste "
+                       "--pane-id <pane> $'\\r' (Codex update prompt: Esc), then re-probe")
+        return action
+    if any(f in p["flags"] for f in _CLOCK_ACT_FLAGS):
+        return "ACT NOW: " + ",".join(f for f in p["flags"] if f in _CLOCK_ACT_FLAGS)
+    if m >= 45:
+        return "TWO EXTENSIONS USED -> reassign (cancel + same --submit-id family)"
+    if changed is False and "working" not in p["flags"]:
+        return "ACT NOW: pane idle & unchanged since the last check (wake / redeliver)"
+    return None
+
+
+def _clock_still_open(rid):
+    """The task is still dispatched and unanswered (a slow probe may outlive it)."""
+    with _conn() as conn:
+        row = conn.execute("SELECT tombstone FROM messages WHERE id=?", (rid,)).fetchone()
+        return bool(row) and row[0] is None and not task_done(conn, rid)
+
+
+def _clock_task(rid, to, ts, st, attempts, t, probe_fn, now, emit):
+    if t.get("to") not in (None, to):
+        t.pop("hash", None)   # redelivered to another role: its pane needs its own baseline
+    if to:
+        t["to"] = to
+    bad_key = f"{st}@{attempts}"   # a requeued task re-entering the same bad state reports again
+    if st in _CLOCK_BAD and bad_key not in t["bad"]:
+        emit(f"STALLED TASK: #{rid} -> {to} {st} attempts={attempts}")
+        t["bad"].append(bad_key)
+    try:
+        age = (now - datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")).total_seconds() / 60
+    except (TypeError, ValueError):
+        return
+    due = [m for m in _CLOCK_MILESTONES if age >= m and m not in t["reported"]]
+    if not due and "hash" in t:
+        return  # between milestones: no probe
+    p = probe_fn(to) if to else None
+    h = p.get("tail_hash") if p else None
+    if "hash" in t:
+        changed = h is not None and h != t["hash"]
+    elif h:
+        changed = None  # baseline now: only history-free verdicts may fire this tick
+    elif not due:
+        return  # baseline probe failed before any milestone: retry next tick
+    else:
+        changed = False  # no baseline and still unreadable at a milestone -> PROBE-FAILED
+    if due:
+        m = max(due)
+        action = _clock_action(p, m, changed)
+        failed = bool(action) and action.startswith("PROBE-FAILED")
+        if action and not (failed and m in t["pf"]) and _clock_still_open(rid):
+            ctx = "?" if not p or p.get("ctx_left") is None else f'{p["ctx_left"]}%'
+            flags = ",".join(p["flags"]) if p and p.get("flags") else ("-" if p else "probe-failed")
+            tail = "?" if changed is None else ("CHANGED" if changed else "SAME")
+            emit(f"REPLY-CLOCK #{rid} -> {to} {m}m (since {ts[11:16]}) | ctx {ctx} "
+                 f"flags={flags} tail={tail} | {action} | {_artifact_text(_artifact_best(rid), now)}")
+        if failed:
+            t["pf"] = sorted(set(t["pf"]) | {m})   # said once; the milestone stays due for a real verdict
+        elif action or changed is not None:
+            # a baseline-only pass with a healthy pane leaves the milestone due: judged next tick
+            t["reported"] = sorted(set(t["reported"]) | set(due))
+    if h:
+        t["hash"] = h
+
+
+def clock_tick(hub, probe_fn=None, now=None, is_current=None):
+    """One pass of the hub reply clock; returns the lines it printed. Never
+    raises (the hub's watch thread calls it). is_current() False (watcher
+    superseded) aborts the tick before any print or save. A failed print sets
+    _clock_stdout_dead. Errors print one CLOCK-ERROR line per distinct message;
+    a task whose own step fails does not stop the others."""
+    global _clock_last_error
+    printed = []
+
+    def emit(line):
+        if is_current is not None and not is_current():
+            raise _ClockAbort("superseded")
+        if not _emit(line):
+            _clock_stdout_dead.set()
+            raise _ClockAbort("stdout dead")
+        printed.append(line)
+
+    errors = []
+    try:
+        if probe_fn is None:
+            import ipc_pane_probe  # noqa: WPS433 — lives next to ipc.py; lazy so workers never load it
+            probe_fn = ipc_pane_probe.probe
+        now = now or datetime.now()
+        tasks = _clock_load(hub)
+        live = {}
+        for rid, to, ts, st, attempts in pending(hub):
+            t = _clock_entry(tasks.get(str(rid)))
+            live[str(rid)] = t
+            try:
+                _clock_task(rid, to, ts, st, attempts, t, probe_fn, now, emit)
+            except _ClockAbort:
+                raise
+            except Exception as e:  # noqa: BLE001 — one task's failure must not blind the rest
+                errors.append(f"#{rid} {type(e).__name__}: {e}")
+        if is_current is not None and not is_current():
+            return printed
+        _clock_save(hub, live)  # finished tasks drop out here
+    except _ClockAbort:
+        return printed
+    except Exception as e:  # noqa: BLE001 — the clock must never take the hub's watch down
+        errors.append(f"{type(e).__name__}: {e}")
+    msg = "; ".join(errors) or None
+    if msg and msg != _clock_last_error:
+        # On stdout: a quiet clock that fails silently would read exactly like
+        # "every task healthy".
+        try:
+            emit(f"CLOCK-ERROR: {msg} - the reply clock is blind there until this clears")
+        except _ClockAbort:
+            return printed
+    _clock_last_error = msg
+    return printed
+
+
+def clock_loop(hub, interval, once=False, block=False, timeout=580):
+    """`ipc.py clock`: the reply clock as its own process, for a hub whose
+    receiver is not watch() (the Codex recv --json supervisor). Claude's watch
+    --me <hub> runs it built in. --block follows recv --block's contract for
+    that supervisor: exit 0 right after a tick that printed, exit 2 with no
+    output at --timeout. Exit 3 = superseded by a newer clock process (one
+    line, do not restart); exit 1 = refused (the hub's watch already runs the
+    clock) or stdout dead. Returns the exit code."""
+    with _conn() as conn:
+        my_gen = _bump_gen(conn, f"clock-{hub}")  # a newer clock process retires this one
+
+    def current():
+        with _conn() as c:
+            return _current_gen(c, f"clock-{hub}") <= my_gen
+
+    if not (once or block) and not _emit(f"CLOCK for {hub} online (quiet: prints only lines the hub must act on)"):
+        return 1
+    deadline = time.time() + timeout
+    while True:
+        if _clock_watch_owns(hub):
+            # Two clocks on one mailbox overwrite each other's state (#task7.D);
+            # checked every tick, so a watch started later takes over (#task9.D N1).
+            _emit(f"CLOCK REFUSED for {hub}: `watch --me {hub}` runs the reply clock built in")
+            return 1
+        lines = clock_tick(hub, is_current=current)
+        if _clock_stdout_dead.is_set():
+            return 1
+        if once or (block and lines):
+            return 0
+        if not current():
+            # not exit 0: a read-at-exit supervisor would wake the model for nothing (#task7.D)
+            _emit(f"CLOCK for {hub} superseded by a newer clock process - not restarting")
+            return 3
+        if block and time.time() >= deadline:
+            return 2
+        time.sleep(interval)
 
 
 def watch(me, interval, allow_file_stdout=False):
@@ -1831,10 +2791,11 @@ def watch(me, interval, allow_file_stdout=False):
     )
     if not _emit(f"WATCHER #{my_gen} for {me} online ({anchors})"):
         return  # stdout dead before we ever advertised: nothing to clean up
+    clock_at, clock_thread = 0.0, None  # hub only: reply clock ticks from this loop (2026-10-18)
     while True:
         claimed_task = False
         try:
-            with _conn() as conn:
+            with _txn() as conn:
                 cur = _current_gen(conn, me)
                 if cur > my_gen:
                     _emit(
@@ -1887,7 +2848,7 @@ def watch(me, interval, allow_file_stdout=False):
                     row = _claim_one(conn, me)  # atomic: each row to exactly one consumer
                     if row is None:
                         break
-                    mid, ts, sender, body, mtype, in_reply_to, result = row
+                    mid, ts, sender, body, mtype, in_reply_to, result, n_new = row
                     if task_done(conn, mid):
                         # Done-drop (same as recv): a requeued-but-already-
                         # answered task is finished work; claim it silently,
@@ -1927,6 +2888,10 @@ def watch(me, interval, allow_file_stdout=False):
                     tag = ""
                     if result and result.split(":", 1)[0] in ("UNSOLVABLE", "REPLAN"):
                         tag = f" [{result.split(':', 1)[0]}]"
+                    if mtype in ("reply", "fail") and in_reply_to is not None:
+                        # 2026-10-17: stored NEW item count + the quotable anchor
+                        tag += ((f" NEW {n_new}" if n_new else "")
+                                + f" anchor {_anchor(in_reply_to, sender)}")
                     if not _emit(
                             f"NEW MSG #{mid} from {sender} ({len(body)} chars){tag} "
                             f'— read full: python "{os.path.abspath(__file__)}" '
@@ -1938,6 +2903,20 @@ def watch(me, interval, allow_file_stdout=False):
                 # hold timed out (stdout death here just retries next poll —
                 # the hold is durable in the DB).
                 _flush_held(conn, me)
+            if _clock_stdout_dead.is_set():
+                raise _StdoutDead("reply-clock line")
+            if me == HUB and time.time() - clock_at >= _CLOCK_EVERY:
+                clock_at = time.time()
+                _clock_mark_owner(HUB)  # from this loop, so a slow tick cannot age it
+                if not (clock_thread and clock_thread.is_alive()):
+                    # A daemon thread, outside the claim transaction (pending()
+                    # opens its own): a probe stuck on its 25 s wezterm timeout
+                    # must not stall this loop's heartbeat and claims (#task5.E).
+                    # The tick checks the generation before printing or saving.
+                    clock_thread = threading.Thread(
+                        target=clock_tick, args=(HUB,), daemon=True,
+                        kwargs={"is_current": lambda: _gen_still(me, my_gen)})
+                    clock_thread.start()
             if claimed_task:
                 # 2026-09-21 (#1521 root cause): the Monitor host caps a watcher
                 # at 30 min (Claude Code 2.1.278 clamps timeout_ms to 1800000)
@@ -1969,7 +2948,7 @@ def watch(me, interval, allow_file_stdout=False):
         time.sleep(interval)
 
 
-_BATCH_KEEP = 100  # numbered recv --json batches kept per role (oldest pruned)
+_BATCH_KEEP = 20  # numbered recv --json batches kept per role (oldest pruned); 100 until 2026-10-17, cut once peek --id read the archive table
 _BATCH_RE = re.compile(r"^_recv_(?P<me>[A-Za-z0-9_]+)_batch_(?P<n>\d+)\.jsonl$")
 
 
@@ -2047,39 +3026,49 @@ def peek(me, tail, ids=None):
     """Show the last `tail` messages involving `me` without marking read.
     With `ids`, show exactly those rows (still only ones involving `me`) in id
     order: the per-message signals name an id, and a batch recv can claim more
-    rows than any fixed --tail covers (2026-10-16 Codex review)."""
+    rows than any fixed --tail covers (2026-10-16 Codex review). Each row ends
+    with an `archived` element: None for a live row; for an id no longer in
+    `messages` (2026-10-17) the row comes from messages_archive and the element is
+    (archived_ts, versions): the newest archived version is shown, and versions
+    > 1 says the archive holds that id more than once (a re-created mailbox)."""
+    cols = ("SELECT id, ts, sender, recipient, body, handled, msg_type, "
+            "in_reply_to, session, result")
     with _conn() as conn:
         if ids:
             marks = ",".join("?" * len(ids))
-            return conn.execute(
-                "SELECT id, ts, sender, recipient, body, handled, msg_type, "
-                "in_reply_to, session, result FROM messages "
-                f"WHERE (recipient=? OR sender=?) AND id IN ({marks}) ORDER BY id",
-                (me, me, *ids),
-            ).fetchall()
+            where = f" WHERE (recipient=? OR sender=?) AND id IN ({marks})"
+            rows = [r + (None,) for r in conn.execute(
+                cols + " FROM messages" + where, (me, me, *ids)).fetchall()]
+            if len(rows) < len(set(ids)) and _has_archive(conn):
+                seen = {r[0] for r in rows}
+                versions = {}
+                for r in conn.execute(cols + ", archived_ts FROM messages_archive" + where
+                                      + " ORDER BY id, archived_ts", (me, me, *ids)):
+                    if r[0] not in seen:
+                        versions.setdefault(r[0], []).append(r)
+                rows += [vs[-1][:-1] + ((vs[-1][-1], len(vs)),) for vs in versions.values()]
+            return sorted(rows, key=lambda r: r[0])
         rows = conn.execute(
-            "SELECT id, ts, sender, recipient, body, handled, msg_type, "
-            "in_reply_to, session, result FROM messages "
-            "WHERE recipient=? OR sender=? ORDER BY id DESC LIMIT ?",
+            cols + " FROM messages WHERE recipient=? OR sender=? ORDER BY id DESC LIMIT ?",
             (me, me, tail),
         ).fetchall()
-    return list(reversed(rows))
+    return [r + (None,) for r in reversed(rows)]
 
 
 def archive(keep):
-    """Delete terminal/handled messages except the most recent `keep` rows.
-    Condition is (handled=1 OR tombstone IS NOT NULL) so failed/cancelled rows are
-    reaped even when handled=1; requeued rows (handled=0, tombstone NULL) are
-    protected — they're active work, not history. R2 line. Unresolved
-    --no-requeue tasks are likewise protected (see _ARCHIVE_DELETE): their claim
-    is handled=1 by design while they await review, but they're active work."""
+    """Move terminal/handled messages except the most recent `keep` rows into
+    messages_archive (2026-10-17; it used to delete them). Condition is
+    (handled=1 OR tombstone IS NOT NULL) so failed/cancelled rows go even when
+    handled=1; requeued rows (handled=0, tombstone NULL) are protected — they're
+    active work, not history. R2 line. Unresolved --no-requeue tasks are likewise
+    protected (see _ARCHIVE_WHERE): their claim is handled=1 by design while they
+    await review, but they're active work. Returns rows moved."""
     with _conn() as conn:
         row = conn.execute(
             "SELECT id FROM messages ORDER BY id DESC LIMIT 1 OFFSET ?", (keep,)
         ).fetchone()
         if row:
-            conn.execute(_ARCHIVE_DELETE, (row[0],))
-            return conn.total_changes
+            return _archive_guarded(conn, row[0], fatal=True)
     return 0
 
 
@@ -2177,6 +3166,22 @@ def main():
                         "--max-age (default 8) or the heartbeat ages out and "
                         "status reports DOWN while watch is running.")
 
+    ck = sub.add_parser(
+        "clock",
+        help="hub reply clock (15/30/45-min checks of open tasks, quiet unless the hub must act). "
+             "Claude's `watch --me <hub>` runs it built in; start this only for a hub whose "
+             "receiver is not watch (the Codex recv --json supervisor)")
+    ck.add_argument("--hub", default=HUB)
+    ck.add_argument("--interval", type=float, default=_CLOCK_EVERY,
+                    help=f"seconds between ticks (default {_CLOCK_EVERY:.0f})")
+    ck.add_argument("--once", action="store_true", help="one tick, then exit")
+    ck.add_argument("--block", action="store_true",
+                    help="for a supervisor that reads output at process exit (Codex): tick every "
+                         "--interval, exit 0 right after a tick that printed, exit 2 with no output "
+                         "at --timeout (recv --block's contract); state persists between runs")
+    ck.add_argument("--timeout", type=int, default=580,
+                    help="max seconds in --block mode (default 580)")
+
     k = sub.add_parser("peek")
     k.add_argument("--me", required=True)
     k.add_argument("--tail", type=int, default=5)
@@ -2193,8 +3198,31 @@ def main():
                    help="emit one JSON envelope per message (NDJSON): "
                         "id/ts/from/to/type/task/session/unread/body")
 
-    a = sub.add_parser("archive")
+    a = sub.add_parser("archive",
+                       help="move handled/terminal rows except the newest --keep into "
+                            "messages_archive (peek --id / task --id still read them)")
     a.add_argument("--keep", type=int, default=50)
+
+    gr = sub.add_parser(
+        "grade",
+        help="hub's correction of the timing ledger row for one task of THIS project "
+             "(run from the project root): --verdict rework --reason R marks a reply "
+             "A used but had to rework; --verdict pass undoes it; --used-new records "
+             "how A used the reply's NEW items. Automatic verdicts (fail, redispatch, "
+             "replan, unsolvable) are set by code and are not overridden. Appends a "
+             "correction row for the newest row of the task; the ledger is never "
+             "rewritten and every reader folds corrections in (latest wins per field).")
+    gr.add_argument("--task", type=int, required=True)
+    gr.add_argument("--verdict", choices=("rework", "pass"), default=None)
+    gr.add_argument("--reason", choices=GRADE_REASONS, default=None,
+                    help="required with --verdict rework, rejected otherwise")
+    gr.add_argument("--used-new", dest="used_new", choices=USED_NEW, default=None,
+                    help="brief/conclusion/routing/rule/task = A's decision state changed "
+                         "because of a NEW item; scope-closed = it closed an item A had "
+                         "listed as open; none = default (a bare 'X is fine' stays none)")
+    gr.add_argument("--findings", type=_findings_arg, default=None, metavar="HELD,FALSE,UNCHECKED",
+                    help="A's check of every finding in a review reply (2026-10-18): how many held, "
+                         "did not hold, were not checked; ipc_estimate.py accuracy compares models")
 
     st = sub.add_parser("status")
     st.add_argument("--watch", required=True,
@@ -2353,12 +3381,16 @@ def main():
                           f"`status --watch {tgt}` first; if {tgt}'s busy beat "
                           f"expired and it never re-parked, nudge its window.)")
                 elif created:
-                    print(f"SENT #{mid}  {args.sender}->{tgt}")
+                    # Print what send() stored (msg_type as it inferred it, the
+                    # parsed type, the RESULT verdict), never a second inference.
+                    with _conn() as conn:
+                        row = conn.execute("SELECT msg_type, task_type, result, in_reply_to, "
+                                           "anchor, new_items FROM messages WHERE id=?",
+                                           (mid,)).fetchone()
+                    print(f"SENT #{mid}  {args.sender}->{tgt}"
+                          + (f"  type={row[1]}" if row and row[0] == "task" else ""))
                     if args.sender != HUB and tgt == HUB:
-                        with _conn() as conn:
-                            r = conn.execute("SELECT result, in_reply_to FROM messages "
-                                             "WHERE id=? AND msg_type='reply'",
-                                             (mid,)).fetchone()
+                        r = row[2:] if row and row[0] == "reply" else None
                         if r and r[0]:
                             print(f"RESULT {r[0]}  (task #{r[1]}; CLEAN = hub gets a "
                                   f"one-line DONE summary, no body read)")
@@ -2368,6 +3400,9 @@ def main():
                                   f"put one on the first line when the task produced a file, "
                                   f"`UNSOLVABLE: <why>` when it cannot be done, "
                                   f"`REPLAN: <wrong premise>` when the brief itself is wrong)")
+                        if row and row[0] in ("reply", "fail") and row[4]:
+                            print(f"ANCHOR {row[4]}  NEW items={row[5] or 0}  (the hub can "
+                                  f"quote the anchor in later briefs)")
                 else:
                     print(f"DUP #{mid}  {args.sender}->{tgt}  "
                           f"(submit-id {args.submit_id!r} already queued/answered; "
@@ -2445,9 +3480,12 @@ def main():
                                     "body_chars": len(body or ""), "batch": batch_no,
                                     # RESULT paths travel with --no-body too, so a hub reading
                                     # envelopes can log DONE without a peek (2026-10-17 audit)
-                                    "paths": _result_paths(body) if (mtype == "reply" and result == "CLEAN") else []},
+                                    "paths": _result_paths(body) if (mtype == "reply" and result == "CLEAN") else [],
+                                    # 2026-10-17: quotable anchor + NEW item count of a linked reply
+                                    "anchor": _anchor(irt, sender) if (irt is not None and mtype in ("reply", "fail")) else None,
+                                    "new_items": n_new or 0},
                                    ensure_ascii=False)
-                        for mid, ts, sender, body, mtype, irt, sess, result in rows]
+                        for mid, ts, sender, body, mtype, irt, sess, result, n_new in rows]
 
                 def save_failed(stage, e):
                     # One line, every claimed id spelled out (a range cannot say which
@@ -2471,7 +3509,7 @@ def main():
                 for line in batch_lines:
                     print(line)
                 rows = []  # printed above; the text loop below has nothing left to do
-            for mid, ts, sender, body, mtype, irt, sess, result in rows:
+            for mid, ts, sender, body, mtype, irt, sess, result, n_new in rows:
                 if mtype == "reply" and result == "CLEAN":
                     # RESULT-line protocol on the recv path (bash-fallback /
                     # codex hub): same one-line summary as the watch path, the
@@ -2479,10 +3517,16 @@ def main():
                     # default 1 (only watch() sets 0), so a later watch never
                     # re-summarises a row recv already handed over.
                     paths = ", ".join(_result_paths(body)) or "?"
-                    print(f"DONE #{irt} <- {sender} RESULT: {paths} "
-                          f"(#{mid}, body via peek if needed)")
+                    note = "" if n_new else ", body via peek if needed"
+                    print(f"DONE #{irt} <- {sender} RESULT: {paths} (#{mid}{note})"
+                          + _summary_suffix(irt, sender, n_new, mid, args.me))
                 else:
-                    print(f"#{mid} [{ts}] {sender}: {body}")
+                    # Linked reply/fail: same NEW count + anchor tags as watch's
+                    # NEW MSG line (the body follows in full, so no peek hint).
+                    tag = ""
+                    if irt is not None and mtype in ("reply", "fail"):
+                        tag = (f" NEW {n_new}" if n_new else "") + f" anchor {_anchor(irt, sender)}"
+                    print(f"#{mid} [{ts}] {sender}{tag}: {body}")
     elif args.cmd == "peek" and (args.batch is not None or args.batches):
         _require_valid(args.me, "--me")
         nums = _batch_numbers(args.me)
@@ -2535,6 +3579,10 @@ def main():
             # line); the human summary goes to stderr there (2026-10-16 review).
             print(f"BATCH {n} ({len(lines)} message(s), saved by recv --json; latest complete is {complete[-1]}); "
                   f"bodies via peek --id", file=err)
+    elif args.cmd == "clock":
+        _require_valid(args.hub, "--hub")
+        sys.exit(clock_loop(args.hub, args.interval, once=args.once,
+                            block=args.block, timeout=args.timeout))
     elif args.cmd == "watch":
         _require_valid(args.me, "--me")
         watch(args.me, args.interval,
@@ -2547,17 +3595,23 @@ def main():
                 print("NONE")
         else:
             for (mid, ts, sender, recipient, body, handled, mtype, in_reply_to,
-                 sess, result) in rows:
+                 sess, result, archived) in rows:
                 if args.json:
                     print(json.dumps(
                         {"id": mid, "ts": ts, "from": sender, "to": recipient,
                          "type": mtype, "task": in_reply_to, "session": sess,
-                         "unread": not handled, "result": result, "body": body},
+                         "unread": not handled, "result": result, "body": body,
+                         "archived": archived is not None,
+                         "archived_ts": archived[0] if archived else None,
+                         "archived_versions": archived[1] if archived else 0},
                         ensure_ascii=False))
                     continue
                 flag = "" if handled else "  (unread)"
                 if result:
                     flag += f"  [RESULT {result}]"
+                if archived:
+                    flag += ("  [archived]" if archived[1] == 1 else
+                             f"  [archived: newest of {archived[1]} versions, {archived[0]}]")
                 # A bodyless done-ack is a lifecycle marker; show what it marks
                 # instead of a blank body. Display-layer only.
                 if mtype == "ack" and not body:
@@ -2565,8 +3619,41 @@ def main():
                     body = f"[done-marker -> task #{tgt}]"
                 print(f"#{mid} [{ts}] {sender}->{recipient}: {body}{flag}")
     elif args.cmd == "archive":
-        n = archive(args.keep)
-        print(f"ARCHIVED {n} rows  (kept last {args.keep})")
+        try:
+            n = archive(args.keep)
+        except Exception as e:  # noqa: BLE001 — manual trim: fail loudly, nothing moved
+            print(f"ARCHIVE FAILED  {type(e).__name__}: {e} (rolled back, nothing moved)",
+                  file=sys.stderr)
+            sys.exit(1)
+        print(f"ARCHIVED {n} rows  (kept last {args.keep}; moved to messages_archive, "
+              f"peek --id / task --id still read them)")
+    elif args.cmd == "grade":
+        if args.verdict is None and args.used_new is None and args.findings is None:
+            print("GRADE  pass --verdict rework|pass, --used-new and/or --findings")
+            sys.exit(2)
+        if args.verdict == "rework" and not args.reason:
+            print(f"GRADE  --verdict rework needs --reason ({'|'.join(GRADE_REASONS)})")
+            sys.exit(2)
+        if args.reason and args.verdict != "rework":
+            print("GRADE  --reason goes only with --verdict rework")
+            sys.exit(2)
+        try:
+            rec, corr = grade(args.task, args.verdict, args.reason, args.used_new, args.findings)
+        except (LookupError, ValueError) as e:
+            print(f"GRADE REFUSED  {e}")
+            sys.exit(2)
+        except OSError as e:
+            print(f"GRADE ERROR  {type(e).__name__}: {e} (no correction appended)")
+            sys.exit(1)
+        if corr is None:
+            print(f"GRADE NO-OP  #{args.task} already verdict={rec.get('verdict')} "
+                  f"reason={rec.get('reason')} used_new={rec.get('used_new')}; nothing appended")
+            sys.exit(0)
+        print(f"GRADED #{args.task}  verdict={rec.get('verdict')} reason={rec.get('reason')} "
+              f"used_new={rec.get('used_new')} findings={rec.get('findings')}  "
+              f"(correction row appended; readers fold it in)")
+        print(json.dumps(corr, ensure_ascii=False))
+        print(json.dumps(rec, ensure_ascii=False))
     elif args.cmd == "status":
         _require_valid(args.watch, "--watch")
         alive = watcher_alive(args.watch, args.max_age)
@@ -2692,6 +3779,8 @@ def main():
                     f"[{info['state']}]  attempts={info['attempts']}")
             if info["result"]:
                 line += f"  result={info['result']}"
+            if info.get("archived"):
+                line += "  [archived]"
             print(line)
         sys.exit(0 if info["state"] != "UNKNOWN" else 1)
     elif args.cmd == "pending":
@@ -2788,12 +3877,12 @@ def main():
         # fail reply explains the failure but does NOT count as answering
         # (task_done excludes msg_type='fail') — R3 line.
         send(args.me, HUB, args.reason or "", in_reply_to=args.task, msg_type="fail")
-        print(f"FAILED  task #{args.task} tombstone=failed")
+        print(f"FAILED  task #{args.task} tombstone=failed  ANCHOR {_anchor(args.task, args.me)}")
     elif args.cmd == "cancel":
         if args.by != HUB:
             print(f"FORBIDDEN  only the hub ({HUB}) may cancel; --by was {args.by}")
             sys.exit(2)
-        with _conn() as conn:
+        with _txn() as conn:
             row = conn.execute("SELECT sender, tombstone FROM messages WHERE id=?",
                                (args.task,)).fetchone()
             if not row:
@@ -2808,6 +3897,7 @@ def main():
             conn.execute(
                 "UPDATE messages SET tombstone='cancelled', handled=1, lease_until=NULL "
                 "WHERE id=?", (args.task,))
+            _log_terminal(conn, args.task, "cancel")   # ledger verdict fail (claimed tasks only)
         print(f"CANCELLED  task #{args.task}")
     elif args.cmd == "redeliver":
         with _conn() as conn:
@@ -2852,14 +3942,14 @@ def main():
             sys.exit(2)
         if args.me:
             _require_valid(args.me, "--me")
-            with _conn() as conn:
+            with _txn() as conn:
                 rq, fl, rv = _reap_stale(conn, me=args.me)
         elif args.hub:
             _require_valid(args.hub, "--hub")
-            with _conn() as conn:
+            with _txn() as conn:
                 rq, fl, rv = _reap_stale(conn, hub=args.hub)
         else:
-            with _conn() as conn:
+            with _txn() as conn:
                 rq, fl, rv = _reap_stale(conn)
         if not rq and not fl and not rv:
             print("REAP  nothing stale")

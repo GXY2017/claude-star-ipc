@@ -52,11 +52,14 @@ WEZTERM_SCRIPTS = ("ipc_wezterm_common.ps1", "ipc_wezterm_launch.ps1",
                    "ipc_wake_pane.ps1", "ipc_pane_exit.ps1",
                    "mux-fleet1.lua", "mux-fleet2.lua")
 # Hub-side tooling (2026-08-29..31 postmortems): brief lint before dispatch, pane
-# liveness probe (context % / stall flags), dispatch->reply timing, 15-min stall
-# watchdog, read-only pane listing/tail, and the fleet triage checklist they implement.
+# liveness probe (context % / stall flags), dispatch->reply timing, pre-dispatch
+# quota snapshot, read-only pane listing/tail, and the fleet triage checklist they
+# implement. The 15-min reply clock is built into `ipc.py watch --me A` (2026-10-18;
+# stall_watch.py removed).
 TOOL_SCRIPTS = ("ipc_brief_lint.py", "ipc_pane_probe.py", "ipc_timing.py",
                 "ipc_estimate.py",   # 2026-09-19: per-model duration ledger + budget estimates
-                "stall_watch.py", "fleet_list_panes.py", "fleet_get_text.py",
+                "ipc_quota.py",      # 2026-10-17: per-vendor quota verdicts before dispatch
+                "fleet_list_panes.py", "fleet_get_text.py",
                 "FLEET-TRIAGE.md")
 
 # (event, command, idempotency marker substring)

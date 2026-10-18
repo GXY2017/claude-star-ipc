@@ -15,6 +15,9 @@ hub-manage-not-operate-15min-slices, fleet-worker-capacity):
   C  a `完成判据:` line or section is required: what the worker checks before replying and
      what A checks on receipt (2026-10-02, book "Build an AI Agent" §7.2 plan items carry
      completion criteria; §9.4.2 delegation input is validated before it is sent)
+  T  a `类型: <type>` line (also `类型：`, `type:`) with one whitelisted value is required
+     (2026-10-17 routing ledger: ipc_estimate.py rank/estimate work per role x type);
+     whitelist = ipc.TASK_TYPES. A force-sent brief is recorded as 未分类.
 
 Usage:  python ~/.claude/ipc/ipc_brief_lint.py <brief.md> --role E [--max-min 15] [--rate E=3.0]
 Exit 0 = pass (warnings allowed), 2 = FAIL (dispatch must stop unless -Force).
@@ -25,6 +28,13 @@ import re
 import sys
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from ipc import TASK_TYPES, parse_task_type  # noqa: E402  (single authority for the 类型 whitelist)
+except Exception as _e:  # noqa: BLE001 — a broken ipc.py must fail the dispatch gate loudly
+    print(f"ipc import failed: {type(_e).__name__}: {_e}")
+    print("ERROR kind=env next=python ~/.claude/ipc/ipc.py --help to see the import error")
+    sys.exit(1)
 
 # Measured minutes per unit (2026-08-29 mailbox timing, X's recount): E ~3.0 min/report
 # for distillation; F ~0.6 min/card for review. Unknown role -> no estimate.
@@ -109,6 +119,16 @@ def main():
     if not CRITERIA.search(text):
         fails.append("C 缺 `完成判据:`（每个子任务一行可核验的完成条件，worker 交付前自查、A 收货时照此验收）")
 
+    # T task type (routing ledger: rank/estimate per role x type)
+    ttype = parse_task_type(text)
+    allowed = " ".join(TASK_TYPES)
+    if ttype is None:
+        fails.append(f"T 缺 `类型:` 行，只能填一个：{allowed}（强制发送时账本记 未分类）")
+    elif ttype == "":
+        fails.append(f"T `类型:` 为空，只能填一个：{allowed}（强制发送时账本记 未分类）")
+    elif ttype not in TASK_TYPES:
+        fails.append(f"T `类型: {ttype}` 不在白名单，只能填一个：{allowed}（强制发送时账本记 未分类）")
+
     # P paths
     for tok in sorted(set(ABS_PATH.findall(text))):
         p = tok.rstrip("\\.:")
@@ -179,7 +199,8 @@ def main():
         print("WARN", w)
     for f in fails:
         print("FAIL", f)
-    tag = f"budget={budget if budget is not None else '-'} units={units if units else '-'}"
+    tag = (f"budget={budget if budget is not None else '-'} units={units if units else '-'} "
+           f"type={ttype if ttype in TASK_TYPES else '未分类'}")
     if fails:
         print(f"LINT FAIL ({len(fails)} fail, {len(warns)} warn) {tag}")
         sys.exit(2)

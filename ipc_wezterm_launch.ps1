@@ -80,7 +80,7 @@ $LaunchCmd = @{
     B     = "claude-kimi 'k3[1m]' --permission-mode auto"    # positional -Model MUST come first or it swallows the flag (ValidateSet)
     C     = 'codex --model gpt-6-luna -c model_reasoning_effort=max'  # user 2026-10-04: C = codex gpt-6-luna max (was gpt-5.6-luna max 09-19..10-04, sol xhigh 08-30..09-19); flags pin it even if ~/.codex/config.toml defaults change
     D     = 'claude-ds --permission-mode auto'               # profile fn, DeepSeek env block
-    E     = 'codex'      # codex CLI slot (letter binding 2026-08-03); model/effort follow ~/.codex/config.toml (gpt-6.1-sol high since 2026-10-05)
+    E     = 'codex'      # codex CLI slot (letter binding 2026-08-03); model/effort follow ~/.codex/config.toml (read it for the current pair; gpt-6.1-sol high 2026-10-05..10-17, gpt-6-astra medium seen 2026-10-18)
     F     = 'claude-glm --permission-mode auto'              # profile fn, Zhipu direct (glm-5.3[1m]); added 2026-08-14
     CODEX = 'codex'      # legacy named channel, redundant with E since 2026-08-03
     DS    = 'claude-ds'  # legacy named channel, redundant with D since 2026-08-03
@@ -159,6 +159,14 @@ if ($guiPid) {
 }
 
 $map = Read-PaneMap
+# A fresh mux numbers its panes from 0 again, so every entry left by the previous
+# mux points at the wrong pane (2026-10-18: B=1/C=2 from 10-10 survived a launch of
+# A,D,E,F and aliased the new D=1/E=2; a later `-Roles B` or newcycle would have
+# typed into D's pane). Start the map empty.
+if ($freshGui -and $map.Count -gt 0) {
+    Write-Host ("fresh mux: dropping stale pane map entries " + (($map.Keys | Sort-Object | ForEach-Object { "$_=$($map[$_].pane_id)" }) -join ' '))
+    $map = @{}
+}
 
 # --- 0. refuse to duplicate a role whose pane is still alive (2026-09-15) ---
 # A DOWN watcher means "not parked", not "pane gone". On 2026-09-14 hub A saw C

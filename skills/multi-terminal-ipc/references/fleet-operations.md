@@ -53,7 +53,7 @@ opus-5[1m] 09-14..10-05; B=kimi k3[1m], C=codex gpt-6-luna
 max — rebound 2026-10-04 (GPT-6 templates carry the base rules ~/.codex/AGENTS.md no longer restates;
 `ipc_wake_pane.ps1 -Model` maps only to the GPT-6 family, sol = gpt-6.1-sol since 10-05), was gpt-5.6-luna max 09-19..10-04, sol xhigh 08-30..09-19,
 D=deepseek-flash[1m] incl. haiku/sub-agent slots,
-E=codex (follows ~/.codex/config.toml, gpt-6.1-sol high since 2026-10-05), F=glm-5.3[1m] via Zhipu direct — added
+E=codex (follows ~/.codex/config.toml; gpt-6.1-sol high 2026-10-05..10-17, gpt-6-astra medium seen 2026-10-18), F=glm-5.3[1m] via Zhipu direct — added
 2026-08-14) are a table at the top of
 the launch script; that table is the authority, this list is a snapshot. The old keepalive daemon
 is DECOMMISSIONED (same date): before dispatching, check `status --watch <role>`.
@@ -108,4 +108,4 @@ traps, and per-bridge caveats: [[ai-fin::wezterm-pane-injection-verified]]
     "do not touch panes running tasks"; no `ipc_role.py reset` — and the fix lands in
     shared code, never a one-off script. [[C--Users-<user>-Downloads-----::fleet-anomalies-to-x]]
 
-**Gotcha — gateway panes freeze on the boot `/ipc-recover`** (2026-09-20): a Claude Code pane routed through a non-Anthropic gateway (kimi / glm) runs one step, then stalls behind an auto-mode notice; `status --watch <role>` reads DOWN while the pane is alive. Send a bare `\r` (`wezterm cli --no-auto-start send-text --no-paste --pane-id N` against the fleet socket) and re-check after 60 s. 2026-10-17: a DeepSeek-gateway pane froze the same way on a release notice mid-task, and a Codex pane can sit on its update prompt (`enter continue · esc skip`: send Esc). `ipc_pane_probe.py` now flags `notice_overlay` and returns verdict `BLOCKED-NOTICE`; `stall_watch.py` prints the dismiss command; after any launch, refresh or `/ipc-recover`, probe once and dismiss before dispatching. Memory `fleet-notice-overlay-blocks-recover`.
+**Gotcha — gateway panes freeze on the boot `/ipc-recover`** (2026-09-20): a Claude Code pane routed through a non-Anthropic gateway (kimi / glm) runs one step, then stalls behind an auto-mode notice; `status --watch <role>` reads DOWN while the pane is alive. Send a bare `\r` (`wezterm cli --no-auto-start send-text --no-paste --pane-id N` against the fleet socket) and re-check after 60 s. 2026-10-17: a DeepSeek-gateway pane froze the same way on a release notice mid-task, and a Codex pane can sit on its update prompt (`enter continue · esc skip`: send Esc). `ipc_pane_probe.py` now flags `notice_overlay` and returns verdict `BLOCKED-NOTICE`; the hub reply clock (built into `watch --me A` since 2026-10-18; `stall_watch.py` before) prints the dismiss command; after any launch, refresh or `/ipc-recover`, probe once and dismiss before dispatching. Memory `fleet-notice-overlay-blocks-recover`.

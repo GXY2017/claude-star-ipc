@@ -15,7 +15,7 @@
 
 ## 0. 两条原则（今天三件的共同病根，2026-08-30）
 
-**P1 量尺读不到输入 = 硬失败，不是 WARNING。** 容量闸 / `Resolve-WeztermSocket` / `stall_watch` 一天跑出三个实例：读不到 pane 被当成「pane 空闲且没变」，闸跳过照发、时钟对健康的 B 打 ACT NOW。已修：`ipc_dispatch.ps1` UNKNOWN → throw；`stall_watch.py` → `PROBE-FAILED` 不裁决；`Send-PaneText` 非零退出 → throw。
+**P1 量尺读不到输入 = 硬失败，不是 WARNING。** 容量闸 / `Resolve-WeztermSocket` / `stall_watch` 一天跑出三个实例：读不到 pane 被当成「pane 空闲且没变」，闸跳过照发、时钟对健康的 B 打 ACT NOW。已修：`ipc_dispatch.ps1` UNKNOWN → throw；回复时钟（当时的 `stall_watch.py`，2026-10-18 起并入 `ipc.py` 的 `clock_tick`）→ `PROBE-FAILED` 不裁决；`Send-PaneText` 非零退出 → throw。
 判据：任何告警行里出现 `ctx ?` / `flags=`（空）/ `error=` 非空 / `UNKNOWN` / `PROBE-FAILED`，先当「没读到」，不当「读到了」。
 
 **P2 socket 没有身份。** `fleet1.sock` 只是路径，谁绑上都算数；`cli list` 退出码 0 只证明「有个 mux 在答」，不证明是编队那个。判「编队在不在」要核 pane 集合：list 出的 pane id 必须包含 `wezterm_panes.json` 里全部 id，且 title/cwd 像编队（cwd=项目根，不是 home）。
@@ -23,7 +23,7 @@
 python ~/.claude/ipc/fleet_list_panes.py fleet1.sock
 ```
 判据：6 个 pane、cwd 都是项目根 → 真编队；只有 1 个 `pwsh.exe` cwd=home → 被别的 mux 顶了（见 T1）。
-地面真值（不经 wezterm）：worker 增量落盘文件的 mtime + 字节数；`stall_watch` 每行末尾已自动附 `artifact=... (Nm ago)`。
+地面真值（不经 wezterm）：worker 增量落盘文件的 mtime + 字节数；回复时钟每行末尾已自动附 `artifact=... (Nm ago)`。
 
 **P3 一个开关只管一件性质的事。** `-Force` 曾同时赦免环境闸和简报 lint（#1208：lint FAIL 照发）。已拆：`-Force` 只越环境闸（socket/pane/ctx 读不到），`-ForceLint` 单独跳 lint 且打 `SKIPPED EXPLICITLY`。判据：看到 `LINT FAIL` 紧接 `SENT` 而没有 `SKIPPED EXPLICITLY` 行 = 开关又混了。
 
@@ -74,7 +74,7 @@ python ~/.claude/ipc/fleet_get_text.py gui-sock-<fleet1 GUI pid> <C 或 E 的映
 
 症状：`REPLY-CLOCK #id -> B 15m | ctx ? flags= tail=SAME | ACT NOW: pane idle ...`。
 判据：`ctx ?` + `flags=` 空 = 探针没读到（P1），不是 worker 停摆。新版已改打 `PROBE-FAILED: cannot read pane (<原因>)` 且不裁决；行尾 `artifact=<文件> (Nm ago)` 是地面真值——几分钟内有更新 = worker 在干活。
-处置：先看 artifact 字段；`no-artifact` 且 pane 也读不到时，再用 `fleet_get_text.py`（GUI socket）看屏幕，仍不明才叫人。**改了 `stall_watch.py` 后必须 TaskStop 旧 Monitor 重挂**，旧进程跑的是旧代码。
+处置：先看 artifact 字段；`no-artifact` 且 pane 也读不到时，再用 `fleet_get_text.py`（GUI socket）看屏幕，仍不明才叫人。**改了 `ipc.py`（时钟在 `clock_tick`）后必须 TaskStop 旧的 `watch --me A` Monitor 重挂**，旧进程跑的是旧代码。
 已知边界（A #1190，2026-08-30，未修）：`artifact_truth()` 是「简报里全文最新的绝对路径」，若简报把产物写成**裸文件名**、只有输入文件是绝对路径，它会挑中一个旧输入（实例：#1167 挑到 `分析素材.md` 662m ago，看着像停摆）。读 artifact 字段时先核那个文件名是不是本单产物；`(Nm ago)` 很大而文件名像输入/库文件 → 当 `no-artifact` 看。计划修法：① `ipc_brief_lint.py` D 档加「产物路径必须绝对路径」，源头拦；② `artifact_truth()` 只认产物词（产物/追加进/写入/新建）同行或下一行的绝对路径，挑不到诚实写 `no-artifact`。写简报的规矩：更正类简报也把产物路径写全。
 
 ## T5. `SENT #id but NUDGE FAILED`
@@ -137,7 +137,7 @@ again at 9:05 PM.
 pwsh -NoProfile -c "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'claude.exe' } | Select-Object ProcessId,CreationDate,CommandLine | Sort-Object CreationDate | Format-Table -AutoSize"
 ```
 判据：没有早于重启时刻的 `claude.exe` = 旧 A 已死；pane 0 显示的「A 还记得」是新 A 读信箱重建的，不是存活。
-处置：重启前默认假设 **A 会丢上下文**——A 先把在途裁定、排班、规矩落盘（`_staging/_A_*.md`），再喊重启；重启后看 pane 0 是新进程就按「新 A」写信。旧 A 的 Monitor 子进程（`stall_watch.py`）会成孤儿，重启后 `Get-CimInstance … stall_watch` 查一遍、杀早于重启时刻的那个。
+处置：重启前默认假设 **A 会丢上下文**——A 先把在途裁定、排班、规矩落盘（`_staging/_A_*.md`），再喊重启；重启后看 pane 0 是新进程就按「新 A」写信。旧 A 的 Monitor 子进程（`ipc.py watch --me A`；2026-10-18 前还有 `stall_watch.py`）会成孤儿，重启后 `Get-CimInstance … watch` 查一遍、杀早于重启时刻的那个。
 根修（待用户定）：hub 跑在 fleet1 之外（自己的 mux 或普通窗口），fleet 重启对 hub 无感。
 
 ## T8. 派单/唤醒抛 `no pane recorded for X`（两份登记，ps1 只读一份；已修）
@@ -165,7 +165,7 @@ python -c "import sys,sqlite3; sys.path.insert(0, r'C:\Users\<user>\.claude\ipc'
 ls -lt --time-style=+%H:%M:%S <项目>\_staging\_A_brief_*.md | head          # 简报写成时刻
 ```
 判据：`ts` 与简报 mtime 相差 ≤ 2 分钟 → 派单时刻就是 ts，hub 记忆错；相差很大且中间信箱有流量 → 才查时钟。
-已固化：`stall_watch.py` 首次看到任务打 `CLOCK-START #id -> role since <ts> (age Nm, state …)`，起算点当场可见，不再需要事后翻库。
+已固化：每行 `REPLY-CLOCK` 都带 `(since HH:MM)` 起算点，不再需要事后翻库（2026-08-30 起 `stall_watch.py` 单独打 `CLOCK-START` 行；2026-10-18 时钟并入 `watch --me A`，正常时不出声，起算点改随裁决行给出）。注意：时钟静默现在是常态，只说明没有要处置的单；时钟自身出错会打 `CLOCK-ERROR`。
 边界：hub 重建上下文后对「我什么时候做了什么」的记忆不可信，以信箱 `ts` 与文件 mtime 为准（与 T7 处置呼应）。
 
 ## T10. codex TUI「自己退出」了，斜杠命令落进 PowerShell（根因是我们发的 Ctrl+C；已修）

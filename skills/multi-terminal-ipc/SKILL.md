@@ -1,7 +1,7 @@
 ---
 name: multi-terminal-ipc
 description: >-
-  Operate cross-model terminal IPC: onboard projects, dispatch/collect work, recover roles, check or reconnect fleets; 多终端、多模型互通、派活、收回复、主从终端、信箱、编队重连. Use for ipc.py operations. Covers hub/workers and window loss without assuming a fleet restart.
+  Operate cross-model terminal IPC: onboard projects, dispatch/collect work, recover roles, start, restart or reconnect fleets; 多终端、多模型互通、派活、收回复、主从终端、信箱、编队重连、启动/重启 wezterm. Use for ipc.py operations. Covers hub/workers and window loss without assuming a fleet restart.
 ---
 
 # multi-terminal-ipc
@@ -90,7 +90,7 @@ pane or GUI window is gone, or to check role→model bindings. Routing:
   timeout or missing reply is not a terminal state: re-poll the same handle
   (`status --watch <role>`, the pane in `wezterm cli list`) before recycling.
   (Codex goal-continuation template, openai/codex codex-rs, read 2026-10-04.)
-- Pane alive but silent after a launch, refresh or `/ipc-recover`: probe it (`python ~/.claude/ipc/ipc_pane_probe.py <role>`); verdict `BLOCKED-NOTICE` means a harness notice or the Codex update prompt sits over the TUI and the model never sees the next tool result. Dismiss it (Enter; Codex update prompt: Esc), re-probe, only then dispatch. `stall_watch` reports it at its 15-minute checks (2026-10-17, see fleet-operations gotcha).
+- Pane alive but silent after a launch, refresh or `/ipc-recover`: probe it (`python ~/.claude/ipc/ipc_pane_probe.py <role>`); verdict `BLOCKED-NOTICE` means a harness notice or the Codex update prompt sits over the TUI and the model never sees the next tool result. Dismiss it (Enter; Codex update prompt: Esc), re-probe, only then dispatch. the hub's reply clock (built into `watch --me A` since 2026-10-18) reports it at its 15/30/45-minute checks (2026-10-17, see fleet-operations gotcha).
 - `ipc_fleet1_restart.ps1` is whole-fleet only: `-Roles` picks what comes back,
   never what gets torn down.
 
@@ -99,6 +99,18 @@ user's behalf, ask which project first and pass `-Project` — unless the user a
 project and scope in this request (2026-09-05 relaxation: do not re-confirm what was just stated;
 still validate the `-Project` value and never widen the scope to a whole-fleet restart, another
 project, or someone else's running task).**
+**Every WezTerm start or restart is fleet form (user rule 2026-10-18):** never an ad-hoc standalone
+`wezterm-gui start` relaunch and never `claude --resume` of the old session. Route by what is
+running (is the fleet-1 mux socket reachable, then `status --watch <role>`):
+- "启动/打开 wezterm" and the fleet-1 mux is alive (GUI window closed or never attached) → the
+  GUI-gone routing above: workers ALIVE = reattach only (`wezterm connect fleet1`, contexts intact,
+  no project question); workers DOWN = restart script.
+- "启动 wezterm" and no fleet-1 mux → `ipc_wezterm_launch.ps1`; ask the project.
+- "重启 wezterm" with the fleet up → the user asking for the whole-fleet restart
+  (`ipc_fleet1_restart.ps1`), so the never-widen clause above does not block it.
+Lineup size, launch method and routing are Claude's call per [[fleet-default-lineup-20261017]]; a
+launch or restart still asks the project. A request that explicitly names a standalone window, a
+single pane or one command is done as named. Why and the incident: [[fleet-launch-ask-project]].
 
 ## Command surface (run from project root)
 
@@ -114,15 +126,15 @@ ipc.py recv --me A --block                            # block until a reply arri
 ipc.py recv --me A --block --count 3                  # BARRIER: after fanning to 3, wait for all 3 — COUNT TRAP: a worker that text-replies AND runs `done` sends TWO rows (reply + bodyless ack), so the quota can fill on the fastest workers' pairs; size ~2×workers, or tell workers to close with a single message (a text reply alone already marks done)
 ipc.py peek --me A --tail 5                            # review last 5 WITHOUT marking read
 ipc.py peek --me A --id 12 15                          # exactly those ids (from NEW MSG / DONE signals), no marking
-ipc.py peek --me C --batch [N] / --batches             # a complete saved recv --json batch (latest or N; numbered files, last 100 kept): recovery when tool output was truncated
+ipc.py peek --me C --batch [N] / --batches             # a complete saved recv --json batch (latest or N; numbered files, last 20 kept): recovery when tool output was truncated
 ipc.py pending --hub A [--detail]                     # tasks dispatched with no reply yet (empty = done)
 ipc.py task --id N [--json]                           # ONE task's state (QUEUED|IN_PROGRESS|DONE|FAILED|CANCELLED|NEEDS-REVIEW|STALE|UNKNOWN), read-only; use it to confirm a claim - pending omits DONE tasks (2026-10-15)
 ipc.py status --watch B --json                        # {alive,busy,squatter,owner_valid,parked,reason}; scripts gate on `parked` only (2026-10-15)
 ipc.py cancel --task N --by A                          # retract a dispatched task
-# --submit-id / --no-requeue, --json envelopes, pending --json states (QUEUED-STALLED / IN-PROGRESS-SILENT / NEEDS-REVIEW), redeliver: references/command-details.md
+# --submit-id / --no-requeue, --json envelopes, pending --json states (QUEUED-STALLED / IN-PROGRESS-SILENT / NEEDS-REVIEW), redeliver, archive table, routing ledger (`类型:`, `ipc_estimate.py rank`, `grade`): references/command-details.md
 # --- mechanical gates & clocks (2026-08-30, from the 2026-08-29 postmortem; user: "能用脚本固化的就固化") ---
 pwsh ~/.claude/ipc/ipc_dispatch.ps1 -Role E -BodyFile brief.md [-SubmitId k] [-MaxMinutes 15] [-DryRun] [-Force]
-                                                      # THE dispatch path: brief lint + recipient pane probe, then park -> send -> nudge -> confirm claim. Gate rules, probes, stall_watch, timing, budget estimates: references/command-details.md
+                                                      # THE dispatch path: brief lint + recipient pane probe, then park -> send -> nudge -> confirm claim. Gate rules, probes, the reply clock, timing, budget estimates: references/command-details.md
 ```
 
 ### Worker B/C/D — execute & report

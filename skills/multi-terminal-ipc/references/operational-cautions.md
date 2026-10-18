@@ -41,6 +41,16 @@
    task, A dispatches with `--no-requeue`: a stale claim then parks as
    NEEDS-REVIEW instead of being auto-requeued or auto-failed — A decides
    (cancel / probe the worker), the reaper never re-runs it.
+   **NEW section (2026-10-17, optional):** after the RESULT lines a worker may add
+   NEW items: `- ` bullets under a `NEW:` line (indented lines continue an item);
+   text after `NEW:` on that same line counts as one item only when no bullet
+   follows. Each item is an assertion plus the consequence of ignoring it. Evidence only: an item cites output, a line number or
+   two conflicting sources; speculation and generic reminders are not written. NEW
+   lines count against the brief's existing budget. A closed-type brief (取数,
+   mechanical 脚本) says "只交付" and gets no NEW section. A CLEAN reply with items
+   reaches A as `DONE … +NEW n: peek …`; every linked reply carries the anchor
+   `#task<N>.<role>` for A to quote in later briefs. The item count goes to the
+   ledger; A records use with `grade --used-new` (`command-details.md`).
 7. **Synthesis stays with A.** Reconciliation, coverage check, final call are the
    hub's. On a barrier timeout returning k<N, diff senders got vs dispatched-to,
    probe the absent (`status --watch X`), re-dispatch ≤2 tries, then `log` the

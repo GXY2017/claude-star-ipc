@@ -76,8 +76,8 @@ rules (guard-safe constraints verbatim; preprocessed inputs ship as files).
    without a `预算: N 分钟` line (N <= 15), whose header role differs from
    `-Role`, whose `UNITS: n` x measured min/unit exceeds the budget, whose
    absolute paths do not exist, or whose product target is empty; and refuses
-   a recipient whose pane reads DEAD/QUOTA/BLOCKED. `stall_watch.py` runs the
-   reply clock. Put `预算:` and `UNITS:` on their own lines near the top. The
+   a recipient whose pane reads DEAD/QUOTA/BLOCKED. The reply clock runs inside
+   the hub's `watch --me A` (`ipc.py clock` for a Codex hub). Put `预算:` and `UNITS:` on their own lines near the top. The
    `预算:` number comes from `python ~/.claude/ipc/ipc_estimate.py estimate --role
    <r> --brief <file>` (per-model p80 from the timing ledger, 2026-09-19), not
    from a guess; if it prints INSUFFICIENT for the model, keep the 15-minute
@@ -86,7 +86,7 @@ rules (guard-safe constraints verbatim; preprocessed inputs ship as files).
    Every brief that names a product file also says how to close: "回复文件首行
    `RESULT: <产物绝对路径>`,有问题或只做了一部分则不写 RESULT 行" (2026-09-19
    RESULT-line protocol, SKILL.md caution 6) — the same absolute path the brief
-   declared, so `send`'s disk check and `stall_watch`'s artifact ground truth
+   declared, so `send`'s disk check and the reply clock's artifact ground truth
    agree on one file.
 5. **Every brief carries `完成判据:`** (2026-10-02, book "Build an AI Agent"
    §7.2 / §9.4.2): one checkable line per sub-task, e.g. "12 份全部追加进
@@ -127,6 +127,20 @@ Dispatch policy:
 - **Context % and provider quota are independent axes.** A quota/limit banner
   (D's usual state) is vendor credit exhaustion — leave the role down per the
   restart script's warning; refreshing context does not help, only waiting does.
+  Check windows BEFORE the round, not after the banner: `python ~/.claude/ipc/ipc_quota.py`
+  (2026-10-17) prints OK / THROTTLE / HOLD per role (5h: 60/80 %, 7d: 70/85 %; A's 5h: 40/60 %
+  because the user's own session shares it; C and E share one Codex pair, so a task to one
+  spends the other's remainder). THROTTLE = only pieces that fit the remainder; HOLD = nothing
+  but an approved exception. A percent has no unit until measured: run `--log` before and
+  after a round and read the delta per task type. Windowed roles get a task only when
+  predicted duration < time to reset; long, non-idempotent or unbounded work is checkpointed
+  to files and goes to the role with the most time left, or to D (the only pay-per-token
+  role) in short must-succeed pieces, never as D's whole queue: D's balance has a review-only
+  floor and D is the end of the failure chain. B and F (Kimi Code, Zhipu Coding Plan) show
+  UNKNOWN: probe each with one small task first, note the first-call time (+5h = reset
+  estimate), and treat the banner gate as the last line, not the first. Anthropic extra usage
+  is OFF on this account, so a 5h hit stops A itself: A's own turns count against the same
+  window. (Reviewed with DeepSeek 2026-10-17.)
 - **Any refresh discards the worker's task context.** Its session id changes;
   follow-ups need a fresh self-contained `--body-file` brief (workers can never
   read hub history). Corollary of the existing session-echo rule: a reply whose
