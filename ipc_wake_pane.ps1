@@ -48,7 +48,10 @@ if ($CodexRoles -contains $Role) {
     if ($Model) {
         $targetModel = if ($modelMap.ContainsKey($Model.ToLower())) { $modelMap[$Model.ToLower()] } else { $Model }
     }
-    $launchCmd = if ($targetModel) { "codex -m $targetModel" } else { 'codex' }
+    # 2026-10-20: without -Model, relaunch with the role's pinned $LaunchCmd (E = gpt-6.1-sol xhigh,
+    # C = gpt-6-luna max) instead of a bare `codex` that would fall back to ~/.codex/config.toml.
+    $tableCmd = (Get-LauncherTable 'LaunchCmd')[$Role]
+    $launchCmd = if ($targetModel) { "codex -m $targetModel" } elseif ($tableCmd) { $tableCmd } else { 'codex' }
 
     $lastLine = (Get-PaneText $paneId) | Where-Object { $_ -match '\S' } | Select-Object -Last 1
     if ($lastLine -match '^\s*PS .*>') {

@@ -31,13 +31,16 @@
    them in full. Two more opening lines (2026-10-02): `UNSOLVABLE: <why>` = cannot be
    done, nothing guessed from memory; `REPLAN: <wrong premise + evidence>` = the brief
    itself is wrong. Both reach A as `NEW MSG … [UNSOLVABLE]` / `[REPLAN]`; on REPLAN, A
-   rewrites the brief instead of re-sending it. `ipc_dispatch.ps1` appends this protocol
+   rewrites the brief instead of re-sending it. A third, `HANDOFF: <handoff file>`
+   (2026-10-21), is sent only on the hub clock's quota request (caution 14) and reaches
+   A as `[HANDOFF]`. `ipc_dispatch.ps1` appends this protocol
    and today's date to every brief by code. Auto-link happens only when exactly one task is open; with several,
    an unlinked reply is refused (2026-09-16 — the old oldest-open guess bound F's
    "#1566 回执" to #1567). A `--type note` never closes anything. Call `ack` periodically on a long
    task or the 1800s ceiling reaps it as "stuck" — `ack` also beats the heartbeat,
-   so it is the keep-alive for a watcher-less worker mid-task (bash-fallback mode,
-   whose heartbeat dies the moment a task is delivered). For a **non-idempotent**
+   so it is the keep-alive for a worker whose busy beater is missing (any `recv`
+   path, parked or one-shot, forks the beater on a delivered task since 2026-09-21;
+   `ack` remains the lease extender). For a **non-idempotent**
    task, A dispatches with `--no-requeue`: a stale claim then parks as
    NEEDS-REVIEW instead of being auto-requeued or auto-failed — A decides
    (cancel / probe the worker), the reaper never re-runs it.
@@ -45,7 +48,17 @@
    NEW items: `- ` bullets under a `NEW:` line (indented lines continue an item);
    text after `NEW:` on that same line counts as one item only when no bullet
    follows. Each item is an assertion plus the consequence of ignoring it. Evidence only: an item cites output, a line number or
-   two conflicting sources; speculation and generic reminders are not written. NEW
+   two conflicting sources; speculation and generic reminders are not written.
+   **Typed items (2026-10-22, from Agensh arXiv:2609.26781 §2.2 "shared context"):** an
+   item may open with `FAIL:` (an approach tried and falsified — the highest-value entry,
+   it stops another role from spending budget on it), `FACT:` (confirmed, with evidence)
+   or `OBSERVED:` (seen, not confirmed); untyped items stay valid; there is no CLAIM
+   (assignment stays with A). Keep an item's first line under 200 chars (send prints
+   `NEW-LONG`, never refuses) and put detail on indented lines below it. The tally
+   travels with every count (`NEW 3 (FAIL 1, FACT 1)`, `+NEW 3 (FAIL 1): peek …`,
+   `recv --json` field `new_types`); `ipc.py board --type FAIL [--grep kw]` lists the
+   items across the project's replies and A reads it before writing a brief (case brief
+   section 已证伪路径, orchestration-and-dispatch.md rule 6). NEW
    lines count against the brief's existing budget. A closed-type brief (取数,
    mechanical 脚本) says "只交付" and gets no NEW section. A CLEAN reply with items
    reaches A as `DONE … +NEW n: peek …`; every linked reply carries the anchor
@@ -82,10 +95,29 @@ a pane-spawn site, upgrading Node.js / wezterm, or handling a fleet anomaly.
     more 15 min; stalled/abnormal → act now; two extensions max. Tasks are sliced
     so a recipient can deliver in ≤15 min. Full procedure and the
     manage-not-operate boundary: `~/.claude/commands/main.md` § A 的职责边界与节奏.
-    Worker quota self-reporting was considered and deferred: no vendor CLI
-    exposes an in-turn quota read (Claude `/usage` and Codex `/status` are
-    TUI-only; `~/.claude/hooks/statusline.js:10-11`), so A reads quota banners from the pane
-    during the 15-min inspection instead.
+    Workers still do not self-report quota. **Quota handoff (user 2026-10-21):
+    a role about to run out of its window writes its work down before the limit
+    stops it**, so another role continues instead of redoing it. The hub clock
+    (`ipc.py` `_clock_handoff`, run by `ipc_supervisor.py`) reads each pending
+    task's recipient windows from files every tick (`ipc_state.py`); at 90 % of the 5h
+    window (`IPC_HANDOFF_PCT`) or 98 % of the 7d window (`IPC_HANDOFF_PCT_7D`; 10 % of
+    a week is many 5h windows of work, user 2026-10-21) with the reset more than
+    10 min away it types a one-line
+    request into a claimed task's pane (a mid-turn message: Claude Code hands it
+    to the model when the running tool calls finish; Codex steers; never after
+    Ctrl+C or Esc, which interrupt). The worker writes
+    `<state dir>/handoff/task-<N>-<role>.md` and sends it as the linked reply,
+    first line `HANDOFF: <path>` (verdict `handoff`, kept out of rank and
+    estimate stats). A sees `QUOTA-HANDOFF #N -> <role> ...` and, on the reply,
+    re-dispatches the rest to a role with room (`ipc_quota.py`): original brief
+    plus that file. A queued task is only reported (cancel, re-route); the hub's
+    own window at 85 % (`IPC_HANDOFF_HUB_PCT`) prints `QUOTA-HANDOFF hub A`:
+    bring `_A_ledger.md` up to date and dispatch nothing new. Once per task,
+    role and window reset. Windows come from the statusline state (Anthropic),
+    the Codex rollout, and since 2026-10-21 the Kimi Code and Zhipu usage APIs
+    (`ipc_quota.py` `kimi()` / `glm()`, cached 60 s). D (DeepSeek) is pay per
+    token and has no window: incremental flush (orchestration § brief rule 4) is
+    its only protection, together with the balance floor.
 15. **Both fleet GUIs vanish at once while every pane and mux server is alive =
     system commit (virtual memory) exhaustion, not a wezterm bug**: diagnose,
     then reattach, never relaunch.

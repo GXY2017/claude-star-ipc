@@ -6,8 +6,17 @@ Reads, per vendor, what can be read without a TUI:
   codex      the newest ~/.codex/sessions rollout event carrying rate_limits (limit_id "codex";
              C and E share these windows: a task to one spends the other's remainder)
   deepseek   GET /user/balance (pay-per-token: a balance, not a window)
-  kimi, glm  subscription windows (Kimi Code, Zhipu Coding Plan); no usage API: only the pane
-             banner after a hit (FLEET-TRIAGE T6), so they stay UNKNOWN here
+  kimi       GET https://api.kimi.com/coding/v1/usages, Bearer $KIMI_CODE_API_KEY: usages.limit_5h /
+             limit_7d used_ratio + reset_time; older count fields (limits[] 300-minute window,
+             usage = weekly) as fallback. Endpoint from CodexBar docs/kimi.md, live 200 2026-10-21
+  glm        GET https://open.bigmodel.cn/api/monitor/usage/quota/limit, Authorization $GLM_API_KEY
+             (no Bearer needed, accepted either way): data.limits[] percentage + nextResetTime (ms);
+             unit 3 x 5 = 5h, unit 6 x 1 = weekly (opencode-glm-quota src/utils/token-limits.ts),
+             TIME_LIMIT = monthly MCP calls, skipped. Endpoint from zai-org/zai-coding-plugins
+             glm-plan-usage, live 200 2026-10-21 (this account returns type CREDIT_LIMIT)
+             Both are cached 60 s in ~/.claude/cache/ipc_quota_api_<vendor>.json for ipc_state,
+             which the hub clock reads every tick; this script's own run always fetches fresh.
+  ollama     G's free-period deadline ($RoleFreeUntil in ipc_wezterm_launch.ps1): OK before, HOLD after
 Verdict per role: OK / THROTTLE (only pieces that fit the remainder) / HOLD (nothing but an
 approved exception) / UNKNOWN. Thresholds differ per window: a 7d window at 80% is far worse
 than a 5h one. A's 5h HOLD is lower because the user's own session shares that window.
@@ -23,13 +32,17 @@ import datetime as dt
 import glob
 import json
 import os
+import re
 import sys
+import time
 import urllib.request
 
-sys.stdout.reconfigure(encoding="utf-8")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ipc_state  # noqa: E402  (same dir; role -> rollout mapping, token_count reader)
+
 HOME = os.path.expanduser("~")
 ROLES = {"A": "anthropic", "X": "anthropic", "B": "kimi", "C": "codex", "E": "codex",
-         "D": "deepseek", "F": "glm"}
+         "D": "deepseek", "F": "glm", "G": "ollama"}
 CACHE = os.path.join(HOME, ".claude", "cache", "ipc_quota_last.json")
 LOG = os.path.join(HOME, ".claude", "ipc", "quota_snapshots.jsonl")
 # (throttle, hold) percent used, by window label
@@ -89,53 +102,30 @@ def anthropic():
     return out
 
 
-def _find_codex_limits(obj):
-    """Depth-first search for a rate_limits dict with limit_id == 'codex'."""
-    if isinstance(obj, dict):
-        if obj.get("limit_id") == "codex" and ("primary" in obj or "secondary" in obj):
-            return obj
-        for v in obj.values():
-            r = _find_codex_limits(v)
-            if r:
-                return r
-    elif isinstance(obj, list):
-        for v in obj:
-            r = _find_codex_limits(v)
-            if r:
-                return r
-    return None
-
-
 def codex():
-    files = sorted(glob.glob(os.path.join(HOME, ".codex", "sessions", "*", "*", "*", "*.jsonl")),
-                   key=os.path.getmtime, reverse=True)
-    for f in files:
-        last = None
-        try:
-            with open(f, encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    if '"rate_limits"' not in line:
-                        continue
-                    try:
-                        ev = json.loads(line)
-                    except ValueError:
-                        continue
-                    rl = _find_codex_limits(ev)
-                    if rl:
-                        last = (rl, ev.get("timestamp"))
-        except OSError:
-            continue
-        if last:
-            rl, ts = last
-            w = []
-            for key in ("primary", "secondary"):
-                p = rl.get(key) or {}
-                mins = p.get("window_minutes")
-                label = "5h" if mins == 300 else "7d" if mins == 10080 else f"{mins}m" if mins else key
-                w.append({"name": label, "used": p.get("used_percent"), "resets": local(p.get("resets_at"))})
-            return {"windows": w, "plan": rl.get("plan_type"), "as_of": local(ts), "source": os.path.basename(f),
-                    "shared": "C+E"}
-    return {"error": "no codex rate_limits event in ~/.codex/sessions"}
+    """C and E share one window, so the freshest rate_limits across their own rollouts wins
+    (ipc_state.codex_rollout maps role -> registered thread; 2026-10-20). The newest rollouts
+    overall are the fallback for a thread that never registered. Per-role context % rides along."""
+    cands = {ipc_state.codex_rollout(r) for r in ("C", "E")} - {None}
+    cands |= set(sorted(glob.glob(ipc_state.ROLLOUTS), key=os.path.getmtime, reverse=True)[:3])
+    best = None
+    for f in cands:
+        tc = ipc_state.codex_token_count(f)
+        if tc and tc.get("rate_limits") and (best is None or (tc["rate_limits_ts"] or "") > (best[0]["rate_limits_ts"] or "")):
+            best = (tc, f)
+    ctx = {r: ipc_state.snapshot(r)["ctx_used_pct"] for r in ("C", "E")}
+    if not best:
+        return {"error": "no codex rate_limits event in ~/.codex/sessions", "ctx": ctx}
+    tc, f = best
+    rl = tc["rate_limits"]
+    w = []
+    for key in ("primary", "secondary"):
+        p = rl.get(key) or {}
+        mins = p.get("window_minutes")
+        label = "5h" if mins == 300 else "7d" if mins == 10080 else f"{mins}m" if mins else key
+        w.append({"name": label, "used": p.get("used_percent"), "resets": local(p.get("resets_at"))})
+    return {"windows": w, "plan": rl.get("plan_type"), "as_of": local(tc["rate_limits_ts"]),
+            "source": os.path.basename(f), "shared": "C+E", "ctx": ctx}
 
 
 def deepseek():
@@ -158,6 +148,134 @@ def deepseek():
     return {"available": d.get("is_available"), "balance": bal, "peak": peak}
 
 
+def _epoch(ts):
+    """ISO string or epoch s/ms -> epoch seconds; None on anything odd."""
+    try:
+        if isinstance(ts, str):
+            t = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return (t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)).timestamp()
+        v = float(ts)
+        return v / 1000.0 if v > 1e11 else v
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _window(name, used, reset):
+    at = _epoch(reset)
+    return {"name": name, "used": round(float(used), 1), "resets_at": at, "resets": local(at)}
+
+
+def parse_kimi(d):
+    """Kimi Code /coding/v1/usages body -> windows. Ratio pools first; count fields fill a
+    window the ratios do not carry (older response shape)."""
+    out = {}
+    for key, name in (("limit_5h", "5h"), ("limit_7d", "7d")):
+        p = ((d.get("usages") or {}).get(key)) or {}
+        if p.get("used_ratio") is not None:
+            out[name] = _window(name, 100.0 * float(p["used_ratio"]), p.get("reset_time"))
+    counts = [("5h", lim.get("detail") or {}) for lim in d.get("limits") or []
+              if (lim.get("window") or {}).get("duration") == 300
+              and (lim.get("window") or {}).get("timeUnit") == "TIME_UNIT_MINUTE"]
+    counts.append(("7d", d.get("usage") or {}))
+    for name, c in counts:
+        try:
+            if name not in out and float(c["limit"]) > 0:
+                out[name] = _window(name, 100.0 * float(c["used"]) / float(c["limit"]), c.get("resetTime"))
+        except (KeyError, TypeError, ValueError):
+            pass
+    return [out[k] for k in ("5h", "7d") if k in out]
+
+
+GLM_WINDOWS = {(3, 5): "5h", (6, 1): "7d"}   # (unit, number); opencode-glm-quota token-limits.ts
+
+
+def parse_glm(d):
+    """Zhipu /api/monitor/usage/quota/limit body -> windows; TIME_LIMIT (monthly MCP calls) skipped."""
+    out = []
+    for lim in ((d.get("data") or {}).get("limits")) or []:
+        if lim.get("type") == "TIME_LIMIT" or lim.get("percentage") is None:
+            continue
+        name = GLM_WINDOWS.get((lim.get("unit"), lim.get("number")), f"u{lim.get('unit')}x{lim.get('number')}")
+        out.append(_window(name, lim["percentage"], lim.get("nextResetTime")))
+    return out
+
+
+def _get_json(url, headers, timeout=10):
+    req = urllib.request.Request(url, headers=headers)
+    return json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8"))
+
+
+def kimi():
+    key = os.environ.get("KIMI_CODE_API_KEY")
+    if not key:
+        return {"error": "KIMI_CODE_API_KEY not set"}
+    try:
+        w = parse_kimi(_get_json("https://api.kimi.com/coding/v1/usages", {"Authorization": f"Bearer {key}"}))
+    except Exception as e:  # network / 401 / 429 / shape
+        return {"error": str(e)[:80]}
+    return {"windows": w} if w else {"error": "no window in the usages response"}
+
+
+def glm():
+    key = os.environ.get("GLM_API_KEY")
+    if not key:
+        return {"error": "GLM_API_KEY not set"}
+    try:
+        d = _get_json("https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+                      {"Authorization": key, "Accept-Language": "en-US,en"})
+    except Exception as e:
+        return {"error": str(e)[:80]}
+    if not d.get("success", True) or d.get("code") not in (None, 200):
+        return {"error": f"code {d.get('code')}: {str(d.get('msg'))[:60]}"}
+    w = parse_glm(d)
+    return {"windows": w, "plan": (d.get("data") or {}).get("level")} if w else {"error": "no window in the quota response"}
+
+
+API_VENDORS = {"kimi": kimi, "glm": glm}
+STATE_VENDOR = {"kimi-code": "kimi", "zhipu-cn": "glm"}   # statusline.js `vendor` -> reader here
+API_TTL_S = 60.0
+
+
+def cached_windows(vendor):
+    """Windows for an API vendor, at most API_TTL_S old (errors are cached too, so a dead
+    endpoint costs one request a minute). [] on error or an unknown vendor. Never raises:
+    ipc_state.snapshot calls it from the hub clock."""
+    fn = API_VENDORS.get(vendor)
+    if not fn:
+        return []
+    path = os.path.join(HOME, ".claude", "cache", f"ipc_quota_api_{vendor}.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            c = json.load(f)
+        if 0 <= time.time() - float(c["at"]) < API_TTL_S:
+            return c.get("windows") or []
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    try:
+        info = fn()
+    except Exception as e:  # noqa: BLE001
+        info = {"error": str(e)[:80]}
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"at": time.time(), "windows": info.get("windows") or [], "error": info.get("error")}, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return info.get("windows") or []
+
+
+def ollama():
+    """G's free-period end, parsed from $RoleFreeUntil in the launcher (the one copy)."""
+    try:
+        with open(os.path.join(HOME, ".claude", "ipc", "ipc_wezterm_launch.ps1"), encoding="utf-8") as f:
+            m = re.search(r"^\s*G\s*=\s*'([^']+)'", re.search(r"\$RoleFreeUntil\s*=\s*@\{(.*?)\n\}", f.read(), re.S).group(1), re.M)
+        return {"free_until": m.group(1)}
+    except (OSError, AttributeError) as e:
+        return {"error": f"no G deadline in launcher: {e}"[:80]}
+
+
 def verdict(role, vendor, info, a):
     if "error" in info:
         return "UNKNOWN", info["error"]
@@ -172,6 +290,11 @@ def verdict(role, vendor, info, a):
         if money < a.review_only_balance:
             return "THROTTLE", desc + " review-only floor"
         return "OK", desc
+    if vendor == "ollama":
+        end = info["free_until"]
+        if dt.datetime.now(dt.timezone.utc) < dt.datetime.fromisoformat(end.replace("Z", "+00:00")):
+            return "OK", f"Ollama Cloud free until {local(end)}"
+        return "HOLD", f"free period ended {local(end)}, paid per token now: ipc_pane_exit.ps1 -Role G"
     if "windows" in info:
         th = TH_A if role == "A" else TH
         wins = info["windows"]
@@ -207,11 +330,11 @@ def main():
     ap.add_argument("--min-balance", type=float, default=5.0, help="USD-equivalent below which DeepSeek is HOLD")
     ap.add_argument("--review-only-balance", type=float, default=8.0, help="below this D takes short pieces only")
     a = ap.parse_args()
+    sys.stdout.reconfigure(encoding="utf-8")   # here, not at import: ipc_state imports this module from the hub clock
     roles = [r.strip().upper() for r in a.roles.split(",") if r.strip()]
 
     v = {"anthropic": anthropic(), "codex": codex(), "deepseek": deepseek(),
-         "kimi": {"note": "Kimi Code subscription: 5h window (403 seen 2026-08-30); no usage API, pane banner only"},
-         "glm": {"note": "Zhipu Coding Plan (user 2026-10-17): 5h window, 429 code 1308 at the cap; no usage API, pane banner only"}}
+         "kimi": kimi(), "glm": glm(), "ollama": ollama()}
 
     # stale fallback for anthropic: keep the last good snapshot, show it marked stale
     prev = {}
@@ -260,6 +383,8 @@ def main():
         cx = v["codex"]
         if "as_of" in cx:
             print(f"-- codex snapshot as of {cx['as_of']} from {cx['source']} (plan {cx.get('plan')}); stale if no Codex turn ran since")
+        if cx.get("ctx"):
+            print("-- codex context used: " + " ".join(f"{r}={'?' if v is None else f'{v:.0f}%'}" for r, v in cx["ctx"].items()))
     if a.strict and any(r["verdict"] != "OK" for r in rows):
         sys.exit(2)
 

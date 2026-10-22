@@ -128,7 +128,7 @@ again at 9:05 PM.
 修正记录：第一版 `BANNER_STOP` 的 `^\s*\S` 把缩进续行也当块结束，claude 横幅块只剩首行，三家旧样本靠首行碰巧命中的词才判对——已改为「标记行（可缩进）或顶格行才结束」，glm 块回到 3 行。教训：**回归表里 verdict 对了不等于块切对了**，改横幅语法时要同时打印块行数。
 样本清单（七份，探针每次改动都重跑）：`quota_kimi_B_403` / `quota_deepseek_D_402` / `quota_glm_F_429` / `quota_codex_C_credits` / `quota_codex_E_credits` 须 QUOTA；`falsepos_X_report1252_synth` / `falsepos_X_reporting_quotas` 须 OK。
 
-## T7. 整队重启把 hub A 也带走了（设计缺口，未修）
+## T7. 整队重启把 hub A 也带走了（用户 2026-10-18 定：hub 留在编队，接受此代价）
 
 症状：`ipc_fleet1_restart.ps1` 后 A 的上下文消失；日志出现 `[A] orphan watcher pid … killed` + `[A] pane 0: claude …`。
 根因：A 的 pane 与 worker 同在 fleet1 的 mux 里，kill mux 即 kill A；脚本默认 `-Roles A,B,C,D,E,F`，`-Roles` 去掉 A 也救不了（pane 随 mux 死）。实例 2026-08-30 14:33（#1255）：新 A 14:33:15 起，从信箱重建了在途状态，但上午对话没了。
@@ -138,7 +138,7 @@ pwsh -NoProfile -c "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq '
 ```
 判据：没有早于重启时刻的 `claude.exe` = 旧 A 已死；pane 0 显示的「A 还记得」是新 A 读信箱重建的，不是存活。
 处置：重启前默认假设 **A 会丢上下文**——A 先把在途裁定、排班、规矩落盘（`_staging/_A_*.md`），再喊重启；重启后看 pane 0 是新进程就按「新 A」写信。旧 A 的 Monitor 子进程（`ipc.py watch --me A`；2026-10-18 前还有 `stall_watch.py`）会成孤儿，重启后 `Get-CimInstance … watch` 查一遍、杀早于重启时刻的那个。
-根修（待用户定）：hub 跑在 fleet1 之外（自己的 mux 或普通窗口），fleet 重启对 hub 无感。
+不做根修（用户 2026-10-18）：hub 留在 fleet1；整队重启由用户在 fleet1 之外的窗口运行（普通 PowerShell 窗口或另一个 wezterm 窗口），A 先写交接。脚本步骤 0a 拒绝在 fleet1 的 pane 里运行（按 `IPC_ROLE`、`fleet1.sock`、`mux-fleet1.lua` 判断），因为拆 mux 会连同运行脚本的 pane 一起杀掉，重启后半段不会执行。只是 TUI 卡住、过期或上下文用尽，用 `ipc_newcycle.ps1 -Relaunch`（逐个 pane 退出 CLI 再原地启动，不动 mux），不用整队重启。评估见 DeepSeek #task20.D。
 
 ## T8. 派单/唤醒抛 `no pane recorded for X`（两份登记，ps1 只读一份；已修）
 

@@ -10,15 +10,20 @@
 # Usage:
 #   pwsh ~/.claude/ipc/ipc_fleet1_restart.ps1 -Project "C:\path\to\project"
 #   pwsh ~/.claude/ipc/ipc_fleet1_restart.ps1 -Project ... -Roles A,B,C,E,F
-#   ... -Force        # proceed even if `pending --hub A` is non-empty, or -Roles omits the hub
+#   ... -Force        # proceed even if A has tasks in flight to fleet-1 roles, or -Roles omits the hub
+#
+# !! Run from a window OUTSIDE fleet 1 (plain PowerShell or another wezterm window);
+#    refused from a fleet-1 pane (step 0a). The hub stays in fleet 1 (user 2026-10-18),
+#    so A writes its handoff before the user runs this.
 #
 # !! WHOLE-FLEET only. -Roles = who comes BACK; teardown (step 2) is always the entire
 #    mux. A -Roles list without the hub is refused without -Force (2026-09-03): to recycle
 #    one role use ipc_wezterm_launch.ps1 -Roles <r> (live mux reused) or ipc_newcycle.ps1.
 #
 # Sequence (deviations from the shutdown runbook are deliberate):
-#   1. pending --hub A must be empty (or -Force) - never kill mid-flight fan-out.
-#      Checked in the OLD docked project's mailbox (from the pane map), not the
+#   1. pending --hub A must hold no task for a role whose pane this teardown kills
+#      (or -Force) - never kill mid-flight fan-out. Tasks to fleet-2 roles (X) do
+#      not block. Checked in the OLD docked project's mailbox (from the pane map), not the
 #      new -Project one - a project-switch restart otherwise checks/sweeps an
 #      empty mailbox (bit 2026-08-15).
 #   2. Kill ONLY the pinned GUI pid (fleet 2 / X runs its own wezterm-gui).
@@ -38,6 +43,20 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\ipc_wezterm_common.ps1"
+# --- 0a. never from inside fleet 1 (user 2026-10-18: the hub stays in the fleet; a
+# whole-fleet restart is run from a window outside it - a plain PowerShell window or
+# another wezterm, e.g. fleet 2's). Step 2 kills the fleet-1 mux and with it the pane
+# running this script, so the relaunch half would never run and the fleet would stay
+# down. No -Force override: from inside fleet 1 the script cannot finish. Checked
+# before the WEZTERM_* strip below, which would erase the evidence.
+$fleet1Roles = @('A','B','C','D','E','F','G','CODEX','DS') + @((Read-PaneMap).Keys)
+if (($env:IPC_ROLE -and $fleet1Roles -contains $env:IPC_ROLE) -or
+    $env:WEZTERM_UNIX_SOCKET -match 'fleet1\.sock' -or $env:WEZTERM_CONFIG_FILE -match 'mux-fleet1\.lua') {
+    throw ("This shell runs inside fleet 1 (IPC_ROLE=$env:IPC_ROLE, socket=$env:WEZTERM_UNIX_SOCKET): the teardown " +
+           "would kill it before the relaunch. Run the same command from a window outside fleet 1 - a plain " +
+           "PowerShell window or another wezterm window. A writes its handoff first: the hub stays in fleet 1 and " +
+           "loses its session (FLEET-TRIAGE T7).")
+}
 # Strip inherited WEZTERM_* up front (2026-08-17, memory
 # wezterm-env-inheritance-gui-launch): run from inside a fleet-2 pane this
 # script carries fleet2's WEZTERM_CONFIG_FILE/WEZTERM_UNIX_SOCKET, which reach
@@ -83,16 +102,35 @@ try {
 # Teardown is fleet-wide.  Include the configured fleet-1 map so legacy or
 # future role names are swept too; -Roles controls only who is relaunched.
 $FleetRoles = @(
-    (@('A','B','C','D','E','F') + @($oldMap.Keys) + @($Roles)) |
+    (@('A','B','C','D','E','F','G') + @($oldMap.Keys) + @($Roles)) |
         Where-Object { $_ } |
         Sort-Object -Unique
 )
+# Roles whose panes the teardown kills: the recorded fleet-1 map. $FleetRoles is the
+# sweep set and includes slots that were never launched; a stale task to one of those
+# would block every restart although the teardown cannot harm it.
+$TeardownRoles = if ($oldMap -and $oldMap.Count -gt 0) { @($oldMap.Keys) } else { $FleetRoles }
 Push-Location $OldProject
 try {
     # --- 1. refuse to kill mid-flight work (checked in the OLD mailbox) ---
-    $pending = (& python $IpcPy pending --hub $Hub 2>&1) -join "`n"
-    if ($pending -notmatch 'NONE' -and -not $Force) {
-        throw "pending --hub $Hub is non-empty - workers may be mid-task:`n$pending`nResolve (recv/cancel) or rerun with -Force."
+    # Only tasks to roles in $TeardownRoles block. A task to a fleet-2 role (X)
+    # survives a fleet-1 teardown, and the restart order itself is usually such a
+    # task (#13 REPLAN, 2026-10-18; DeepSeek review #task18.D). pending exits 0 when
+    # empty and 1 with rows; an uncaught exception also exits 1 (traceback, no JSON
+    # rows), so exit 1 without rows fails closed.
+    if (-not $Force) {
+        $raw = @(& python $IpcPy pending --hub $Hub --json 2>&1)
+        $rc = $LASTEXITCODE
+        $rows = @($raw | Where-Object { "$_" -match '^\s*\{' } | ForEach-Object { "$_" | ConvertFrom-Json })
+        if ($rc -notin 0, 1 -or ($rc -eq 1 -and $rows.Count -eq 0)) {
+            throw "pending --hub $Hub failed (exit $rc) - refusing to tear down:`n$($raw -join "`n")`nFix the mailbox error or rerun with -Force."
+        }
+        $blocking = @($rows | Where-Object { $TeardownRoles -contains $_.to })
+        if ($blocking.Count -gt 0) {
+            throw ("tasks to fleet-1 roles are in flight - workers may be mid-task:`n" +
+                   (($blocking | ForEach-Object { "#$($_.id) $Hub->$($_.to) [$($_.state)]" }) -join "`n") +
+                   "`nResolve (recv/cancel) or rerun with -Force.")
+        }
     }
 
     # --- 1b. a socket detour (wezterm_sock_override.json) describes the fleet we are about

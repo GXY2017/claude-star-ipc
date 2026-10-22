@@ -17,7 +17,7 @@ variant tier before the vendor tag, and `fail` rows never enter a duration sampl
   python ~/.claude/ipc/ipc_estimate.py rank --type 取数 [--open] [--roles B,D,E]
 
 2026-10-17 routing (memory ipc-record-dedup-plan-20261017): rows carry `type` (the
-brief's 类型: field), `verdict` (pass|rework|redispatch|fail|replan|unsolvable),
+brief's 类型: field), `verdict` (pass|rework|redispatch|fail|replan|unsolvable|handoff),
 `new_items` and `used_new`. `rank` prints one line per candidate role for one task
 type; the role level is that role's rows under its CURRENT model ($ModelTag), the
 cell is the same rows of that type, and thin cells are shrunk toward the role
@@ -84,6 +84,7 @@ ROLE_MODEL_HISTORY = {
     "D": [("DeepSeek", "2026-01-01", None)],
     "E": [("Codex", "2026-01-01", None)],
     "F": [("GLM-Zhipu", "2026-08-14", None)],
+    "G": [("MiniMax-ollama", "2026-10-21", None)],
     "CODEX": [("Codex", "2026-01-01", None)],
     "DS": [("DeepSeek", "2026-01-01", None)],
     "X": [("Claude-fleet2", "2026-01-01", None)],
@@ -208,8 +209,9 @@ def timed(r):
     (2026-09-19 review item 2: five fast `fail` rows formed a valid throughput
     rate and drove the budget below what real work needs.) Fail rows still
     count toward `fail%` in stats. Cancel rows (a claimed task the hub cancelled,
-    2026-10-17) measure dispatch->cancel, not work, and are excluded the same way."""
-    return minutes(r) is not None and r.get("outcome") not in ("fail", "cancel")
+    2026-10-17) measure dispatch->cancel, not work, and are excluded the same way;
+    so are handoff rows (partial work, 2026-10-21)."""
+    return minutes(r) is not None and r.get("outcome") not in ("fail", "cancel") and verdict_of(r) != "handoff"
 
 
 def row_type(r):
@@ -231,8 +233,10 @@ def _group_key(r, by):
 
 def not_cancel(r):
     """Cancel rows record the hub's decision, not a role outcome: out of every
-    rate, count and duration here (the ledger keeps them)."""
-    return r.get("outcome") != "cancel"
+    rate, count and duration here (the ledger keeps them). Handoff rows (2026-10-21:
+    the role stopped part-way because its quota window ran low) are a capacity event,
+    not a quality or duration sample, and are left out the same way."""
+    return r.get("outcome") != "cancel" and verdict_of(r) != "handoff"
 
 
 def stats(by="model", since=None):

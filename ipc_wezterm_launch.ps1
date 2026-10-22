@@ -72,6 +72,9 @@ $Roles = @($Roles | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim(
 #   uncompacted. E's ~/.codex/config.toml moved to gpt-6.1-sol high the same day;
 #   C stays gpt-6-luna max (models_cache.json lists no gpt-6.1-luna).
 # F added 2026-08-14: GLM via Zhipu direct (claude-glm profile fn, glm-5.3[1m]).
+# G added 2026-10-21 (user): MiniMax M3.1 Flash via Ollama Cloud, free only until the
+#   $RoleFreeUntil deadline below. ollama launch sets no context size for this slug
+#   (Claude Code would assume 200K), so the line presets 1M + compact at 75%.
 # All four in --permission-mode auto (user decision 2026-08-03: manual mode stalls
 # unattended panes on tool-approval prompts). Wrapper fns forward extra args to claude;
 # ollama forwards what follows `--` to the integration.
@@ -80,8 +83,9 @@ $LaunchCmd = @{
     B     = "claude-kimi 'k3[1m]' --permission-mode auto"    # positional -Model MUST come first or it swallows the flag (ValidateSet)
     C     = 'codex --model gpt-6-luna -c model_reasoning_effort=max'  # user 2026-10-04: C = codex gpt-6-luna max (was gpt-5.6-luna max 09-19..10-04, sol xhigh 08-30..09-19); flags pin it even if ~/.codex/config.toml defaults change
     D     = 'claude-ds --permission-mode auto'               # profile fn, DeepSeek env block
-    E     = 'codex'      # codex CLI slot (letter binding 2026-08-03); model/effort follow ~/.codex/config.toml (read it for the current pair; gpt-6.1-sol high 2026-10-05..10-17, gpt-6-astra medium seen 2026-10-18)
+    E     = 'codex --model gpt-6.1-sol -c model_reasoning_effort=xhigh'  # user 2026-10-20: E = codex gpt-6.1-sol xhigh, pinned by flags (was bare `codex` following ~/.codex/config.toml: gpt-6.1-sol high 10-05..10-17, gpt-6-astra medium 10-18..10-20)
     F     = 'claude-glm --permission-mode auto'              # profile fn, Zhipu direct (glm-5.3[1m]); added 2026-08-14
+    G     = '$env:CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000; $env:CLAUDE_CODE_AUTO_COMPACT_WINDOW=750000; ollama launch claude --model minimax-m3.1-flash:cloud -y -- --permission-mode auto'   # added 2026-10-21; no inner quotes (ipc.py _role_variant parses this line)
     CODEX = 'codex'      # legacy named channel, redundant with E since 2026-08-03
     DS    = 'claude-ds'  # legacy named channel, redundant with D since 2026-08-03
 }
@@ -99,10 +103,23 @@ $ModelTag = @{
     B     = 'Kimi'
     C     = 'Codex-gpt6-luna'  # 2026-10-04: second codex pane, gpt-6-luna max (was Codex-luna = gpt-5.6-luna 09-19..10-04, Codex-sol 08-30..09-19; E stays the config.toml-driven one)
     D     = 'DeepSeek'
-    E     = 'Codex'
+    E     = 'Codex-gpt6.1-sol'  # 2026-10-20: pinned sol xhigh (was bare 'Codex' while E followed config.toml)
     F     = 'GLM-Zhipu'
+    G     = 'MiniMax-ollama'
     CODEX = 'Codex'
     DS    = 'DeepSeek'
+}
+# Roles bound to a time-limited free offer: from this UTC instant on, the launcher and
+# ipc_newcycle.ps1 -Relaunch refuse the role, and ipc_quota.py reports it HOLD, so the
+# role stops starting when the offer turns paid instead of billing per token.
+$RoleFreeUntil = @{
+    G = '2026-10-22T23:59:00Z'   # ollama.com/library/minimax-m3.1-flash (read 2026-10-21): "free until Oct 22, 2026 11:59 PM UTC", then $0.15 in / $0.60 out per 1M
+}
+$expired = @($Roles | Where-Object { $RoleFreeUntil[$_] -and [datetimeoffset]::UtcNow -ge [datetimeoffset]::Parse($RoleFreeUntil[$_], [cultureinfo]::InvariantCulture) })
+if ($expired.Count -gt 0) {
+    Write-Warning ("skipping " + ($expired -join ',') + ": free period ended (`$RoleFreeUntil in $PSCommandPath)")
+    $Roles = @($Roles | Where-Object { $expired -notcontains $_ })
+    if ($Roles.Count -eq 0) { throw "nothing left to launch: every requested role is past its free period" }
 }
 # Roles running the codex CLI, not the claude harness: different TUI (skip the
 # claude readiness probe and the standby wake). NOTE codex DOES claim a role at
@@ -262,3 +279,9 @@ foreach ($l in $launched) {
         Write-Warning "[$($l.role)] pane $($l.pane) TUI not detected within timeout - check it manually"
     }
 }
+
+# 2026-10-20: the hub reply clock runs out of session (ipc_supervisor.py), so A's watch only
+# relays actionable lines and no model turn is spent on ticking. Idempotent: a live
+# supervisor is reused. Stop with `python ~/.claude/ipc/ipc_supervisor.py stop`.
+$supOut = (& python (Join-Path $PSScriptRoot 'ipc_supervisor.py') start 2>&1) -join ' '
+Write-Host "[supervisor] $supOut"

@@ -59,6 +59,8 @@ WEZTERM_SCRIPTS = ("ipc_wezterm_common.ps1", "ipc_wezterm_launch.ps1",
 TOOL_SCRIPTS = ("ipc_brief_lint.py", "ipc_pane_probe.py", "ipc_timing.py",
                 "ipc_estimate.py",   # 2026-09-19: per-model duration ledger + budget estimates
                 "ipc_quota.py",      # 2026-10-17: per-vendor quota verdicts before dispatch
+                "ipc_state.py",      # 2026-10-20: per-role ctx/quota state from files (statusline state + codex rollouts), pane regex fallback
+                "ipc_supervisor.py", # 2026-10-20: out-of-session hub reply clock (started by ipc_wezterm_launch.ps1)
                 "fleet_list_panes.py", "fleet_get_text.py",
                 "FLEET-TRIAGE.md")
 

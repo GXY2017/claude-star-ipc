@@ -299,7 +299,7 @@ function Submit-PaneText([int]$PaneId, [string]$Text, [int]$DelayMs = 400) {
 
 function Get-PaneKind([int]$PaneId) {
     # What is running in the pane RIGHT NOW, judged by the pane's own footer/prompt shape:
-    #   'codex'  - `› Ask Codex to do anything` prompt or `Context NN% left ·` status line
+    #   'codex'  - `› Ask Codex to do anything` prompt or `Context NN% left ·` / `Context NN% used` status line
     #   'claude' - `⏵⏵ auto mode on` / `? for shortcuts` footer or `Ctx NN% left` statusline
     #   'shell'  - last non-empty line is a PowerShell prompt (the TUI has exited)
     #   'unknown'
@@ -310,8 +310,26 @@ function Get-PaneKind([int]$PaneId) {
     # 3+ SGR mouse reports on one line = a TUI died without restoring terminal modes (#1416)
     if (($lines | Select-Object -Last 12 | Where-Object { $_ -match '(\[\d{1,4};\d{1,4};\d{1,4}[Mm]){3,}' }).Count -ge 1) { return 'dead-tui' }
     if ($last -match '^\s*PS [A-Za-z]:\\.*>\s*$') { return 'shell' }
-    if ($tail -match '› Ask Codex|Context \d{1,3}% left ·') { return 'codex' }
-    if ($tail -match '⏵⏵ auto mode|\? for shortcuts|accept edits on|plan mode on|\bCtx \d{1,3}(\.\d+)?% left') { return 'claude' }
+    # `used` only as the status line's last field (`· Context NN% used`): drops quoted prose (#task26.E R1)
+    $codexRe = '(?m)› Ask Codex|Context \d{1,3}% left ·|· Context \d{1,3}% used\s*$'
+    $claudeOnlyRe = '⏵⏵ auto mode|accept edits on|plan mode on|\bCtx \d{1,3}(\.\d+)?% left'
+    $claudeRe = "$claudeOnlyRe|\? for shortcuts"
+    # Footer first, so a codex status line quoted in a claude pane's output cannot win (#task28.E R1b):
+    # claude draws ─── rules around its input box, the footer is what follows the last one;
+    # codex drew none on the live panes (2026-10-18; overlays such as f2/update not captured, #task33.E),
+    # its footer is the last 3 lines (also when a rule is the very last line).
+    # Neither marker there -> the old 12-line search.
+    $tl = @($lines | Select-Object -Last 12)
+    $rule = -1
+    for ($i = $tl.Count - 1; $i -ge 0; $i--) { if ($tl[$i] -match '^\s*─{10,}\s*$') { $rule = $i; break } }
+    $ruled = $rule -ge 0 -and $rule -lt $tl.Count - 1
+    $foot = if ($ruled) { $tl[($rule + 1)..($tl.Count - 1)] } else { $tl | Select-Object -Last 3 }
+    $footTxt = $foot -join "`n"
+    if ($footTxt -match $codexRe) { return 'codex' }
+    # codex prints `? for shortcuts` too: in the footer it marks claude only below a ─── rule (#task30.D S1)
+    if ($footTxt -match $(if ($ruled) { $claudeRe } else { $claudeOnlyRe })) { return 'claude' }
+    if ($tail -match $codexRe) { return 'codex' }
+    if ($tail -match $claudeRe) { return 'claude' }
     return 'unknown'
 }
 
@@ -357,7 +375,8 @@ function Wait-CodexReady([int]$PaneId, [int]$TimeoutSec = 150, [string]$LaunchCm
         $lines = Get-PaneText $PaneId
         $t = $lines -join "`n"
         $last = $lines | Where-Object { $_ -match '\S' } | Select-Object -Last 1
-        if ($t -match 'Context \d+% left' -and $t -notmatch 'Starting MCP servers') { return $true }
+        # codex builds from 2026-10-18 print "Context NN% used" (ipc_pane_probe.py header)
+        if ($t -match 'Context \d+% (left|used)' -and $t -notmatch 'Starting MCP servers') { return $true }
         if ($t -match '(?i)trust this (folder|directory)') { Send-PaneText $PaneId "`r"; continue }
         if ($t -match '(?i)restart Codex' -and $last -match '^\s*PS .*>\s*$') {
             if ($relaunches -ge 2) { return $false }
@@ -402,6 +421,90 @@ function Wait-PaneReady([int]$PaneId, [int]$TimeoutSec = 40) {
         if ($txt -match '\? for shortcuts|auto mode on|accept edits on|plan mode on') { return $true }
     }
     return $false
+}
+
+# --- in-pane relaunch (2026-10-18, user "不重启wezterm，但每个模型exit再进入";
+# DeepSeek design #task20.D; used by ipc_newcycle.ps1 -Relaunch) ---
+
+function Get-LauncherTable([string]$Name) {
+    # Role bindings live only in ipc_wezterm_launch.ps1 (ipc.py _role_variant() parses
+    # its $LaunchCmd text, so the table must stay there): read a constant table by AST
+    # without running the launcher.
+    $path = Join-Path $env:USERPROFILE '.claude\ipc\ipc_wezterm_launch.ps1'
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$null)
+    $want = "`$$Name"
+    $node = $ast.Find({ param($n)
+        $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq $want }.GetNewClosure(), $true)
+    if (-not $node) { throw "$want not found in $path" }
+    return $node.Right.Expression.SafeGetValue()
+}
+
+function Invoke-PaneRelaunch([string]$Role, [int]$PaneId, [string]$Project, [switch]$Force) {
+    # Exit the role's CLI inside its own pane, then retype the launcher's line there and
+    # send the wake. Before /exit: Esc on a permission prompt (Enter would APPROVE the
+    # pending tool call), Enter on a notice overlay (codex: Esc). Claude asks "Exit and
+    # stop tasks" when a Monitor runs: option 1 is preselected, Enter takes it. Codex:
+    # Esc then Ctrl+C (T10), a second Ctrl+C if it is still up. Returns one result line
+    # and never exits the caller. An unreadable pane, or one still producing output
+    # (unless -Force), is left untouched.
+    $cmd = (Get-LauncherTable 'LaunchCmd')[$Role]
+    if (-not $cmd) { return "[$Role] SKIP - no launch command bound for $Role in ipc_wezterm_launch.ps1" }
+    $freeUntil = (Get-LauncherTable 'RoleFreeUntil')[$Role]
+    if ($freeUntil -and [datetimeoffset]::UtcNow -ge [datetimeoffset]::Parse($freeUntil, [cultureinfo]::InvariantCulture)) {
+        return "[$Role] SKIP - free period ended $freeUntil (`$RoleFreeUntil in ipc_wezterm_launch.ps1); exit the pane: pwsh ~/.claude/ipc/ipc_pane_exit.ps1 -Role $Role"
+    }
+    $isCodex = @(Get-LauncherTable 'CodexRoles') -contains $Role
+    $kind = Get-PaneKind $PaneId
+    if ($kind -in 'unknown', 'dead-tui') { return "[$Role] SKIP - pane $PaneId kind=$kind; look at it before relaunching" }
+    if ($kind -ne 'shell') {
+        $p = $null
+        try { $p = (& python (Join-Path $env:USERPROFILE '.claude\ipc\ipc_pane_probe.py') $Role --json) | ConvertFrom-Json } catch { }
+        # the probe always exits 0; an unreadable pane is error set / tail_hash null (#task24.E B1)
+        if (-not $p -or $p.error -or -not $p.tail_hash) {
+            $why = if ($p -and $p.error) { $p.error } else { 'no probe output' }
+            return "[$Role] SKIP - pane $PaneId probe unreadable ($why); look at it before relaunching"
+        }
+        $flags = @($p.flags)
+        if ($flags -contains 'working' -and -not $Force) {
+            return "[$Role] SKIP - pane $PaneId still producing output (flags=$($flags -join ',')); -Force cuts it off"
+        }
+        if ($flags -contains 'permission_prompt') {
+            Send-PaneText $PaneId ([string][char]27)
+            Start-Sleep -Seconds 1
+        } elseif ($flags -contains 'notice_overlay') {
+            Send-PaneText $PaneId $(if ($isCodex) { [string][char]27 } else { "`r" })
+            Start-Sleep -Seconds 1
+        }
+        if ($isCodex) {
+            Send-PaneText $PaneId ([string][char]27)
+            Start-Sleep -Milliseconds 400
+            Send-PaneText $PaneId ([string][char]3)
+        } else {
+            Clear-PaneInput $PaneId
+            Submit-PaneText $PaneId '/exit'
+        }
+        $deadline = (Get-Date).AddSeconds(60)
+        $nudged = $false
+        while ((Get-PaneKind $PaneId) -ne 'shell' -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 3
+            if (-not $isCodex -and ((Get-PaneText $PaneId) -join "`n") -match 'Exit and stop tasks') {
+                Send-PaneText $PaneId "`r"
+                Start-Sleep -Seconds 2
+            }
+            if ($isCodex -and -not $nudged) { Send-PaneText $PaneId ([string][char]3); $nudged = $true }
+        }
+        if ((Get-PaneKind $PaneId) -ne 'shell') {
+            $tail = ((Get-PaneText $PaneId) | Where-Object { $_ -match '\S' } | Select-Object -Last 3) -join ' | '
+            return "[$Role] ERROR - CLI did not exit in 60 s; pane $PaneId tail: $tail"
+        }
+    }
+    $projQ = $Project -replace "'", "''"   # PowerShell single-quote escape (#task24.E S2)
+    Submit-PaneText $PaneId "Set-Location -LiteralPath '$projQ'; `$env:IPC_ROLE='$Role'; $cmd"
+    $ready = if ($isCodex) { Wait-CodexReady $PaneId 150 $cmd } else { Wait-PaneReady $PaneId 90 }
+    if (-not $ready) { return "[$Role] ERROR - relaunched but not ready in time; look at pane $PaneId (no wake sent)" }
+    $wake = if ($isCodex) { "`$ipc-recover $Role" } else { "/ipc-recover $Role" }
+    Submit-PaneText $PaneId $wake
+    return "[$Role] pane $PaneId : relaunched ($cmd), sent $wake"
 }
 
 # --- dispatch gate helpers (2026-10-15 efficiency review P1) ---

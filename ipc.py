@@ -632,7 +632,10 @@ HUB = os.environ.get("IPC_HUB", "A")
 # LAST so _take_auto's launch-order roulette never reaches it — X is claimed
 # only via explicit IPC_ROLE=X. Plain worker otherwise (star topology: talks
 # to the hub only).
-_BASE_ROLES = ("A", "B", "C", "D", "E", "F", "CODEX", "DS", "X")
+# G = fleet-1 slot added 2026-10-21 (MiniMax via Ollama Cloud, free-period only:
+# $RoleFreeUntil in ipc_wezterm_launch.ps1). Placed after the legacy channels so
+# the roulette reaches it last among worker slots; the launcher claims it via IPC_ROLE=G.
+_BASE_ROLES = ("A", "B", "C", "D", "E", "F", "CODEX", "DS", "G", "X")
 ROLES = _BASE_ROLES if HUB in _BASE_ROLES else (HUB,) + _BASE_ROLES
 
 
@@ -1045,7 +1048,11 @@ _RESULT_LINE = re.compile(r"^\s*RESULT\s*[:：]\s*(.+?)\s*$")   # single line, a
 # or `REPLAN: <which premise of the brief is wrong + evidence>` (the brief must be
 # rewritten, not re-sent). Both stay non-CLEAN, so the hub reads the full body; the
 # status is stored in `result` and tagged on the NEW MSG signal.
-_STATUS_LINE = re.compile(r"^\s*(UNSOLVABLE|REPLAN)\s*[:：]\s*(.*?)\s*$", re.I)
+# 2026-10-21: `HANDOFF: <handoff file>` = the role stopped because its quota window is
+# nearly spent (the hub clock asked it to, see _clock_handoff); another role continues
+# from that file. Verdict `handoff`: a capacity event, not a quality outcome.
+_STATUS_WORDS = ("UNSOLVABLE", "REPLAN", "HANDOFF")
+_STATUS_LINE = re.compile(r"^\s*(" + "|".join(_STATUS_WORDS) + r")\s*[:：]\s*(.*?)\s*$", re.I)
 _HOLD_SECS = float(os.environ.get("IPC_HOLD_SECS", "900"))   # max wait for a CLEAN reply = the 15-min slice rule
 
 
@@ -1073,7 +1080,7 @@ def _verify_result(conn, body, task_id):
     """Return 'CLEAN', 'UNVERIFIED: <why>' or None (no RESULT line) for a linked
     reply body. CLEAN iff the body OPENS with >=1 RESULT line and every path is
     absolute, an existing regular file, and modified at/after the parent task's
-    dispatch ts. A body opening with UNSOLVABLE:/REPLAN: returns that status."""
+    dispatch ts. A body opening with UNSOLVABLE:/REPLAN:/HANDOFF: returns that status."""
     first = next((l for l in (body or "").splitlines() if l.strip()), "")
     ms = _STATUS_LINE.match(first)
     if ms:
@@ -1154,27 +1161,43 @@ _NEW_HEADING = re.compile(r"^\s*#+\s*NEW\s*$")
 _NEW_ITEM = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+\S")
 
 
-def count_new_items(body):
-    """Items of the NEW section(s). The one rule (also in operational-cautions
-    caution 6 and the ipc_dispatch.ps1 footer): items are `- ` bullets under a
-    `NEW:` line; text after `NEW:` on that same line counts as one item only when
-    no bullet follows. Lenient details: `* ` and `1. ` bullets count too; a bullet
-    deeper than the shallowest bullet seen so far in the section, or any indented
-    non-bullet line, continues the current item; the section ends at a
+# 2026-10-22 (from Agensh, arXiv:2609.26781 §2.2 "shared context"): an item may
+# open with a type tag. FAIL = an approach tried and falsified (the highest-value
+# entry: it stops another role from spending budget on it), FACT = confirmed with
+# evidence, OBSERVED = seen, not yet confirmed. Untyped items stay valid. The
+# first line of an item is what the hub and later briefs quote, so it stays short
+# (_NEW_MAX_CHARS: warned at send, never refused); the long version goes on the
+# indented continuation lines below it. `ipc.py board` lists typed items across a
+# project's replies. CLAIM is deliberately absent: assignment stays with the hub.
+NEW_TYPES = ("FAIL", "FACT", "OBSERVED")
+_NEW_TYPED = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+\**(" + "|".join(NEW_TYPES)
+                        + r")\**\s*[:：]\s*(.*?)\s*$")
+_NEW_BULLET = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
+_NEW_MAX_CHARS = 200
+
+
+def new_items(body):
+    """[(type or None, first line)] of the NEW section(s). The one rule (also in
+    operational-cautions caution 6 and the ipc_dispatch.ps1 footer): items are `- `
+    bullets under a `NEW:` line; text after `NEW:` on that same line counts as one
+    item only when no bullet follows. Lenient details: `* ` and `1. ` bullets count
+    too; a bullet deeper than the shallowest bullet seen so far in the section, or
+    any indented non-bullet line, continues the current item; the section ends at a
     non-indented, non-empty, non-bullet line. Fenced code blocks are removed first
     (_unfenced), so a quoted `NEW:` example in a fence counts nothing."""
-    count, in_sec, base, inline, bullets = 0, False, None, 0, 0
+    items, in_sec, base, inline, bullets = [], False, None, None, 0
 
     def close():
-        return inline if not bullets else 0
+        if inline is not None and not bullets:
+            items.append((None, inline))
 
     for line in _unfenced((body or "").splitlines()):
         m = _NEW_HEAD.match(line)
         if m or _NEW_HEADING.match(line):
             if in_sec:
-                count += close()
+                close()
             in_sec, base, bullets = True, None, 0
-            inline = 1 if (m and m.group(1)) else 0
+            inline = m.group(1) if (m and m.group(1)) else None
             continue
         if not in_sec or not line.strip():
             continue
@@ -1183,13 +1206,35 @@ def count_new_items(body):
         if bullet and (base is None or indent <= base):
             base = indent if base is None else min(base, indent)
             bullets += 1
-            count += 1
+            t = _NEW_TYPED.match(line)
+            items.append((t.group(1), t.group(2)) if t
+                         else (None, _NEW_BULLET.sub("", line).strip()))
         elif indent == 0 and not bullet:
-            count += close()
-            in_sec, inline, bullets = False, 0, 0
+            close()
+            in_sec, inline, bullets = False, None, 0
     if in_sec:
-        count += close()
-    return count
+        close()
+    return items
+
+
+def count_new_items(body):
+    """Item count of the NEW section(s); parsed ONCE in send(), stored as new_items."""
+    return len(new_items(body))
+
+
+def new_types_tag(body):
+    """`FAIL 1, FACT 2` over the typed items of a reply ("" when none is typed)."""
+    items = new_items(body)
+    return ", ".join(f"{t} {sum(1 for k, _ in items if k == t)}" for t in NEW_TYPES
+                     if any(k == t for k, _ in items))
+
+
+def _new_tag(n_new, body):
+    """` NEW n (FAIL 1, FACT 2)` / ` NEW n` / "" for the NEW MSG and peek tags."""
+    if not n_new:
+        return ""
+    types = new_types_tag(body)
+    return f" NEW {n_new}" + (f" ({types})" if types else "")
 
 
 def _anchor(task_id, sender):
@@ -1197,13 +1242,44 @@ def _anchor(task_id, sender):
     return f"#task{task_id}.{sender}"
 
 
-def _summary_suffix(task_id, sender, n_new, mid, me):
+def board_rows(since=None, task=None):
+    """(id, ts, sender, body, task) of every linked worker reply to the hub that
+    carries NEW items, live table then archive, oldest first (`ipc.py board`).
+    Read-only: no claim, no reap. An archive created before the new_items column
+    is read without the filter (its rows are parsed, not trusted to the count)."""
+    cond, params = ["msg_type='reply'", "in_reply_to IS NOT NULL", "recipient=?",
+                    "COALESCE(new_items, 0) > 0"], [HUB]
+    if since:
+        cond.append("ts >= ?")
+        params.append(since)
+    if task is not None:
+        cond.append("in_reply_to = ?")
+        params.append(task)
+    sel = "SELECT id, ts, sender, body, in_reply_to FROM {} WHERE " + " AND ".join(cond)
+    rows = []
+    with _conn() as conn:
+        rows += conn.execute(sel.format("messages"), params).fetchall()
+        have = {r[1] for r in conn.execute("PRAGMA table_info(messages_archive)")}
+        if {"id", "ts", "sender", "body", "in_reply_to", "msg_type", "recipient"} <= have:
+            q = sel if "new_items" in have else sel.replace(" AND COALESCE(new_items, 0) > 0", "")
+            rows += conn.execute(q.format("messages_archive"), params).fetchall()
+    seen, out = set(), []
+    for r in sorted(rows, key=lambda r: r[0]):
+        if r[0] not in seen:
+            seen.add(r[0])
+            out.append(r)
+    return out
+
+
+def _summary_suffix(task_id, sender, n_new, mid, me, types=""):
     """Tail of the hub's one-line DONE summary (watch flush and recv): the reply's
-    anchor, and for a reply carrying NEW items (stored count) the count plus the
-    peek that shows them (a CLEAN reply's body is otherwise never read)."""
+    anchor, and for a reply carrying NEW items (stored count) the count, its typed
+    tally (`FAIL 1`, 2026-10-22) and the peek that shows them (a CLEAN reply's body
+    is otherwise never read)."""
     if task_id is None:
         return ""
-    new = f" +NEW {n_new}: peek --me {me} --id {mid}" if n_new else ""
+    new = (f" +NEW {n_new}" + (f" ({types})" if types else "")
+           + f": peek --me {me} --id {mid}") if n_new else ""
     return f"{new}  anchor {_anchor(task_id, sender)}"
 
 
@@ -1473,8 +1549,8 @@ def fold_ledger(rows):
 
 def _auto_verdict(outcome, attempts, result):
     """Code-set verdict, most decisive first: fail (fail reply, cancel, reaper
-    auto-fail) > redispatch (claimed more than once) > unsolvable / replan (the
-    reply's opening status line, as already parsed into `result` by
+    auto-fail) > redispatch (claimed more than once) > unsolvable / replan /
+    handoff (the reply's opening status line, as already parsed into `result` by
     _verify_result) > pass. Only `rework` needs the hub's hand (grade); a missed
     grade records an extra pass."""
     if outcome in ("fail", "cancel"):
@@ -1482,7 +1558,7 @@ def _auto_verdict(outcome, attempts, result):
     if (attempts or 0) > 1:
         return "redispatch"
     status = (result or "").split(":", 1)[0]
-    return status.lower() if status in ("UNSOLVABLE", "REPLAN") else "pass"
+    return status.lower() if status in _STATUS_WORDS else "pass"
 
 
 def _ledger_append(rec):
@@ -1636,7 +1712,7 @@ def grade(task_id, verdict=None, reason=None, used_new=None, findings=None):
     THIS project `rework` with a reason (a reply A used but had to redo), undo that
     with `pass`, and/or record `used_new` (how A used the reply's NEW items), by
     APPENDING a correction row (see the key comment). rework/pass apply only over
-    pass/rework: fail, redispatch, replan and unsolvable come from code and stand.
+    pass/rework: fail, redispatch, replan, unsolvable and handoff come from code and stand.
     Only fields that would change are written; when none would, nothing is
     appended. Returns (folded row, correction row or None for a no-op); raises
     LookupError (no row) or ValueError (verdict refused, or the ledger lock not
@@ -1743,7 +1819,7 @@ def _flush_held(conn, me, force=False):
             return True
     for mid, _ts, sender, body, task, n_new in held:
         paths = ", ".join(_result_paths(body)) or "?"
-        tail = _summary_suffix(task, sender, n_new, mid, me)
+        tail = _summary_suffix(task, sender, n_new, mid, me, new_types_tag(body))
         note = "" if n_new else ", no peek needed"
         if not _emit(f"DONE #{task} <- {sender} RESULT: {paths} (#{mid}{note}){tail}"):
             return False
@@ -1751,14 +1827,16 @@ def _flush_held(conn, me, force=False):
     return True
 
 
-def pending(hub):
+def pending(hub, reap=True):
     """Tasks `hub` dispatched that are not yet done -> the workers still absent.
     Fan-out is COMPLETE when this is empty. Uses task_done (so 'answered' matches
     done exactly) and derives a lifecycle state per row so the hub can read
-    QUEUED / IN_PROGRESS / STALE / FAILED at a glance. Lazily reaps first.
+    QUEUED / IN_PROGRESS / STALE / FAILED at a glance. Lazily reaps first;
+    reap=False leaves the mailbox untouched (clock --dry-run, #task22.D).
     Returns [(id, recipient, ts, state, attempts)]."""
     with _txn() as conn:
-        _reap_stale(conn, hub=hub)
+        if reap:
+            _reap_stale(conn, hub=hub)
         rows = conn.execute(
             "SELECT t.id, t.recipient, t.ts, t.handled, t.lease_until, t.tombstone, "
             "t.attempts, t.no_requeue, t.last_seen_ts FROM messages t "
@@ -2430,10 +2508,181 @@ def _orphan_exit(me, reason):
 # CLOCK-START and passed milestones and could call a working pane "idle &
 # unchanged". A tick whose watcher was superseded (generation) neither prints
 # nor saves; a failed print sets _clock_stdout_dead so watch() orphan-exits.
+# DeepSeek #task22.D: an unreadable pane is re-probed on a backoff (1, 2, 4,
+# then every 5 min; a new milestone still probes at once), not every tick;
+# after 45 min an open task is re-probed every 30 min and prints STILL-OPEN
+# only for an actionable verdict it has not printed already.
 _CLOCK_EVERY = 60.0
 _CLOCK_MILESTONES = (15, 30, 45)
+_CLOCK_PF_BACKOFF_MAX = 300.0
+_CLOCK_RECHECK = 30 * 60.0
 _CLOCK_BAD = ("QUEUED-STALLED", "IN-PROGRESS-SILENT", "NEEDS-REVIEW")
 _CLOCK_ACT_FLAGS = ("recv_loop", "permission_prompt", "quota_banner", "notice_overlay")
+# 2026-10-20: a worker whose transcript/rollout grew within this window is progressing, and
+# the pane is not read at all (its tail hash moves on spinners and retry countdowns too).
+# 15 min > the 600 s foreground Bash cap, so a long OCR/build is not mistaken for a stall.
+_CLOCK_ACTIVE_S = 15 * 60.0
+
+
+def _clock_active(role):
+    """True / False = the role's transcript or rollout did / did not grow within
+    _CLOCK_ACTIVE_S (ipc_state.activity_age); None = no file known, probe the pane."""
+    try:
+        import ipc_state  # noqa: WPS433 — lives next to ipc.py
+        age, _ = ipc_state.activity_age(role)
+    except Exception:  # noqa: BLE001 — the clock never fails on an optional signal
+        return None
+    return None if age is None else age <= _CLOCK_ACTIVE_S
+
+
+def _activity_text(role):
+    try:
+        import ipc_state  # noqa: WPS433
+        age, _ = ipc_state.activity_age(role)
+    except Exception:  # noqa: BLE001
+        age = None
+    return "act ?" if age is None else f"act {age / 60:.0f}m ago"
+
+
+# 2026-10-21 (user: a role about to run out of its 5h window writes its work down so
+# another role can continue, instead of stopping dead mid-task and losing the work).
+# Every tick reads each pending task's recipient windows (ipc_state: the statusline
+# state for Anthropic roles, the registered rollout for Codex roles, the vendor usage
+# API for Kimi Code and Zhipu roles, cached 60 s; DeepSeek is pay-per-token, no window).
+# Claimed task + a window at _HANDOFF_PCT: the request is typed into the role's pane as
+# a mid-turn message (Claude Code hands it over after the current tool call; Codex
+# steers), never after Ctrl+C or Esc, which interrupt the turn. Queued task: reported
+# only, A cancels and re-routes. The hub's own window prints a line asking A to bring
+# its ledger up to date. Each fires once per task, role and window reset.
+# Thresholds per window (user 2026-10-21): 5h at 90 % (hub 85 %); 7d at 98 % for every
+# role, hub included: 10 % of a week is many 5h windows of work, so 90 % there would hand
+# off far too early, while 2 % still covers writing the file.
+_HANDOFF_PCT = float(os.environ.get("IPC_HANDOFF_PCT", "90"))
+_HANDOFF_HUB_PCT = float(os.environ.get("IPC_HANDOFF_HUB_PCT", "85"))
+_HANDOFF_PCT_7D = float(os.environ.get("IPC_HANDOFF_PCT_7D", "98"))
+
+
+def _handoff_pct(name, base):
+    """Threshold for one window: the 7d window has its own, every other uses `base`."""
+    return _HANDOFF_PCT_7D if name == "7d" else base
+_HANDOFF_RESET_SKIP_S = 10 * 60.0   # reset closer than this: waiting it out costs less than a handoff
+_HANDOFF_CLAIMED = ("IN_PROGRESS", "IN-PROGRESS-SILENT")
+_HANDOFF_QUEUED = ("QUEUED", "QUEUED-STALLED")
+
+
+def _quota_near(role, pct, now_ts):
+    """(name, used, resets_at, resets) of the role's fullest window at or over its threshold
+    (`pct` for 5h and any other window, _HANDOFF_PCT_7D for 7d) whose reset is more than
+    _HANDOFF_RESET_SKIP_S away; None when there is none or no data.
+    A reset already past means the reading predates the reset (a Codex rollout keeps its
+    last value until the next turn): skipped too. Unknown reset time: kept."""
+    try:
+        import ipc_state  # noqa: WPS433
+        wins = ipc_state.snapshot(role)["quota"]
+    except Exception:  # noqa: BLE001 — optional signal, like _clock_active
+        return None
+    best = None
+    for w in wins:
+        try:
+            used = float(w.get("used"))
+            reset = float(w.get("resets_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if used < _handoff_pct(w.get("name"), pct) or (reset and reset - now_ts < _HANDOFF_RESET_SKIP_S):
+            continue
+        if best is None or used > best[1]:
+            best = (w.get("name") or "?", used, w.get("resets_at"), w.get("resets") or "?")
+    return best
+
+
+def _handoff_key(*parts, resets_at):
+    """Once-per-window dedup key. resets_at is bucketed to 10 min: Kimi's reset_time drifts
+    by +-1 s between two reads of the same window (measured 2026-10-21), and the raw value
+    in the key re-typed the request every tick. Unknown reset: None."""
+    try:
+        bucket = int(float(resets_at) // 600) if resets_at else None
+    except (TypeError, ValueError):
+        bucket = None
+    return "@".join(str(p) for p in parts) + f"@{bucket}"
+
+
+def _handoff_path(rid, role):
+    """Per-project IPC state dir: writable for Codex roles (writable_roots) and Claude alike."""
+    return os.path.join(_STATE_DIR, "handoff", f"task-{rid}-{role}.md")
+
+
+def _handoff_text(rid, role, win, path):
+    """One line, typed into the pane. Forward slashes: valid in pwsh, Bash and the Write tool."""
+    p = path.replace("\\", "/")
+    ipc_py = os.path.abspath(__file__).replace("\\", "/")
+    return (f"IPC A: your {win[0]} quota is {win[1]:.0f}% used (resets {win[3]}). Stop task #{rid} "
+            f"after the current step and start no new unit. Write {p} with first line "
+            f"HANDOFF: {p} and then: (1) what is done, with product file paths; (2) what remains, "
+            "next step first; (3) decisions and assumptions made; (4) traps hit. Then run: "
+            f"python {ipc_py} send --from {role} --to A --in-reply-to {rid} --body-file {p} "
+            "and stop. Another role continues from that file.")
+
+
+def _handoff_send(rid, role, win, path, probe_fn):
+    """Type the handoff request into the role's pane. None on success, else why not.
+    A pane under a prompt or notice is left alone: Enter there would answer the dialog."""
+    try:
+        p = probe_fn(role)
+        if p.get("error"):
+            return f"pane unreadable: {p['error']}"
+        if p["verdict"].startswith(("DEAD", "QUOTA", "BLOCKED")):
+            return f"pane {p['verdict']}"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        import ipc_pane_probe  # noqa: WPS433
+        ipc_pane_probe.submit(role, _handoff_text(rid, role, win, path))
+    except Exception as e:  # noqa: BLE001 — reported on the clock line, retried next tick
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
+def _clock_handoff(rid, to, st, t, now_ts, probe_fn, emit, readonly):
+    if not to or st not in _HANDOFF_CLAIMED + _HANDOFF_QUEUED:
+        return
+    win = _quota_near(to, _HANDOFF_PCT, now_ts)
+    if not win:
+        return
+    key = _handoff_key(to, win[0], resets_at=win[2])
+    if t.get("handoff") == key:
+        return
+    head = f"QUOTA-HANDOFF #{rid} -> {to} {win[0]}={win[1]:.0f}%@{win[3]}"
+    if st in _HANDOFF_QUEUED:
+        t["handoff"] = key
+        emit(f"{head} | queued, not started | cancel --task {rid} --by A, re-dispatch to a role "
+             "with room (ipc_quota.py)")
+        return
+    path = _handoff_path(rid, to)
+    if readonly:
+        emit(f"{head} | dry run: would type the handoff request into the pane ({path})")
+        return
+    why = _handoff_send(rid, to, win, path, probe_fn)
+    if why is None:
+        t["handoff"] = key
+        emit(f"{head} | handoff request typed into the pane; expect a HANDOFF reply naming {path} "
+             "| then re-dispatch the rest to a role with room (ipc_quota.py): original brief + that file")
+    elif t.get("handoff_fail") != key:
+        t["handoff_fail"] = key   # said once; the send is retried every tick
+        emit(f"{head} | handoff request NOT sent ({why}); retrying every tick")
+
+
+def _clock_hub_quota(hub, hs, now_ts, emit, readonly):
+    win = _quota_near(hub, _HANDOFF_HUB_PCT, now_ts)
+    if not win:
+        return
+    key = _handoff_key(win[0], resets_at=win[2])
+    if hs.get("handoff") == key:
+        return
+    if not readonly:
+        hs["handoff"] = key
+    emit(f"QUOTA-HANDOFF hub {hub} {win[0]}={win[1]:.0f}%@{win[3]} | bring _A_ledger.md up to date "
+         "now (open tasks, decisions, next step), dispatch nothing new; workers keep running and "
+         "their replies wait in the mailbox")
+
+
 _CLOCK_ABS_PATH = re.compile(r"[A-Za-z]:\\[^\s`'\"()（）,，。;；|<>]+")  # same shape as ipc_brief_lint
 _clock_last_error = None
 _clock_stdout_dead = threading.Event()
@@ -2447,11 +2696,12 @@ def _clock_path(hub):
     return os.path.join(_STATE_DIR, f"_clock_{hub}.json")
 
 
-def _clock_load(hub):
+def _clock_load(hub, part="tasks"):
+    """One part of _clock_<hub>.json: "tasks" (per task id) or "hub" (the hub's own lines)."""
     try:
         with open(_clock_path(hub), encoding="utf-8") as f:
             data = json.load(f)
-        tasks = data.get("tasks") if isinstance(data, dict) else None
+        tasks = data.get(part) if isinstance(data, dict) else None
         return tasks if isinstance(tasks, dict) else {}
     except (OSError, ValueError):
         return {}
@@ -2468,17 +2718,23 @@ def _clock_entry(raw):
     out = {"reported": milestones(t.get("reported")),   # milestones with a verdict
            "pf": milestones(t.get("pf")),               # milestones whose PROBE-FAILED was printed
            "bad": [b for b in bad if isinstance(b, str)] if isinstance(bad, list) else []}
-    for k in ("hash", "to"):
+    for k in ("hash", "to", "last_recheck", "handoff", "handoff_fail"):
         if isinstance(t.get(k), str):
             out[k] = t[k]
+    # Whitelist: a field not copied here is dropped at the next load (#task22.D NEW).
+    if isinstance(t.get("pf_fail"), int) and t["pf_fail"] > 0:
+        out["pf_fail"] = t["pf_fail"]
+    for k in ("pf_next", "recheck_at"):
+        if isinstance(t.get(k), (int, float)) and not isinstance(t.get(k), bool):
+            out[k] = float(t[k])
     return out
 
 
-def _clock_save(hub, tasks):
+def _clock_save(hub, tasks, hub_state=None):
     path = _clock_path(hub)
     tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"tasks": tasks}, f)
+        json.dump({"tasks": tasks, "hub": hub_state or {}}, f)
     os.replace(tmp, path)
 
 
@@ -2495,6 +2751,76 @@ def _clock_mark_owner(hub):
             f.write(f"{os.getpid()}\n")
     except OSError:
         pass
+
+
+def _supervisor_path(hub):
+    return os.path.join(_STATE_DIR, f"_supervisor_{hub}.json")
+
+
+def _supervisor_events_path(hub):
+    return os.path.join(_STATE_DIR, f"_supervisor_{hub}.events")
+
+
+def _supervisor_alive(hub):
+    """ipc_supervisor.py heartbeat fresh (within three of its intervals + 30 s) -> its dict,
+    else None. While it is alive the hub watch relays its event lines instead of ticking the
+    clock itself, and `clock` refuses (2026-10-20: the clock left the model session)."""
+    try:
+        with open(_supervisor_path(hub), encoding="utf-8") as f:
+            d = json.load(f)
+        age = time.time() - float(d.get("ts", 0))
+        return d if 0 <= age < 3 * float(d.get("interval", _CLOCK_EVERY)) + 30 else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _relay_offset_path(hub):
+    return os.path.join(_STATE_DIR, f"_supervisor_{hub}.relay")
+
+
+def _relay_supervisor(hub):
+    """Print the supervisor's event lines not yet relayed (complete lines only); returns
+    the number printed. The byte offset persists in _supervisor_<hub>.relay so a relaunched
+    watch (or the Codex form's repeated `clock --block`) continues where the last one stopped;
+    with no offset file the relay starts at EOF (first sight: history is not replayed)."""
+    p = _supervisor_events_path(hub)
+    try:
+        size = os.path.getsize(p)
+    except OSError:
+        return 0
+    offset = None
+    try:
+        with open(_relay_offset_path(hub), encoding="utf-8") as f:
+            offset = int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        pass
+    if offset is None or offset > size:
+        offset = size
+    if size > offset:
+        try:
+            with open(p, "rb") as f:
+                f.seek(offset)
+                chunk = f.read(size - offset)
+        except OSError:
+            return 0
+        nl = chunk.rfind(b"\n")
+        printed = 0
+        if nl >= 0:                         # a partial last line waits for its newline
+            for line in chunk[:nl].decode("utf-8", "replace").splitlines():
+                if line.strip():
+                    if not _emit(line):
+                        _clock_stdout_dead.set()
+                        return printed
+                    printed += 1
+            offset += nl + 1
+    else:
+        printed = 0
+    try:
+        with open(_relay_offset_path(hub), "w", encoding="utf-8") as f:
+            f.write(str(offset))
+    except OSError:
+        pass
+    return printed
 
 
 def _clock_watch_owns(hub):
@@ -2580,7 +2906,7 @@ def _clock_still_open(rid):
         return bool(row) and row[0] is None and not task_done(conn, rid)
 
 
-def _clock_task(rid, to, ts, st, attempts, t, probe_fn, now, emit):
+def _clock_task(rid, to, ts, st, attempts, t, probe_fn, now, emit, readonly=False):
     if t.get("to") not in (None, to):
         t.pop("hash", None)   # redelivered to another role: its pane needs its own baseline
     if to:
@@ -2589,21 +2915,39 @@ def _clock_task(rid, to, ts, st, attempts, t, probe_fn, now, emit):
     if st in _CLOCK_BAD and bad_key not in t["bad"]:
         emit(f"STALLED TASK: #{rid} -> {to} {st} attempts={attempts}")
         t["bad"].append(bad_key)
+    _clock_handoff(rid, to, st, t, now.timestamp(), probe_fn, emit, readonly)   # every tick, not per milestone
     try:
         age = (now - datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")).total_seconds() / 60
     except (TypeError, ValueError):
         return
     due = [m for m in _CLOCK_MILESTONES if age >= m and m not in t["reported"]]
+    now_ts = now.timestamp()
     if not due and "hash" in t:
+        if _CLOCK_MILESTONES[-1] in t["reported"]:
+            _clock_recheck(rid, to, ts, st, attempts, t, probe_fn, now, age, emit)
         return  # between milestones: no probe
+    pf_wait = t.get("pf_next", 0) - now_ts
+    if 0 < pf_wait <= _CLOCK_PF_BACKOFF_MAX and all(m in t["pf"] for m in due):
+        return  # unreadable at the last probe: retry on the backoff; a new milestone probes at once
+    if due and to and max(due) < _CLOCK_MILESTONES[-1] and _clock_active(to):
+        # progressing (transcript/rollout grew recently): the milestone passes without a pane
+        # read; the 45-min reassign rule still gets its probe
+        t["reported"] = sorted(set(t["reported"]) | set(due))
+        return
     p = probe_fn(to) if to else None
     h = p.get("tail_hash") if p else None
+    if h:
+        t.pop("pf_fail", None)
+        t.pop("pf_next", None)
+    else:
+        t["pf_fail"] = t.get("pf_fail", 0) + 1
+        t["pf_next"] = now_ts + min(60 * 2 ** (t["pf_fail"] - 1), _CLOCK_PF_BACKOFF_MAX)
     if "hash" in t:
         changed = h is not None and h != t["hash"]
     elif h:
         changed = None  # baseline now: only history-free verdicts may fire this tick
     elif not due:
-        return  # baseline probe failed before any milestone: retry next tick
+        return  # baseline probe failed before any milestone: retry on the backoff
     else:
         changed = False  # no baseline and still unreadable at a milestone -> PROBE-FAILED
     if due:
@@ -2615,7 +2959,7 @@ def _clock_task(rid, to, ts, st, attempts, t, probe_fn, now, emit):
             flags = ",".join(p["flags"]) if p and p.get("flags") else ("-" if p else "probe-failed")
             tail = "?" if changed is None else ("CHANGED" if changed else "SAME")
             emit(f"REPLY-CLOCK #{rid} -> {to} {m}m (since {ts[11:16]}) | ctx {ctx} "
-                 f"flags={flags} tail={tail} | {action} | {_artifact_text(_artifact_best(rid), now)}")
+                 f"flags={flags} tail={tail} {_activity_text(to)} | {action} | {_artifact_text(_artifact_best(rid), now)}")
         if failed:
             t["pf"] = sorted(set(t["pf"]) | {m})   # said once; the milestone stays due for a real verdict
         elif action or changed is not None:
@@ -2625,12 +2969,47 @@ def _clock_task(rid, to, ts, st, attempts, t, probe_fn, now, emit):
         t["hash"] = h
 
 
-def clock_tick(hub, probe_fn=None, now=None, is_current=None):
+def _clock_recheck(rid, to, ts, st, attempts, t, probe_fn, now, age, emit):
+    """Past the last milestone: probe every _CLOCK_RECHECK and print STILL-OPEN
+    for an actionable verdict, once per (state, attempts, verdict). A working or
+    changed pane stays silent; so does a repeat (#task22.D)."""
+    now_ts = now.timestamp()
+    wait = t.get("recheck_at", 0) - now_ts
+    if "recheck_at" not in t or wait > _CLOCK_RECHECK:
+        t["recheck_at"] = now_ts + _CLOCK_RECHECK   # first pass after 45 min, or a clock set back
+        return
+    if wait > 0:
+        return
+    t["recheck_at"] = now_ts + _CLOCK_RECHECK
+    if to and _clock_active(to):
+        t.pop("last_recheck", None)         # progressing: no pane read, a later relapse speaks
+        return
+    p = probe_fn(to) if to else None
+    h = p.get("tail_hash") if p else None
+    changed = h is not None and h != t.get("hash")
+    if h:
+        t["hash"] = h
+    action = _clock_action(p, 0, changed)   # m=0: the 45-min reassign text is not repeated
+    if not action:
+        t.pop("last_recheck", None)         # healthy again: a later relapse speaks
+        return
+    key = f"{st}@{attempts}@{action.split(' (')[0]}"
+    if key == t.get("last_recheck") or not _clock_still_open(rid):
+        return
+    t["last_recheck"] = key
+    ctx = "?" if not p or p.get("ctx_left") is None else f'{p["ctx_left"]}%'
+    flags = ",".join(p["flags"]) if p and p.get("flags") else ("-" if p else "probe-failed")
+    emit(f"STILL-OPEN #{rid} -> {to} {age:.0f}m (since {ts[11:16]}) | ctx {ctx} flags={flags} "
+         f"tail={'CHANGED' if changed else 'SAME'} {_activity_text(to)} | {action} | {_artifact_text(_artifact_best(rid), now)}")
+
+
+def clock_tick(hub, probe_fn=None, now=None, is_current=None, readonly=False):
     """One pass of the hub reply clock; returns the lines it printed. Never
     raises (the hub's watch thread calls it). is_current() False (watcher
     superseded) aborts the tick before any print or save. A failed print sets
     _clock_stdout_dead. Errors print one CLOCK-ERROR line per distinct message;
-    a task whose own step fails does not stop the others."""
+    a task whose own step fails does not stop the others. readonly=True
+    (clock --dry-run) neither reaps the mailbox nor saves clock state."""
     global _clock_last_error
     printed = []
 
@@ -2649,19 +3028,27 @@ def clock_tick(hub, probe_fn=None, now=None, is_current=None):
             probe_fn = ipc_pane_probe.probe
         now = now or datetime.now()
         tasks = _clock_load(hub)
+        hs = {k: v for k, v in _clock_load(hub, "hub").items() if k == "handoff" and isinstance(v, str)}
         live = {}
-        for rid, to, ts, st, attempts in pending(hub):
+        for rid, to, ts, st, attempts in (pending(hub, reap=False) if readonly else pending(hub)):
             t = _clock_entry(tasks.get(str(rid)))
             live[str(rid)] = t
             try:
-                _clock_task(rid, to, ts, st, attempts, t, probe_fn, now, emit)
+                _clock_task(rid, to, ts, st, attempts, t, probe_fn, now, emit, readonly)
             except _ClockAbort:
                 raise
             except Exception as e:  # noqa: BLE001 — one task's failure must not blind the rest
                 errors.append(f"#{rid} {type(e).__name__}: {e}")
+        try:
+            _clock_hub_quota(hub, hs, now.timestamp(), emit, readonly)
+        except _ClockAbort:
+            raise
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"hub quota {type(e).__name__}: {e}")
         if is_current is not None and not is_current():
             return printed
-        _clock_save(hub, live)  # finished tasks drop out here
+        if not readonly:
+            _clock_save(hub, live, hs)  # finished tasks drop out here
     except _ClockAbort:
         return printed
     except Exception as e:  # noqa: BLE001 — the clock must never take the hub's watch down
@@ -2678,14 +3065,25 @@ def clock_tick(hub, probe_fn=None, now=None, is_current=None):
     return printed
 
 
-def clock_loop(hub, interval, once=False, block=False, timeout=580):
+def clock_loop(hub, interval, once=False, block=False, timeout=580, dry_run=False):
     """`ipc.py clock`: the reply clock as its own process, for a hub whose
     receiver is not watch() (the Codex recv --json supervisor). Claude's watch
     --me <hub> runs it built in. --block follows recv --block's contract for
     that supervisor: exit 0 right after a tick that printed, exit 2 with no
     output at --timeout. Exit 3 = superseded by a newer clock process (one
     line, do not restart); exit 1 = refused (the hub's watch already runs the
-    clock) or stdout dead. Returns the exit code."""
+    clock) or stdout dead. --dry-run: one snapshot for a human, allowed while
+    the watch owns the clock (no generation bump, no reap, no state write; due
+    probes still run, so do not loop it). Returns the exit code."""
+    if dry_run:
+        _emit(f"CLOCK DRY RUN for {hub} (no state written, mailbox not reaped; due probes still run)")
+        tasks = _clock_load(hub)
+        for rid, to, ts, st, attempts in pending(hub, reap=False):
+            t = _clock_entry(tasks.get(str(rid)))
+            _emit(f"  #{rid} -> {to} {st} attempts={attempts} since {ts[11:16]} "
+                  f"reported={t['reported']} probe-failed={t['pf']}")
+        clock_tick(hub, readonly=True)
+        return 1 if _clock_stdout_dead.is_set() else 0
     with _conn() as conn:
         my_gen = _bump_gen(conn, f"clock-{hub}")  # a newer clock process retires this one
 
@@ -2697,12 +3095,21 @@ def clock_loop(hub, interval, once=False, block=False, timeout=580):
         return 1
     deadline = time.time() + timeout
     while True:
-        if _clock_watch_owns(hub):
+        if _supervisor_alive(hub):
+            # 2026-10-20: ipc_supervisor.py ticks out of session. --once / --block become a
+            # relay of its event lines (same exit contract, so the Codex form's receiver
+            # loop needs no change); a bare `clock` has nothing to do and refuses.
+            if not (once or block):
+                _emit(f"CLOCK REFUSED for {hub}: ipc_supervisor.py runs the reply clock (status: python ~/.claude/ipc/ipc_supervisor.py status)")
+                return 1
+            lines = _relay_supervisor(hub)
+        elif _clock_watch_owns(hub):
             # Two clocks on one mailbox overwrite each other's state (#task7.D);
             # checked every tick, so a watch started later takes over (#task9.D N1).
             _emit(f"CLOCK REFUSED for {hub}: `watch --me {hub}` runs the reply clock built in")
             return 1
-        lines = clock_tick(hub, is_current=current)
+        else:
+            lines = clock_tick(hub, is_current=current)
         if _clock_stdout_dead.is_set():
             return 1
         if once or (block and lines):
@@ -2886,12 +3293,11 @@ def watch(me, interval, allow_file_stdout=False):
                     # a bare `python ipc.py` copy-pasted from this signal
                     # fails (ipc.py is not in the project cwd).
                     tag = ""
-                    if result and result.split(":", 1)[0] in ("UNSOLVABLE", "REPLAN"):
+                    if result and result.split(":", 1)[0] in _STATUS_WORDS:
                         tag = f" [{result.split(':', 1)[0]}]"
                     if mtype in ("reply", "fail") and in_reply_to is not None:
                         # 2026-10-17: stored NEW item count + the quotable anchor
-                        tag += ((f" NEW {n_new}" if n_new else "")
-                                + f" anchor {_anchor(in_reply_to, sender)}")
+                        tag += _new_tag(n_new, body) + f" anchor {_anchor(in_reply_to, sender)}"
                     if not _emit(
                             f"NEW MSG #{mid} from {sender} ({len(body)} chars){tag} "
                             f'— read full: python "{os.path.abspath(__file__)}" '
@@ -2907,16 +3313,21 @@ def watch(me, interval, allow_file_stdout=False):
                 raise _StdoutDead("reply-clock line")
             if me == HUB and time.time() - clock_at >= _CLOCK_EVERY:
                 clock_at = time.time()
-                _clock_mark_owner(HUB)  # from this loop, so a slow tick cannot age it
-                if not (clock_thread and clock_thread.is_alive()):
-                    # A daemon thread, outside the claim transaction (pending()
-                    # opens its own): a probe stuck on its 25 s wezterm timeout
-                    # must not stall this loop's heartbeat and claims (#task5.E).
-                    # The tick checks the generation before printing or saving.
-                    clock_thread = threading.Thread(
-                        target=clock_tick, args=(HUB,), daemon=True,
-                        kwargs={"is_current": lambda: _gen_still(me, my_gen)})
-                    clock_thread.start()
+                if _supervisor_alive(HUB):
+                    # 2026-10-20: ipc_supervisor.py ticks the clock out of session; this loop
+                    # only relays its actionable lines (a turn per real event, none for ticking)
+                    _relay_supervisor(HUB)
+                else:
+                    _clock_mark_owner(HUB)  # from this loop, so a slow tick cannot age it
+                    if not (clock_thread and clock_thread.is_alive()):
+                        # A daemon thread, outside the claim transaction (pending()
+                        # opens its own): a probe stuck on its 25 s wezterm timeout
+                        # must not stall this loop's heartbeat and claims (#task5.E).
+                        # The tick checks the generation before printing or saving.
+                        clock_thread = threading.Thread(
+                            target=clock_tick, args=(HUB,), daemon=True,
+                            kwargs={"is_current": lambda: _gen_still(me, my_gen)})
+                        clock_thread.start()
             if claimed_task:
                 # 2026-09-21 (#1521 root cause): the Monitor host caps a watcher
                 # at 30 min (Claude Code 2.1.278 clamps timeout_ms to 1800000)
@@ -3125,7 +3536,18 @@ def main():
     r.add_argument("--block", action="store_true",
                    help="wait for a message instead of returning NONE immediately")
     r.add_argument("--timeout", type=int, default=580,
-                   help="max seconds to wait in --block mode (stay under bash's 600s cap)")
+                   help="max seconds to wait in --block mode (a foreground Bash call is "
+                        "capped at 600s; a background Bash host is not, and the idle "
+                        "park uses --signal-only --timeout 3500)")
+    r.add_argument("--signal-only", action="store_true", dest="signal_only",
+                   help="IDLE PARK (2026-10-22, Claude workers; from Agensh's event-driven "
+                        "runtime): print watch-style `NEW MSG #id ...` signals instead of "
+                        "bodies (read them with peek --id), and keep the heartbeat on "
+                        "return because the caller re-parks on its next turn (false-alive "
+                        "is bounded by --max-age). Host it as a BACKGROUND Bash with a long "
+                        "--timeout: it costs no turn while parked and exits (which notifies "
+                        "the session) on delivery or timeout; a delivered task starts the "
+                        "busy beater as any recv does. Ignored with --json.")
     r.add_argument("--interval", type=float, default=2.0,
                    help="seconds between polls in --block mode")
     r.add_argument("--keep-heartbeat", action="store_true",
@@ -3175,6 +3597,9 @@ def main():
     ck.add_argument("--interval", type=float, default=_CLOCK_EVERY,
                     help=f"seconds between ticks (default {_CLOCK_EVERY:.0f})")
     ck.add_argument("--once", action="store_true", help="one tick, then exit")
+    ck.add_argument("--dry-run", action="store_true",
+                    help="one read-only snapshot (open tasks, their milestones, any due verdict); "
+                         "allowed while `watch --me <hub>` owns the clock: no state write, no reap")
     ck.add_argument("--block", action="store_true",
                     help="for a supervisor that reads output at process exit (Codex): tick every "
                          "--interval, exit 0 right after a tick that printed, exit 2 with no output "
@@ -3209,7 +3634,7 @@ def main():
              "(run from the project root): --verdict rework --reason R marks a reply "
              "A used but had to rework; --verdict pass undoes it; --used-new records "
              "how A used the reply's NEW items. Automatic verdicts (fail, redispatch, "
-             "replan, unsolvable) are set by code and are not overridden. Appends a "
+             "replan, unsolvable, handoff) are set by code and are not overridden. Appends a "
              "correction row for the newest row of the task; the ledger is never "
              "rewritten and every reader folds corrections in (latest wins per field).")
     gr.add_argument("--task", type=int, required=True)
@@ -3242,6 +3667,23 @@ def main():
     tk.add_argument("--json", action="store_true",
                     help="emit one JSON object: id/state/terminal/from/to/ts/"
                          "attempts/result/claimed_ts/replies")
+
+    bd = sub.add_parser("board",
+                        help="typed NEW items (FAIL / FACT / OBSERVED) across this mailbox's "
+                             "linked replies, oldest first; read-only, claims nothing "
+                             "(2026-10-22). The hub reads `board --type FAIL` before "
+                             "writing a brief so no role retries a falsified approach.")
+    bd.add_argument("--type", default=",".join(NEW_TYPES),
+                    help="comma list of FAIL/FACT/OBSERVED (default all three), or `all` "
+                         "to include untyped items")
+    bd.add_argument("--grep", action="append", default=[],
+                    help="case-insensitive substring filter on the item text; repeat the "
+                         "flag for AND, write `a|b` inside one value for OR")
+    bd.add_argument("--since", default=None,
+                    help="ISO date or timestamp; only replies at or after it")
+    bd.add_argument("--task", type=int, default=None, help="items of one task id only")
+    bd.add_argument("--json", action="store_true",
+                    help="one JSON object per item: anchor/type/text/id/ts/task/from")
 
     pd = sub.add_parser("pending",
                         help="list tasks the hub dispatched that have no reply yet "
@@ -3401,8 +3843,16 @@ def main():
                                   f"`UNSOLVABLE: <why>` when it cannot be done, "
                                   f"`REPLAN: <wrong premise>` when the brief itself is wrong)")
                         if row and row[0] in ("reply", "fail") and row[4]:
-                            print(f"ANCHOR {row[4]}  NEW items={row[5] or 0}  (the hub can "
-                                  f"quote the anchor in later briefs)")
+                            types = new_types_tag(args.body) if row[5] else ""
+                            print(f"ANCHOR {row[4]}  NEW items={row[5] or 0}"
+                                  + (f" ({types})" if types else "")
+                                  + "  (the hub can quote the anchor in later briefs)")
+                            for i, (_k, text) in enumerate(new_items(args.body), 1):
+                                if len(text) > _NEW_MAX_CHARS:
+                                    print(f"NEW-LONG item {i}: {len(text)} chars > {_NEW_MAX_CHARS} "
+                                          f"— keep an item's first line short (it is what the hub "
+                                          f"and later briefs quote); put the detail on indented "
+                                          f"lines below it")
                 else:
                     print(f"DUP #{mid}  {args.sender}->{tgt}  "
                           f"(submit-id {args.submit_id!r} already queued/answered; "
@@ -3441,7 +3891,7 @@ def main():
         _require_valid(args.me, "--me")
         if args.block:
             rows = recv_block(args.me, args.timeout, args.interval, args.count,
-                              keep_heartbeat=args.keep_heartbeat)
+                              keep_heartbeat=args.keep_heartbeat or args.signal_only)
         else:
             rows = recv(args.me)
         if not rows:
@@ -3461,6 +3911,20 @@ def main():
                 # barrier could add exit 4; 3 stays reserved for send REFUSED.)
                 sys.exit(2)
         else:
+            if args.signal_only and not args.json:
+                # Idle park: the same fixed-size signal watch() prints, so the
+                # worker procedure is one shape (signal -> peek --id -> ack -> work).
+                # Rows are claimed already; bodies stay for peek.
+                for mid, ts, sender, body, mtype, irt, sess, result, n_new in rows:
+                    tag = ""
+                    if result and result.split(":", 1)[0] in _STATUS_WORDS:
+                        tag = f" [{result.split(':', 1)[0]}]"
+                    if mtype in ("reply", "fail") and irt is not None:
+                        tag += _new_tag(n_new, body) + f" anchor {_anchor(irt, sender)}"
+                    print(f"NEW MSG #{mid} from {sender} ({len(body or '')} chars){tag} "
+                          f'— read full: python "{os.path.abspath(__file__)}" '
+                          f"peek --me {args.me} --id {mid}")
+                rows = []
             if args.json:
                 # Reserve the number, persist the complete batch, THEN print: the
                 # rows are already claimed, and a broken or capped output channel
@@ -3483,7 +3947,9 @@ def main():
                                     "paths": _result_paths(body) if (mtype == "reply" and result == "CLEAN") else [],
                                     # 2026-10-17: quotable anchor + NEW item count of a linked reply
                                     "anchor": _anchor(irt, sender) if (irt is not None and mtype in ("reply", "fail")) else None,
-                                    "new_items": n_new or 0},
+                                    "new_items": n_new or 0,
+                                    # 2026-10-22: typed tally (`FAIL 1, FACT 2`), "" when untyped
+                                    "new_types": new_types_tag(body) if n_new else ""},
                                    ensure_ascii=False)
                         for mid, ts, sender, body, mtype, irt, sess, result, n_new in rows]
 
@@ -3519,13 +3985,14 @@ def main():
                     paths = ", ".join(_result_paths(body)) or "?"
                     note = "" if n_new else ", body via peek if needed"
                     print(f"DONE #{irt} <- {sender} RESULT: {paths} (#{mid}{note})"
-                          + _summary_suffix(irt, sender, n_new, mid, args.me))
+                          + _summary_suffix(irt, sender, n_new, mid, args.me,
+                                            new_types_tag(body)))
                 else:
                     # Linked reply/fail: same NEW count + anchor tags as watch's
                     # NEW MSG line (the body follows in full, so no peek hint).
                     tag = ""
                     if irt is not None and mtype in ("reply", "fail"):
-                        tag = (f" NEW {n_new}" if n_new else "") + f" anchor {_anchor(irt, sender)}"
+                        tag = _new_tag(n_new, body) + f" anchor {_anchor(irt, sender)}"
                     print(f"#{mid} [{ts}] {sender}{tag}: {body}")
     elif args.cmd == "peek" and (args.batch is not None or args.batches):
         _require_valid(args.me, "--me")
@@ -3581,8 +4048,11 @@ def main():
                   f"bodies via peek --id", file=err)
     elif args.cmd == "clock":
         _require_valid(args.hub, "--hub")
+        if args.dry_run and args.block:
+            print("clock: --dry-run is a one-off snapshot; it does not combine with --block")
+            sys.exit(2)
         sys.exit(clock_loop(args.hub, args.interval, once=args.once,
-                            block=args.block, timeout=args.timeout))
+                            block=args.block, timeout=args.timeout, dry_run=args.dry_run))
     elif args.cmd == "watch":
         _require_valid(args.me, "--me")
         watch(args.me, args.interval,
@@ -3768,6 +4238,32 @@ def main():
         # scripts gating on it agree with the send gate. Busy-only stays 1,
         # unchanged from the original semantics.
         sys.exit(0 if (alive and not squatter) else 1)
+    elif args.cmd == "board":
+        want = (None if args.type.strip().lower() == "all"
+                else {t.strip().upper() for t in args.type.split(",") if t.strip()})
+        unknown = sorted((want or set()) - set(NEW_TYPES))
+        if unknown:
+            print(f"BOARD  unknown type(s) {unknown}; known: {', '.join(NEW_TYPES)} or all")
+            sys.exit(2)
+        out = []
+        for mid, ts, sender, body, irt in board_rows(args.since, args.task):
+            for kind, text in new_items(body):
+                if want is not None and kind not in want:
+                    continue
+                if not all(any(alt.strip().lower() in text.lower()
+                               for alt in g.split("|") if alt.strip())
+                           for g in args.grep):
+                    continue
+                out.append({"anchor": _anchor(irt, sender), "type": kind, "text": text,
+                            "id": mid, "ts": ts, "task": irt, "from": sender})
+        if args.json:
+            for o in out:
+                print(json.dumps(o, ensure_ascii=False))
+        elif not out:
+            print("NONE")
+        else:
+            for o in out:
+                print(f"{o['anchor']:<14} {o['type'] or '-':<9} {o['text']}  (#{o['id']} {o['ts']})")
     elif args.cmd == "task":
         info = task_status(args.task)
         if args.json:

@@ -8,6 +8,11 @@ wrong lens — the pane status line is the only truthful capacity signal. This p
 it so ipc_dispatch.ps1 (gate) and the hub reply clock (ipc.py clock_tick) never rely on a
 human reading a percentage.
 
+Files first (2026-10-20): context %, quota windows and activity age come from ipc_state.py
+(statusline.js state file for claude roles, the registered rollout for codex roles); the
+status-line regexes below are the FALLBACK when no fresh file exists. Banner / prompt /
+notice / dead-TUI flags still need the pane text - those shapes exist nowhere else.
+
 Status-line formats handled (verified 2026-08-30 on fleet1; 2026-10-18 rows added):
   codex          : "gpt-6-luna max · Context 79% left · ~\\Downloads\\..."
   codex (10-18)  : "GPT-6-Astra medium · ~ · 5h 92% left · weekly 99% left · Context 15% used"   <- USED %
@@ -28,8 +33,11 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ipc_state  # noqa: E402  (same dir; file-based ctx/quota/activity)
 
 HOME = os.path.expanduser("~")
 WEZTERM = r"C:\Program Files\WezTerm\wezterm.exe"
@@ -156,6 +164,18 @@ def resolve(fleet, pane_id):
     return sock, pane_id + int(ov.get("pane_offset", 0))
 
 
+def submit(role, text, delay=1.2):
+    """Type `text` into the role's pane, pause, then a lone Enter (Python twin of Submit-PaneText
+    in ipc_wezterm_common.ps1: Claude Code's paste guard turns an Enter inside a fast burst into
+    a newline). No Ctrl+C / Esc first: both interrupt a running turn. Used by the hub clock's
+    quota handoff request (ipc.py _clock_handoff, 2026-10-21)."""
+    fleet, pane = pane_for(role)
+    sock, eff = resolve(fleet, pane)
+    _wez(sock, "send-text", "--pane-id", str(eff), "--no-paste", "--", text)
+    time.sleep(delay)
+    _wez(sock, "send-text", "--pane-id", str(eff), "--no-paste", "--", "\r")
+
+
 def pane_text(fleet, pane_id):
     sock, eff = resolve(fleet, pane_id)
     r = subprocess.run([WEZTERM, "cli", "--no-auto-start", "get-text", "--pane-id", str(eff)],
@@ -236,13 +256,24 @@ def verdict(ctx, flags):
 
 def probe(role):
     out = {"role": role.upper(), "fleet": None, "pane_id": None, "ctx_left": None, "ctx_src": None,
-           "flags": [], "verdict": "UNKNOWN", "reset_hint": None, "tail_hash": None, "last_line": "", "error": None}
+           "flags": [], "verdict": "UNKNOWN", "reset_hint": None, "tail_hash": None, "last_line": "", "error": None,
+           "quota": [], "activity_age_s": None, "activity_path": None, "state_age_s": None}
+    try:
+        snap = ipc_state.snapshot(role)   # file-based first; never raises on missing files
+        out.update(quota=snap["quota"], activity_age_s=snap["activity_age_s"],
+                   activity_path=snap["activity_path"], state_age_s=snap["state_age_s"])
+        if snap["ctx_left"] is not None:
+            out.update(ctx_left=snap["ctx_left"], ctx_src="statefile" if snap["kind"] == "claude" else "rollout")
+    except Exception as exc:              # a broken state file must not hide the pane
+        out["state_error"] = f"{type(exc).__name__}: {exc}"
     try:
         fleet, pid = pane_for(role)
         out["fleet"], out["pane_id"] = fleet, pid
         ctx, src, flags, th, last = parse(pane_text(fleet, pid))
-        out.update(ctx_left=ctx, ctx_src=src, flags=flags, tail_hash=th, last_line=last,
-                   verdict=verdict(ctx, flags), reset_hint=getattr(parse, "last_reset_hint", None))
+        if out["ctx_left"] is None:       # no fresh file: the screen regex is the fallback
+            out.update(ctx_left=ctx, ctx_src=src)
+        out.update(flags=flags, tail_hash=th, last_line=last,
+                   verdict=verdict(out["ctx_left"], flags), reset_hint=getattr(parse, "last_reset_hint", None))
     except Exception as exc:              # probe failure is data, never a crash
         out["error"] = f"{type(exc).__name__}: {exc}"
     return out
@@ -253,7 +284,11 @@ def human(p):
     fl = ",".join(p["flags"]) or "-"
     err = f'  err={p["error"]}' if p["error"] else ""
     rh = f'  reset={p["reset_hint"]}' if p.get("reset_hint") else ""
-    return f'{p["role"]:<2} pane={p["pane_id"]} ctx_left={ctx:<4} verdict={p["verdict"]:<14} flags={fl}{rh}{err}'
+    act = "?" if p.get("activity_age_s") is None else f'{p["activity_age_s"] / 60:.0f}m'
+    q = " ".join(f'{w["name"]}={w["used"]:.0f}%' for w in p.get("quota") or [] if w.get("used") is not None)
+    q = f"  quota[{q}]" if q else ""
+    return (f'{p["role"]:<2} pane={p["pane_id"]} ctx_left={ctx:<4} ({p["ctx_src"] or "-"}) '
+            f'verdict={p["verdict"]:<14} flags={fl}  act={act}{q}{rh}{err}')
 
 
 def main():

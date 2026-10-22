@@ -70,8 +70,10 @@ rules (guard-safe constraints verbatim; preprocessed inputs ship as files).
    all in context). A then runs the 15-minute reply clock from
    `~/.claude/commands/main.md` § A 的职责边界与节奏: no reply at 15 min →
    inspect; working normally → one more 15 min; stalled/abnormal → act now;
-   two extensions max. Worker quota self-reporting is deferred (SKILL.md
-   caution 14).
+   two extensions max. Workers do not self-report quota; the hub clock asks a
+   role near the end of its window for a handoff file (operational-cautions.md
+   caution 14, 2026-10-21). The flush rule is what protects D, the one role
+   without a window, and any role the request reaches too late.
    **Enforced by code since 2026-08-30:** `ipc_dispatch.ps1` refuses a brief
    without a `预算: N 分钟` line (N <= 15), whose header role differs from
    `-Role`, whose `UNITS: n` x measured min/unit exceeds the budget, whose
@@ -96,6 +98,49 @@ rules (guard-safe constraints verbatim; preprocessed inputs ship as files).
    `ipc_dispatch.ps1` appends both (RESULT / UNSOLVABLE / REPLAN, knowledge
    cutoff). On a `[REPLAN]` reply, A fixes the premise and writes a new brief;
    on `[UNSOLVABLE]`, A reroutes or reports — never re-sends the same brief.
+6. **Shared view, separate writers, central ruling** (user decision
+   2026-10-22, from the AI财务分析 Anthropic case post-mortem: 69 briefs, 17
+   review rounds, most bytes were restated background and receipts repeating
+   briefs). The mailbox is the doorbell; the content lives in files that every
+   role can read and exactly one role writes:
+   - **Case brief** (extends rule 3): A writes one file per case holding the
+     background every role needs (question and deliverable, outline, units and
+     calibers, evidence tiers and source-list path, version boundary, roster,
+     change log, and a **已证伪路径** section: the project's `FAIL:` NEW items
+     from `ipc.py board --type FAIL`, refreshed before each brief — 2026-10-22,
+     from Agensh's typed shared-context board). Briefs cite `见案件简报 §n`
+     instead of restating it. What the
+     user-level rules require verbatim in every brief (guard-safe constraints,
+     preprocessed-input paths, `完成判据:`) stays in the brief.
+   - **Read-only board**: A keeps one small status index. Two state axes, never
+     merged: execution state copied verbatim from `ipc.py task --id N`
+     (QUEUED / IN_PROGRESS / DONE / FAILED / CANCELLED / NEEDS-REVIEW / STALE /
+     UNKNOWN; NEEDS-REVIEW and STALE mean "A must act", never "in progress" or
+     "failed") and acceptance state from A or the reviewer (`待验收 / 需修改 /
+     已接受`). A DONE mailbox task means "replied", not "usable". Task ids are
+     stable: re-dispatching the same work to another role changes the current
+     message id and owner, never the task id; earlier message ids are history.
+     The board holds status lines only; content stays in the task files.
+   - **One file, one writer.** Reviewer findings and author dispositions are
+     two files that point at each other by stable issue ids (`R<round>-<n>`,
+     never renumbered, never table row numbers); A's ruling is a third. Nobody
+     prevents overwrites by "editing only my column" of a shared table — two
+     file-tool models reading an old version and writing back still clobber.
+   - **Version boundary**: drafts are visible but not citable; the version a
+     reply names in `RESULT: <path>` is what downstream tasks use. `RESULT:`
+     names a path, so an in-place edit silently hands downstream the new
+     draft: the submitted file stays untouched while anything depends on it,
+     edits go to a new file name (version or timestamp) and a new `RESULT:`;
+     if that is impossible, A pauses the affected tasks until the re-submit.
+     A change note alone protects nothing. When a shared caliber changes, A logs
+     it in the case brief and sends one notice to every affected in-flight task.
+   - Roles never dispatch to each other; assignment and cross-role conflicts
+     stay with A. No shared-write tables, no file watchers: the existing
+     dispatch, wake, reply-correlation, `task --id` and RESULT path are enough.
+   Project-level templates (case brief, board, findings/disposition files) live
+   with the project; this rule names none. Acceptance of the change is judged
+   on outcomes, not bytes: less hub restating and re-entry, less waiting and
+   rework, no wrong-version reads or missed acceptance.
 
 ## Capacity-aware dispatch (hub A, adopted 2026-08-19)
 
@@ -136,11 +181,13 @@ Dispatch policy:
   predicted duration < time to reset; long, non-idempotent or unbounded work is checkpointed
   to files and goes to the role with the most time left, or to D (the only pay-per-token
   role) in short must-succeed pieces, never as D's whole queue: D's balance has a review-only
-  floor and D is the end of the failure chain. B and F (Kimi Code, Zhipu Coding Plan) show
-  UNKNOWN: probe each with one small task first, note the first-call time (+5h = reset
-  estimate), and treat the banner gate as the last line, not the first. Anthropic extra usage
+  floor and D is the end of the failure chain. B and F (Kimi Code, Zhipu Coding Plan) have
+  read their 5h and weekly windows from the vendor usage APIs since 2026-10-21 and get the
+  same thresholds; the banner gate stays the last line. Anthropic extra usage
   is OFF on this account, so a 5h hit stops A itself: A's own turns count against the same
-  window. (Reviewed with DeepSeek 2026-10-17.)
+  window. (Reviewed with DeepSeek 2026-10-17.) Mid-task, the 5h window crossing 90 % (7d: 98 %) triggers the
+  quota handoff (operational-cautions.md caution 14): the role writes its state to a file
+  and the rest goes to a role with room.
 - **Any refresh discards the worker's task context.** Its session id changes;
   follow-ups need a fresh self-contained `--body-file` brief (workers can never
   read hub history). Corollary of the existing session-echo rule: a reply whose
