@@ -12,9 +12,18 @@ on the same project through a shared mailbox.
   blocking receive, task-cycle resets and crash recovery — coordination and
   audit sit in one place instead of inside framework code.
 - **Heterogeneous agents, policy-based model routing.** Each role runs the CLI
-  and model configured for it (Claude Code or Codex). Route judgment-heavy
-  roles to a frontier model and mechanical work to cheaper tiers by editing
-  the launch config, not application code.
+  and model configured for it (Claude Code, Codex, or other vendor CLIs).
+  Route judgment-heavy roles to a frontier model and mechanical work to
+  cheaper tiers by editing the launch config, not application code.
+- **Quota-aware dispatch.** A pre-dispatch snapshot reads each vendor's
+  remaining usage window and returns an OK / THROTTLE / HOLD verdict per role,
+  so a brief is sized to the capacity that is actually left — cost and quota
+  are inputs to routing, not an afterthought.
+- **State as data, supervisor out of the loop.** Fleet health (model, context
+  use, rate limits, prompt-cache warmth, cost) is read from state files, and
+  an out-of-session supervisor process runs the reply clock without a model in
+  it. Mechanical events are handled and logged automatically; the hub agent
+  spends turns only on real decisions.
 - **Briefs as context packaging.** A dispatch is a markdown brief
   (goal, constraints, done-criteria), linted by `ipc_brief_lint.py`. The brief
   is the worker's context package — the same discipline as sub-agent context
@@ -22,9 +31,9 @@ on the same project through a shared mailbox.
 - **Human-in-the-loop by default.** Workers run inside the CLI harness's normal
   permission model; high-stakes actions still ask the human. The runtime moves
   messages, never authority.
-- **Built for recovery, not just the happy path.** Stall watching, pane
-  probing and waking, role re-claiming after window loss, and a whole-fleet
-  restart path. The lifecycle is covered by a three-state protocol test
+- **Built for recovery, not just the happy path.** Pane probing and waking,
+  role re-claiming after window loss, and a whole-fleet restart path. The
+  lifecycle is covered by a three-state protocol test
   (`tests/ipc_three_state_full_test.py`).
 
 ## Architecture
@@ -44,12 +53,15 @@ on the same project through a shared mailbox.
 
 | File | Role |
 |---|---|
-| `ipc.py` | Neutral SQLite mailbox: `send`, `recv --block`, status, roles |
+| `ipc.py` | Neutral SQLite mailbox: `send`, `recv --block`, watch/clock, roles |
+| `ipc_state.py` | Per-role machine state from files: model, context use, rate limits, cache, cost |
+| `ipc_quota.py` | Pre-dispatch quota snapshot per vendor; OK / THROTTLE / HOLD verdicts |
+| `ipc_supervisor.py` | Out-of-session supervisor: runs the reply clock with no model in the loop |
 | `install_user.py`, `migrate_ipc.py` | User-level install and migration |
 | `ipc_wezterm_launch.ps1`, `mux-fleet*.lua` | Launch a whole fleet into panes, auto-submit recovery |
 | `ipc_dispatch.ps1`, `ipc_newcycle.ps1` | Dispatch a brief, reset the task cycle |
 | `ipc_brief_lint.py`, `ipc_estimate.py` | Brief quality gate and size estimate |
-| `stall_watch.py`, `ipc_pane_probe.py`, `ipc_wake_pane.ps1` | Keep the fleet alive |
+| `ipc_pane_probe.py`, `ipc_wake_pane.ps1` | Keep the fleet alive |
 | `skills/multi-terminal-ipc/` | Operating guide for the agents themselves |
 
 ## Install
