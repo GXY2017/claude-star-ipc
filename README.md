@@ -19,8 +19,9 @@ on the same project through a shared mailbox.
   remaining usage window and returns an OK / THROTTLE / HOLD verdict per role,
   so a brief is sized to the capacity that is actually left — cost and quota
   are inputs to routing, not an afterthought.
-- **State as data, supervisor out of the loop.** Fleet health (model, context
-  use, rate limits, prompt-cache warmth, cost) is read from state files, and
+- **State as data, supervisor out of the loop.** With the state integrations
+  configured (see Install), model, context use, rate limits and prompt-cache
+  warmth are read from local files where available, and
   an out-of-session supervisor process runs the reply clock without a model in
   it. Mechanical events are handled and logged automatically; the hub agent
   spends turns only on real decisions.
@@ -54,7 +55,7 @@ on the same project through a shared mailbox.
 | File | Role |
 |---|---|
 | `ipc.py` | Neutral SQLite mailbox: `send`, `recv --block`, watch/clock, roles |
-| `ipc_state.py` | Per-role machine state from files: model, context use, rate limits, cache, cost |
+| `ipc_state.py` | Available per-role state from configured integrations: model, context use, rate limits, cache |
 | `ipc_quota.py` | Pre-dispatch quota snapshot per vendor; OK / THROTTLE / HOLD verdicts |
 | `ipc_supervisor.py` | Out-of-session supervisor: runs the reply clock with no model in the loop |
 | `install_user.py`, `migrate_ipc.py` | User-level install and migration |
@@ -79,6 +80,14 @@ python install_user.py
 In `~/.claude/ipc/ipc_wezterm_launch.ps1`, configure `$LaunchCmd` for each role's
 CLI and model, and `$Roles` for the default fleet. Pass `-Roles` at launch to
 choose a different fleet.
+
+File-based state monitoring needs additional integrations that this repository
+does not ship or install: Claude-family roles expect a status-line hook
+(statusline.js) to write `~/.claude/ipc/state/<ROLE>.json`; Codex roles need
+their thread IDs registered so `ipc_state.py` can locate their rollout files
+(the author's setup uses `codex-compat.js`). See the input contract in
+[ipc_state.py](ipc_state.py). Without these integrations, per-role file-based
+telemetry is unavailable; installing the mailbox alone does not provide it.
 
 ## Use
 
@@ -120,5 +129,9 @@ For dispatch, replies, and recovery, see the
 ## Scope
 
 Self-hosted and single-machine (Windows-first). The runtime coordinates agents
-you already run: it adds no model calls of its own and keeps all state in one
-project-local SQLite file. MIT License.
+you already run: it adds no model calls of its own. Messages live in a
+project-isolated SQLite mailbox, normally at
+`~/.claude/projects/<key>/ipc/_ipc.db`. Role registries, heartbeats and
+supervisor state use separate files; shared fleet telemetry and quota caches
+also live under `~/.claude/`. Backups and migrations must account for these
+files as well as the database. MIT License.
