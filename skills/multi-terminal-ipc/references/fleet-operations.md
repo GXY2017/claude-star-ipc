@@ -9,10 +9,10 @@ terminals live as panes in one WezTerm window, launched and batch-controlled by
 two user-level scripts (role→pane-id map, no window guessing, no hand-typing):
 
 ```powershell
-pwsh ~/.claude/ipc/ipc_wezterm_launch.ps1 -Roles A,B,C,D,E,F -Project <root>  # spawn lineup, claim roles, park watchers
+pwsh ~/.claude/ipc/ipc_wezterm_launch.ps1 -Roles A -Project <root>          # hub only (user rule 2026-10-27, -Roles default A); A adds workers after the first task with the -Roles <workers> form below
 pwsh ~/.claude/ipc/ipc_newcycle.ps1 [-Roles C] [-Force] [-SkipHub]          # refresh context: per pane kind sends /clear + /ipc-recover (claude) or /new (codex, no wake, never Ctrl+C); BUSY roles skipped; dead codex TUI relaunched instead. This is A's tool when a role runs low on context — clearing beats restarting the pane. It never switches projects or changes a pane's cwd; a project switch is ipc_fleet1_restart.ps1 -Project <root>
 pwsh ~/.claude/ipc/ipc_newcycle.ps1 -Relaunch -Roles D,F [-Force] [-Detach]  # fresh PROCESS per role without touching the mux (2026-10-18, #task20.D): /exit (Exit-and-stop-tasks dialog answered) or codex Esc+Ctrl+C, retype the launcher's line in the same pane, wait ready, wake. Esc on a permission prompt first (Enter would approve it), Enter on a notice overlay. Skips a pane still producing output (-Force cuts it) and an unreadable one. The pane that runs the script ($env:IPC_ROLE, normally A) is skipped with the command to run; -Detach starts that command outside the process tree, 45 s later (log %TEMP%\ipc_relaunch_<role>.log; end the turn). Use it instead of a whole-fleet restart when TUIs are stuck or stale
-pwsh ~/.claude/ipc/ipc_wezterm_launch.ps1 -Roles C -Project <root>          # ONE role back into the LIVE fleet: mux is reused, other panes untouched — ONLY for a role whose pane is GONE (`wezterm cli list` lacks its wezterm_panes.json pane id). A DOWN watcher with a live pane is woken in place: claude roles `ipc_wake_pane.ps1 -Role D -Message '/ipc-recover D'`, codex roles `-Message '$ipc-recover C'`. Since 2026-09-15 the launcher REFUSES a role whose mapped pane is still alive and prints that wake command (`-Force` adds the duplicate anyway). Bit 2026-09-14: A saw C DOWN, ran `-Roles C` then `-Roles D`; fleet ended with two C and two D panes and A's kill-pane cleanup was blocked
+pwsh ~/.claude/ipc/ipc_wezterm_launch.ps1 -Roles C -Project <root>          # roles into the LIVE fleet: mux reused, other panes untouched — the normal way A adds the workers it picked (2026-10-27, orchestration-and-dispatch.md § Lineup decided by the hub), or brings back a role whose pane is GONE (`wezterm cli list` lacks its wezterm_panes.json pane id). A DOWN watcher with a live pane is woken in place: claude roles `ipc_wake_pane.ps1 -Role D -Message '/ipc-recover D'`, codex roles `-Message '$multi-terminal-ipc recover C'`. Since 2026-09-15 the launcher REFUSES a role whose mapped pane is still alive and prints that wake command (`-Force` adds the duplicate anyway). Bit 2026-09-14: A saw C DOWN, ran `-Roles C` then `-Roles D`; fleet ended with two C and two D panes and A's kill-pane cleanup was blocked
 pwsh ~/.claude/ipc/ipc_fleet1_restart.ps1 -Project <root>                   # WHOLE-FLEET restart only, run by the user from a window OUTSIDE fleet 1 (plain PowerShell or another wezterm window; refused from a fleet-1 pane, which the teardown would kill mid-run). The hub stays in fleet 1 (user 2026-10-18), so A writes its handoff first and loses its session. Stuck or stale TUIs need `newcycle -Relaunch`, not this. Steps: pending check (only tasks to roles in the fleet-1 pane map block; a task to X does not, 2026-10-18) -> tear down mux + GUI + orphan watchers -> relaunch -> verify parks. `-Roles` picks what comes BACK, never what gets torn down: `-Roles C` still kills the mux and every pane incl. A itself (bit 2026-09-03, [[ipc-single-role-restart]]); since 2026-09-03 a `-Roles` list without the hub is REFUSED unless `-Force` Orphan-watcher sweep covers `$FleetRoles` = A–F ∪ old fleet-1 pane map ∪ `-Roles` (fixed 2026-09-04: it used to loop over `-Roles` only, so `-Roles A,C` left B/D/E/F watchers alive = fake ALIVE + stolen mail; [[ai-fin::fleet-shutdown-orphan-watchers]] 第三型).
 pwsh ~/.claude/ipc/ipc_fleet2_launch.ps1 -Project <root>                   # second formation: its own mux + GUI, role X only (Claude, --permission-mode auto); ask which project first unless the user already named the project and scope in this request, same rule as fleet 1
 pwsh ~/.claude/ipc/ipc_pane_exit.ps1 -Role F [-KeepRole]                   # clean exit of ONE pane: /exit -> release slot -> confirm watcher retired (caution 10); fleet 1 only
@@ -50,11 +50,11 @@ SessionStart hook (GLM/DeepSeek panes park a watcher but may never claim). [Chan
 ## Role→model bindings and DOWN watchers
 
 Role→model bindings (A=claude claude-opus-5-5 hub — 1M native, rebound 2026-10-05, was
-opus-5[1m] 09-14..10-05; B=kimi k3[1m], C=codex gpt-6-luna
+opus-5[1m] 09-14..10-05; B=kimi k3.1-pro-highspeed (user 2026-10-26, was k3[1m]), C=codex gpt-6-luna
 max — rebound 2026-10-04 (GPT-6 templates carry the base rules ~/.codex/AGENTS.md no longer restates;
 `ipc_wake_pane.ps1 -Model` maps only to the GPT-6 family, sol = gpt-6.1-sol since 10-05), was gpt-5.6-luna max 09-19..10-04, sol xhigh 08-30..09-19,
 D=deepseek-flash[1m] incl. haiku/sub-agent slots,
-E=codex (follows ~/.codex/config.toml; gpt-6.1-sol high 2026-10-05..10-17, gpt-6-astra medium seen 2026-10-18), F=glm-5.3[1m] via Zhipu direct — added
+E=codex gpt-6.1-terra xhigh (user 2026-10-27, pinned by flags in `ipc_wezterm_launch.ps1` $LaunchCmd; gpt-6.1-sol xhigh 10-20..10-27; before 10-20 bare `codex` following ~/.codex/config.toml: gpt-6.1-sol high 2026-10-05..10-17, gpt-6-astra medium seen 2026-10-18), F=glm-5.3[1m] via Zhipu direct — added
 2026-08-14, G=minimax-m3.1-flash:cloud via `ollama launch claude` — added 2026-10-21, free
 until 2026-10-22 23:59 UTC; past the launcher's `$RoleFreeUntil` deadline the launcher and
 `newcycle -Relaunch` skip G and `ipc_quota.py` reports it HOLD) are a table at the top of
@@ -63,8 +63,7 @@ is DECOMMISSIONED (same date): before dispatching, check `status --watch <role>`
 DOWN means the watcher is not parked, NOT that the pane is gone: check the pane
 first (`wezterm cli list` against the pane map), wake a live pane by typing into
 it (`ipc_wake_pane.ps1`), and relaunch only a pane that no longer exists. Full findings,
-traps, and per-bridge caveats: [[ai-fin::wezterm-pane-injection-verified]]
-(AI 财务分析 repo, `.claude/memory/`).
+traps, and per-bridge caveats: [[ai-fin::wezterm-pane-injection-verified]].
 
 ## Fleet cautions (`SKILL.md` § 注意事项 10–13, 15, 16)
 

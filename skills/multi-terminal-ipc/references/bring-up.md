@@ -14,24 +14,24 @@ claim. Since 2026-09-02 the gate is inside `ipc_role.py claim` itself
 that, the Codex hooks (`~/.codex/hooks.json` → `codex-compat.js
 session-start-ipc`, and a project-level `.codex/hooks.json` calling `claim`
 directly) skipped the guard, so a bare `codex` opened in any `ipc.enabled`
-project silently auto-claimed a free role (became C in AI财务分析). Codex is
+project silently auto-claimed a free role (became C in one project, 2026-09-02). Codex is
 stricter than Claude (user rule 2026-09-02): it claims only with an explicit
 `IPC_ROLE`, i.e. only as a fleet member launched by the fleet script; a codex
 opened by hand, even inside a WezTerm pane, stays standalone. The project-level
-`.codex/hooks.json` claim in AI财务分析 was removed the same day so every codex
+`.codex/hooks.json` claim in that project was removed the same day so every codex
 claim goes through `codex-compat.js`. Fleet panes are unaffected: the launcher
 sets `IPC_ROLE` per pane.
 
 **The one manual floor the hook can't cross:** it can inject instructions but
 can't fire a worker's first tool call. `ipc_wezterm_launch.ps1` crosses it: once
-each TUI is ready it types `/ipc-recover <role>` (Codex panes: `$ipc-recover
+each TUI is ready it types `/ipc-recover <role>` (Codex panes: `$multi-terminal-ipc recover
 <role>`), which parks the watcher and verifies the claim; any queued backlog then
 arrives as signals (WATCHER FIRST, no separate drain step: work done without a
 beating watcher reads as stale to the lease reaper and gets requeued mid-flight).
 After a fleet launch A does not ask the user for anything: it checks `status
 --watch <role>` and acts only on a role still DOWN or a pane the launcher warned
 about ("TUI not detected"). A window opened by hand needs `/ipc-recover <role>`
-(Codex: `$ipc-recover <role>`) typed into it; a bare `ok`/`standby` can be answered with prose and park nothing
+(Codex: `$multi-terminal-ipc recover <role>`) typed into it; a bare `ok`/`standby` can be answered with prose and park nothing
 (2026-08-17, #1186).
 
 Force a specific role at launch: `IPC_ROLE=A claude …` (overrides launch order).

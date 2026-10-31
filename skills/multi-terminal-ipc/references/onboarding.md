@@ -28,7 +28,7 @@ Then bring terminals online:
    guard-passing sessions without a preset role, first in = A/hub, the rest
    take the lowest free slot.
 2. The manual floor: the fleet launcher types `/ipc-recover <role>` (Codex:
-   `$ipc-recover <role>`) into each pane once its TUI is ready; type it yourself
+   `$multi-terminal-ipc recover <role>`) into each pane once its TUI is ready; type it yourself
    only in a window opened by hand. Its watcher parks and any backlog arrives
    as signals.
 3. Verify: `ipc_role.py status` shows the roles live, then one A→B round-trip

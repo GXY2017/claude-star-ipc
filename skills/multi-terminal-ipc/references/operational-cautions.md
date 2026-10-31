@@ -94,7 +94,7 @@ a pane-spawn site, upgrading Node.js / wezterm, or handling a fleet anomaly.
     --hub A --detail`, `ipc_role.py status`, pane text); working normally → one
     more 15 min; stalled/abnormal → act now; two extensions max. Tasks are sliced
     so a recipient can deliver in ≤15 min. Full procedure and the
-    manage-not-operate boundary: `~/.claude/commands/main.md` § A 的职责边界与节奏.
+    manage-not-operate boundary: `references/claude-main.md` § A 的职责边界与节奏 (Codex: `codex-main.md`).
     Workers still do not self-report quota. **Quota handoff (user 2026-10-21):
     a role about to run out of its window writes its work down before the limit
     stops it**, so another role continues instead of redoing it. The hub clock
@@ -126,4 +126,17 @@ a pane-spawn site, upgrading Node.js / wezterm, or handling a fleet anomaly.
 17. **A worker is one context window; a long token-heavy serial queue exhausts it
     mid-queue**: dispatch 2–3 items per batch. Full rule and evidence:
     `orchestration-and-dispatch.md` (this directory) § Worker context and queue length.
+18. **A refresh per heavy batch is the normal rhythm; plan where it may happen**
+    (lifted 2026-10-28 from a project backfill skill; measured 2026-08-16/20: one
+    saturated batch took about 50 percentage points of a codex worker's context).
+    - Say in the brief that the session is refreshed after each batch, so the worker
+      does not treat the interruption as a failure.
+    - Before a refresh, let the worker stop at a download or parse stage with its raw
+      files, manifest and draft on disk; the next round resumes from disk.
+    - Never interrupt a worker while it runs a merge-write script: interrupting the
+      model turn kills the child process and can leave the target file half-written.
+    - A worker's estimate of its own remaining context is unreliable (five batches in a
+      row self-reported about 40% while the footer showed 19%): the hub reads the pane
+      footer itself (`orchestration-and-dispatch.md` § Capacity-aware dispatch).
+      [[C--Users-<user>-Downloads-----::refresh-codex-pane-e]]
 

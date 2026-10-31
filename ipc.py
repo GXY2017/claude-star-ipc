@@ -25,6 +25,8 @@ CLI:
     python ipc.py send --from A --to B "msg" --require-watcher  # refuse if B neither parked nor busy; QUEUED-BUSY if mid-task
     python ipc.py send --from A --to B "msg" --submit-id fx7    # idempotent: same key never double-queues (safe re-dispatch)
     python ipc.py send --from A --to B "msg" --no-requeue       # fail-closed: stale lease parks as NEEDS-REVIEW, never auto-requeued
+    python ipc.py send --from A --to D "review" --for-task 12   # hub only: D's CLEAN reply is forwarded by code to #12's
+                                             # owner as a note (open #12 only); A's DONE line ends `->fwd B#<note>`
     python ipc.py status --watch B           # is B's --block watcher parked? ALIVE/DOWN
     python ipc.py status --watch B --json    # one JSON object: alive/busy/owner_valid/parked/
                                              # reason — scripts gate on `parked`, never on
@@ -539,6 +541,12 @@ def _conn():
         ("task_type", "TEXT"),
         ("new_items", "INTEGER"),
         ("anchor", "TEXT"),
+        # 2026-10-31 task subscription (DeepSeek Super-agent article): on a hub
+        # task M, for_task = N means "forward M's CLEAN reply to N's owner"
+        # (send --for-task N); on the note send() generates for that forward,
+        # for_task = M (the task whose reply it carries; the hub's DONE line
+        # names the note from it). NULL everywhere else.
+        ("for_task", "INTEGER"),
     ):
         if col not in have:
             conn.execute(f"ALTER TABLE messages ADD COLUMN {col} {ddl}")
@@ -599,7 +607,9 @@ class LinkRefused(Exception):
     Refused at send time (exit 3) so the hub never sees a silently mis-closed or
     never-closed task (E review 2026-09-16: four F results sent as unlinked
     notes left #1592/#1594/#1596/#1598 open -> stale REPLY-CLOCK alarms and
-    requeues until auto-fail)."""
+    requeues until auto-fail). Also raised (2026-10-31) for `send --for-task N`
+    when the sender is not the hub, the row is not a hub->worker task, or N is
+    not an open hub task (see _open_hub_task)."""
 
 
 class StarViolation(Exception):
@@ -791,9 +801,92 @@ def _dup_by_submit_id(conn, sender, recipient, submit_id):
         (sender, recipient, submit_id)).fetchone()
 
 
+def _open_hub_task(conn, tid, hub):
+    """((owner, hop), None) when #tid is an open task the hub dispatched (exists in
+    `messages`, msg_type task, sender hub, no tombstone, not task_done: the same
+    predicate _open_tasks uses for auto-link), else (None, why). An archived task
+    is finished by construction (_ARCHIVE_WHERE), so a missing row is closed."""
+    row = conn.execute("SELECT sender, recipient, msg_type, tombstone, hop "
+                       "FROM messages WHERE id=?", (tid,)).fetchone()
+    if not row:
+        return None, f"no open message #{tid} (missing or archived)"
+    s, r, mt, tomb, hop = row
+    if mt != "task":
+        return None, f"#{tid} is a {mt}, not a task"
+    if s != hub:
+        return None, f"task #{tid} was dispatched by {s}, not the hub {hub}"
+    if tomb is not None:
+        return None, f"task #{tid} is {tomb}"
+    if task_done(conn, tid):
+        return None, f"task #{tid} is already answered (closed)"
+    return (r, hop), None
+
+
+# 2026-10-31 task subscription (DeepSeek Super-agent article: follow-up events that
+# reach the subscribed worker directly, not through the router's model turn, cut
+# router decisions ~30% and cached-token reads ~37%). Only a CLEAN reply forwards:
+# no RESULT line, UNVERIFIED, UNSOLVABLE / REPLAN / HANDOFF, fail, done and ack all
+# stay with the hub, which must read them itself.
+_FWD_EXCERPT_LINES = 20
+
+
+def _forward_clean(conn, reply_id, task_id, worker, body, ts):
+    """Inside send()'s transaction, after a worker's CLEAN reply #reply_id to task
+    #task_id was inserted: when that task carries for_task = N and N is still an
+    open hub task, insert ONE plain note hub -> N's owner, in_reply_to = N, with a
+    fixed header, the RESULT lines and the first _FWD_EXCERPT_LINES lines of the
+    rest of the reply. The note is code-generated and hub->worker, so the star is
+    intact; notes are never reaped, leased, held or counted as answers (task_done
+    reads reply/ack only). Returns (note id, owner) or None (silently skipped)."""
+    row = conn.execute("SELECT for_task FROM messages WHERE id=? AND msg_type='task'",
+                       (task_id,)).fetchone()
+    if not row or row[0] is None:
+        return None
+    target = row[0]
+    owner, _why = _open_hub_task(conn, target, HUB)
+    if owner is None:
+        return None                      # N closed or tombstoned since dispatch: skip
+    recipient, hop = owner
+    hop = (hop or 0) + 1                 # as send() links a hub note to N
+    if hop > 4:                          # send()'s default ttl
+        return None
+    rest = (body or "").splitlines()
+    while rest and (not rest[0].strip() or _RESULT_LINE.match(rest[0])):
+        rest.pop(0)                      # the RESULT header is restated below
+    lines = [f"FORWARD #{task_id} <- {worker} for your #{target} "
+             f"(auto, no reply needed / 代码自动转发，无需回复)"]
+    lines += [f"RESULT: {p}" for p in _result_paths(body)]
+    lines += rest[:_FWD_EXCERPT_LINES]
+    if len(rest) > _FWD_EXCERPT_LINES:
+        lines.append(f"[+{len(rest) - _FWD_EXCERPT_LINES} more lines not forwarded; "
+                     f"the RESULT file is the full product]")
+    cur = conn.execute(
+        "INSERT INTO messages (ts, sender, recipient, body, in_reply_to, msg_type, "
+        "status, hop, ttl, for_task) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (ts, HUB, recipient, "\n".join(lines), target, "note", "sent", hop, 4, task_id))
+    return cur.lastrowid, recipient
+
+
+def _fwd_note(conn, reply_id, task_id):
+    """(note id, owner) of the forward _forward_clean made for reply #reply_id to
+    task #task_id, or None. The note is inserted right after the reply in the
+    same transaction, so it is the first forward note for that task above it."""
+    if task_id is None:
+        return None
+    return conn.execute(
+        "SELECT id, recipient FROM messages WHERE msg_type='note' AND for_task=? "
+        "AND id>? ORDER BY id LIMIT 1", (task_id, reply_id)).fetchone()
+
+
+def _fwd_suffix(conn, reply_id, task_id):
+    """` ->fwd B#13` for the hub's DONE line when the reply was forwarded, else ''."""
+    fw = _fwd_note(conn, reply_id, task_id)
+    return f" ->fwd {fw[1]}#{fw[0]}" if fw else ""
+
+
 def send(sender, recipient, body, *, in_reply_to=None, msg_type=None, hop=None,
          ttl=4, require_watcher=False, max_age=8.0, lease=DEFAULT_LEASE,
-         submit_id=None, no_requeue=False, budget=None):
+         submit_id=None, no_requeue=False, budget=None, for_task=None):
     """Insert one message for a SINGLE recipient. Returns (id, created, queued_busy):
     created=False means submit_id matched an existing non-terminal row, which was
     reused instead of queued again (idempotent resend, tutti clientSubmitID idea).
@@ -827,7 +920,11 @@ def send(sender, recipient, body, *, in_reply_to=None, msg_type=None, hop=None,
     no_requeue: fail-closed task (see _reap_stale): a stale claim is NEVER
     auto-requeued or auto-failed — it parks as NEEDS-REVIEW in pending until the
     hub cancels or the worker done/fail/ack-revives it. Use for non-idempotent
-    work where a phantom second run is worse than waiting."""
+    work where a phantom second run is worse than waiting.
+    for_task: hub->worker task only (2026-10-31). N must be an open hub task
+    (_open_hub_task) owned by another role, else LinkRefused. When the worker's
+    reply to THIS task is CLEAN and N is still open, the same transaction adds a
+    note hub -> N's owner (_forward_clean)."""
     if sender != HUB and recipient != HUB:
         raise StarViolation(f"star topology forbids {sender}->{recipient} "
                             f"(hub={HUB}; set IPC_HUB to change)")
@@ -880,6 +977,16 @@ def send(sender, recipient, body, *, in_reply_to=None, msg_type=None, hop=None,
             msg_type = "reply" if (sender != HUB and recipient == HUB) else "task"
         worker_to_hub = (sender != HUB and recipient == HUB
                          and msg_type in ("reply", "ack", "fail"))
+        if for_task is not None:
+            if sender != HUB or recipient == HUB or msg_type != "task":
+                raise LinkRefused(f"--for-task {for_task}: only a hub->worker task may "
+                                  f"subscribe (got {sender}->{recipient} {msg_type})")
+            owner, why = _open_hub_task(conn, for_task, HUB)
+            if owner is None:
+                raise LinkRefused(f"--for-task {for_task}: {why}")
+            if owner[0] == recipient:
+                raise LinkRefused(f"--for-task {for_task}: #{for_task} belongs to "
+                                  f"{recipient} itself; a forward would echo its own reply")
         if worker_to_hub and in_reply_to is None and msg_type == "reply":
             opened = _open_tasks(conn, recipient, sender)  # recipient=hub
             if len(opened) > 1:
@@ -931,12 +1038,12 @@ def send(sender, recipient, body, *, in_reply_to=None, msg_type=None, hop=None,
             "INSERT OR IGNORE INTO messages "
             "(ts, sender, recipient, body, in_reply_to, msg_type, status, hop, ttl, "
             "lease_until, lease_secs, submit_id, no_requeue, session, result, budget_min, "
-            "task_type, new_items, anchor) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "task_type, new_items, anchor, for_task) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (ts, sender, recipient, body, in_reply_to, msg_type, "sent", hop, ttl,
              lease_until, lease_secs, submit_id, 1 if no_requeue else 0,
              os.environ.get("CLAUDE_SESSION_ID") or None, result, budget_min,
-             task_type, new_items, anchor),
+             task_type, new_items, anchor, for_task),
         )
         if cur.rowcount == 0 and submit_id is not None:
             dup = _dup_by_submit_id(conn, sender, recipient, submit_id)
@@ -952,6 +1059,9 @@ def send(sender, recipient, body, *, in_reply_to=None, msg_type=None, hop=None,
         if worker_to_hub and in_reply_to is not None and msg_type in ("reply", "fail"):
             _log_timing(conn, cur.lastrowid, in_reply_to, sender, msg_type, result, ts,
                         new_items=new_items or 0)
+        if (worker_to_hub and in_reply_to is not None and msg_type == "reply"
+                and result == "CLEAN" and cur.rowcount == 1):
+            _forward_clean(conn, cur.lastrowid, in_reply_to, sender, body, ts)
         return cur.lastrowid, True, queued_busy
 
 
@@ -1030,9 +1140,31 @@ def _claim_one(conn, me):
         "WHERE id=("
         "  SELECT id FROM messages WHERE recipient=? AND handled=0 "
         "  ORDER BY id LIMIT 1"
-        ") RETURNING id, ts, sender, body, msg_type, in_reply_to, result, new_items",
+        ") RETURNING id, ts, sender, body, msg_type, in_reply_to, result, new_items, "
+        "attempts",
         (_now, _now, _now, me),
     ).fetchone()
+
+
+# 2026-10-31, from DeepSeek Super-agent article (recovery note): a task delivered
+# again (requeued by the reaper or re-exposed by `redeliver`) reaches the worker
+# with this fixed prefix so it checks what the earlier attempt already did before
+# repeating outside actions. Display only: the stored body is never modified.
+_REQUEUE_NOTE = ("此单此前已投递过、未结清就被收回。重做前先核对：工作目录、简报里声明的产物路径、"
+                 "git 历史和已落盘文件；已完成的部分不重做；发送、提交、下单等外部动作先确认未执行过再做。")
+
+
+def redelivery_prefix(mtype, attempts, short=False):
+    """The one helper every path that hands a task to a worker uses (recv text,
+    the watch / signal-only NEW MSG tag, peek of the recipient's own task; --json
+    carries `requeued` + `attempt` instead). '' unless a task's claim count
+    (attempts, already incremented by the claim) is > 1. short=True returns only
+    the `[REQUEUED attempt k/MAX]` head for a one-line signal. Notes and replies
+    never get it."""
+    if mtype != "task" or (attempts or 0) <= 1:
+        return ""
+    head = f"[REQUEUED attempt {attempts}/{MAX_ATTEMPTS}]"
+    return head if short else f"{head} {_REQUEUE_NOTE}"
 
 
 # ---- RESULT-line protocol (2026-09-19, user decision: protocol first, no model) --
@@ -1361,7 +1493,7 @@ _LAUNCH_CMD_CACHE = {}
 def _role_variant(role):
     """Model AND parameters the role was launched with, e.g. 'Codex/gpt-5.6-sol/xhigh',
     'Claude/claude-opus-5[1m]', 'Kimi/k3[1m]'. Parsed from the launcher's
-    `$LaunchCmd` line (`--model X`, a quoted positional model, and
+    `$LaunchCmd` line (`--model X` / PowerShell `-Model X`, a quoted positional model, and
     `model_reasoning_effort=Y`); a bare `codex` falls back to ~/.codex/config.toml's
     `model` / `model_reasoning_effort` read at write time; a bare claude wrapper
     records 'default'. Best effort by construction: an in-pane /model switch or a
@@ -1379,8 +1511,8 @@ def _role_variant(role):
             pass
         _LAUNCH_CMD_CACHE.setdefault("_", "")   # sentinel: parsed once even if empty
     cmd = _LAUNCH_CMD_CACHE.get(role.upper(), "")
-    mm = (re.search(r"--model\s+['\"]?([^\s'\"]+)", cmd)
-          or re.match(r"^\S+\s+'([^']+)'", cmd))          # claude-kimi 'k3[1m]' positional
+    mm = (re.search(r"(?:--model|-[Mm]odel)\s+['\"]?([^\s'\"]+)", cmd)
+          or re.match(r"^\S+\s+'([^']+)'", cmd))          # claude-kimi 'k3[1m]' positional (pre-2026-10-24)
     me = re.search(r"model_reasoning_effort=['\"]?(\w+)", cmd)
     model = mm.group(1) if mm else None
     effort = me.group(1) if me else None
@@ -1821,6 +1953,7 @@ def _flush_held(conn, me, force=False):
         paths = ", ".join(_result_paths(body)) or "?"
         tail = _summary_suffix(task, sender, n_new, mid, me, new_types_tag(body))
         note = "" if n_new else ", no peek needed"
+        tail += _fwd_suffix(conn, mid, task)   # 2026-10-31: --for-task forward already sent
         if not _emit(f"DONE #{task} <- {sender} RESULT: {paths} (#{mid}{note}){tail}"):
             return False
         conn.execute("UPDATE messages SET announced=1 WHERE id=?", (mid,))
@@ -1873,7 +2006,7 @@ def task_status(tid):
     with _conn() as conn:
         row = conn.execute(
             "SELECT id, sender, recipient, ts, handled, lease_until, tombstone, "
-            "attempts, no_requeue, last_seen_ts, msg_type, result, claimed_ts "
+            "attempts, no_requeue, last_seen_ts, msg_type, result, claimed_ts, for_task "
             "FROM messages WHERE id=?", (tid,)).fetchone()
         if not row:
             arch = _archived_task_status(conn, tid)
@@ -1881,7 +2014,7 @@ def task_status(tid):
                 return arch
             return _task_info(tid, "UNKNOWN", reason="no such message id")
         (rid, sender, recipient, ts, handled, lease_until, tombstone, attempts,
-         norq, seen, msg_type, result, claimed_ts) = row
+         norq, seen, msg_type, result, claimed_ts, for_task) = row
         if msg_type != "task":
             return _task_info(tid, "UNKNOWN", reason=f"message #{tid} is a {msg_type}, not a task",
                               sender=sender, recipient=recipient, ts=ts)
@@ -1891,17 +2024,21 @@ def task_status(tid):
             "SELECT id, sender, msg_type FROM messages WHERE in_reply_to=? "
             "ORDER BY id", (rid,)).fetchall()
     return _task_info(rid, st, sender=sender, recipient=recipient, ts=ts, attempts=attempts,
-                      result=result, claimed_ts=claimed_ts, replies=replies)
+                      result=result, claimed_ts=claimed_ts, replies=replies,
+                      for_task=for_task)
 
 
 def _task_info(tid, state, reason=None, archived=False, sender=None, recipient=None,
-               ts=None, attempts=None, result=None, claimed_ts=None, replies=()):
+               ts=None, attempts=None, result=None, claimed_ts=None, replies=(),
+               for_task=None):
     """The one shape every `task --id` answer has (text printer and --json alike):
-    all keys present, null where unknown (2026-10-17 review)."""
+    all keys present, null where unknown (2026-10-17 review). for_task (2026-10-31)
+    = the task whose owner gets this task's CLEAN reply forwarded; `replies` lists
+    every linked row, a --for-task forward included (type note, from the hub)."""
     return {
         "id": tid, "state": state, "terminal": state in _TERMINAL_STATES,
         "from": sender, "to": recipient, "ts": ts, "attempts": attempts,
-        "result": result, "claimed_ts": claimed_ts,
+        "result": result, "claimed_ts": claimed_ts, "for_task": for_task,
         "replies": [{"id": i, "from": s, "type": t} for i, s, t in replies],
         "reason": reason, "archived": archived,
     }
@@ -1913,13 +2050,19 @@ def _archived_task_status(conn, tid):
     CANCELLED / FAILED / DONE; replies are read from both tables."""
     if not _has_archive(conn):
         return None
+    # for_task (2026-10-31) exists in an archive only once a move ran after the
+    # column was added (_ensure_archive); older archives read it as NULL.
+    has_ft = any(r[1] == "for_task"
+                 for r in conn.execute("PRAGMA table_info(messages_archive)"))
     row = conn.execute(
         "SELECT id, sender, recipient, ts, tombstone, attempts, msg_type, result, "
-        "claimed_ts FROM messages_archive WHERE id=? ORDER BY archived_ts DESC LIMIT 1",
+        f"claimed_ts, {'for_task' if has_ft else 'NULL'} FROM messages_archive "
+        "WHERE id=? ORDER BY archived_ts DESC LIMIT 1",
         (tid,)).fetchone()   # newest archived version of this id
     if not row:
         return None
-    rid, sender, recipient, ts, tombstone, attempts, msg_type, result, claimed_ts = row
+    (rid, sender, recipient, ts, tombstone, attempts, msg_type, result, claimed_ts,
+     for_task) = row
     if msg_type != "task":
         return _task_info(tid, "UNKNOWN", archived=True,
                           reason=f"message #{tid} is an archived {msg_type}, not a task",
@@ -1934,7 +2077,8 @@ def _archived_task_status(conn, tid):
     return _task_info(rid, st, archived=True,
                       reason=None if st != "UNKNOWN" else "archived task without a closing reply",
                       sender=sender, recipient=recipient, ts=ts, attempts=attempts,
-                      result=result, claimed_ts=claimed_ts, replies=replies)
+                      result=result, claimed_ts=claimed_ts, replies=replies,
+                      for_task=for_task)
 
 
 _ARCHIVE_THRESHOLD = 300   # start trimming once the table exceeds this many rows
@@ -2176,7 +2320,7 @@ def recv(me):
             "ELSE ? + lease_secs END "
             "WHERE recipient=? AND handled=0 "
             "RETURNING id, ts, sender, body, msg_type, in_reply_to, session, result, "
-            "new_items",
+            "new_items, attempts",
             (_now, _now, _now, me),
         ).fetchall()
         # Done-drop: claimed (handled=1, so archive can sweep it) but not handed
@@ -3255,7 +3399,7 @@ def watch(me, interval, allow_file_stdout=False):
                     row = _claim_one(conn, me)  # atomic: each row to exactly one consumer
                     if row is None:
                         break
-                    mid, ts, sender, body, mtype, in_reply_to, result, n_new = row
+                    mid, ts, sender, body, mtype, in_reply_to, result, n_new, attempts = row
                     if task_done(conn, mid):
                         # Done-drop (same as recv): a requeued-but-already-
                         # answered task is finished work; claim it silently,
@@ -3298,6 +3442,9 @@ def watch(me, interval, allow_file_stdout=False):
                     if mtype in ("reply", "fail") and in_reply_to is not None:
                         # 2026-10-17: stored NEW item count + the quotable anchor
                         tag += _new_tag(n_new, body) + f" anchor {_anchor(in_reply_to, sender)}"
+                    rq = redelivery_prefix(mtype, attempts, short=True)   # 2026-10-31
+                    if rq:
+                        tag += f" {rq}"
                     if not _emit(
                             f"NEW MSG #{mid} from {sender} ({len(body)} chars){tag} "
                             f'— read full: python "{os.path.abspath(__file__)}" '
@@ -3441,9 +3588,11 @@ def peek(me, tail, ids=None):
     with an `archived` element: None for a live row; for an id no longer in
     `messages` (2026-10-17) the row comes from messages_archive and the element is
     (archived_ts, versions): the newest archived version is shown, and versions
-    > 1 says the archive holds that id more than once (a re-created mailbox)."""
+    > 1 says the archive holds that id more than once (a re-created mailbox).
+    attempts (2026-10-31) sits just before that element: the CLI prints the
+    redelivery prefix on the recipient's own requeued task."""
     cols = ("SELECT id, ts, sender, recipient, body, handled, msg_type, "
-            "in_reply_to, session, result")
+            "in_reply_to, session, result, attempts")
     with _conn() as conn:
         if ids:
             marks = ",".join("?" * len(ids))
@@ -3530,6 +3679,14 @@ def main():
                         "requeues nor fails it — it parks as NEEDS-REVIEW in "
                         "pending until the hub cancels or the worker "
                         "done/fail/ack-revives it. Use for non-idempotent work.")
+    s.add_argument("--for-task", dest="for_task", type=int, default=None, metavar="N",
+                   help="hub->worker task only (2026-10-31): N must be an open hub task "
+                        "owned by another role. When the recipient's reply to THIS task is "
+                        "CLEAN (verified RESULT line) and N is still open, send() adds a "
+                        "note hub -> N's owner (header, RESULT lines, first 20 lines) in "
+                        "the same transaction; the hub's DONE line ends `->fwd <role>#<note>`. "
+                        "Non-CLEAN replies, fail, done and ack never forward. Refused "
+                        "(REFUSED-LINK, exit 3) otherwise.")
 
     r = sub.add_parser("recv")
     r.add_argument("--me", required=True)
@@ -3807,7 +3964,8 @@ def main():
                     in_reply_to=args.in_reply_to, msg_type=args.msg_type,
                     require_watcher=args.require_watcher, max_age=args.max_age,
                     lease=args.lease, submit_id=args.submit_id,
-                    no_requeue=args.no_requeue, budget=args.budget)
+                    no_requeue=args.no_requeue, budget=args.budget,
+                    for_task=args.for_task)
                 if created and queued_busy and args.msg_type == "note":
                     print(f"QUEUED-BUSY #{mid}  {args.sender}->{tgt}  "
                           f"({tgt} is executing a claimed task; the note delivers "
@@ -3830,12 +3988,21 @@ def main():
                                            "anchor, new_items FROM messages WHERE id=?",
                                            (mid,)).fetchone()
                     print(f"SENT #{mid}  {args.sender}->{tgt}"
-                          + (f"  type={row[1]}" if row and row[0] == "task" else ""))
+                          + (f"  type={row[1]}" if row and row[0] == "task" else "")
+                          + (f"  for-task=#{args.for_task} (a CLEAN reply is forwarded "
+                             f"to #{args.for_task}'s owner)" if args.for_task else ""))
                     if args.sender != HUB and tgt == HUB:
                         r = row[2:] if row and row[0] == "reply" else None
                         if r and r[0]:
                             print(f"RESULT {r[0]}  (task #{r[1]}; CLEAN = hub gets a "
                                   f"one-line DONE summary, no body read)")
+                        if r and r[0] == "CLEAN":
+                            with _conn() as conn:
+                                fw = _fwd_note(conn, mid, r[1])
+                            if fw:
+                                print(f"FORWARDED #{fw[0]} -> {fw[1]}  (task #{r[1]} was "
+                                      f"dispatched --for-task; code copied this result "
+                                      f"to {fw[1]} as a note, nothing for you to do)")
                         elif r and r[1] is not None:
                             print(f"RESULT none  (body does not OPEN with a `RESULT: "
                                   f"<absolute path>` line — hub will read the full body; "
@@ -3915,16 +4082,29 @@ def main():
                 # Idle park: the same fixed-size signal watch() prints, so the
                 # worker procedure is one shape (signal -> peek --id -> ack -> work).
                 # Rows are claimed already; bodies stay for peek.
-                for mid, ts, sender, body, mtype, irt, sess, result, n_new in rows:
+                for mid, ts, sender, body, mtype, irt, sess, result, n_new, att in rows:
                     tag = ""
                     if result and result.split(":", 1)[0] in _STATUS_WORDS:
                         tag = f" [{result.split(':', 1)[0]}]"
                     if mtype in ("reply", "fail") and irt is not None:
                         tag += _new_tag(n_new, body) + f" anchor {_anchor(irt, sender)}"
+                    rq = redelivery_prefix(mtype, att, short=True)   # 2026-10-31
+                    if rq:
+                        tag += f" {rq}"
                     print(f"NEW MSG #{mid} from {sender} ({len(body or '')} chars){tag} "
                           f'— read full: python "{os.path.abspath(__file__)}" '
                           f"peek --me {args.me} --id {mid}")
                 rows = []
+            # 2026-10-31: which CLEAN replies send() already forwarded (--for-task),
+            # for the hub's DONE line suffix and the envelope's "fwd".
+            fwd = {}
+            if any(r[4] == "reply" and r[7] == "CLEAN" and r[5] is not None for r in rows):
+                with _conn() as conn:
+                    for r in rows:
+                        fw = (_fwd_note(conn, r[0], r[5])
+                              if r[4] == "reply" and r[7] == "CLEAN" else None)
+                        if fw:
+                            fwd[r[0]] = f"{fw[1]}#{fw[0]}"
             if args.json:
                 # Reserve the number, persist the complete batch, THEN print: the
                 # rows are already claimed, and a broken or capped output channel
@@ -3949,9 +4129,14 @@ def main():
                                     "anchor": _anchor(irt, sender) if (irt is not None and mtype in ("reply", "fail")) else None,
                                     "new_items": n_new or 0,
                                     # 2026-10-22: typed tally (`FAIL 1, FACT 2`), "" when untyped
-                                    "new_types": new_types_tag(body) if n_new else ""},
+                                    "new_types": new_types_tag(body) if n_new else "",
+                                    # 2026-10-31: --for-task forward ("B#13") of a CLEAN reply;
+                                    # requeued/attempt = redelivery flag, body stays as stored
+                                    "fwd": fwd.get(mid) or None,
+                                    "requeued": bool(redelivery_prefix(mtype, att)),
+                                    "attempt": att},
                                    ensure_ascii=False)
-                        for mid, ts, sender, body, mtype, irt, sess, result, n_new in rows]
+                        for mid, ts, sender, body, mtype, irt, sess, result, n_new, att in rows]
 
                 def save_failed(stage, e):
                     # One line, every claimed id spelled out (a range cannot say which
@@ -3975,7 +4160,7 @@ def main():
                 for line in batch_lines:
                     print(line)
                 rows = []  # printed above; the text loop below has nothing left to do
-            for mid, ts, sender, body, mtype, irt, sess, result, n_new in rows:
+            for mid, ts, sender, body, mtype, irt, sess, result, n_new, att in rows:
                 if mtype == "reply" and result == "CLEAN":
                     # RESULT-line protocol on the recv path (bash-fallback /
                     # codex hub): same one-line summary as the watch path, the
@@ -3986,14 +4171,16 @@ def main():
                     note = "" if n_new else ", body via peek if needed"
                     print(f"DONE #{irt} <- {sender} RESULT: {paths} (#{mid}{note})"
                           + _summary_suffix(irt, sender, n_new, mid, args.me,
-                                            new_types_tag(body)))
+                                            new_types_tag(body))
+                          + (f" ->fwd {fwd[mid]}" if fwd.get(mid) else ""))
                 else:
                     # Linked reply/fail: same NEW count + anchor tags as watch's
                     # NEW MSG line (the body follows in full, so no peek hint).
                     tag = ""
                     if irt is not None and mtype in ("reply", "fail"):
                         tag = _new_tag(n_new, body) + f" anchor {_anchor(irt, sender)}"
-                    print(f"#{mid} [{ts}] {sender}{tag}: {body}")
+                    rq = redelivery_prefix(mtype, att)   # 2026-10-31 recovery note
+                    print(f"#{mid} [{ts}] {sender}{tag}: " + (f"{rq}\n" if rq else "") + body)
     elif args.cmd == "peek" and (args.batch is not None or args.batches):
         _require_valid(args.me, "--me")
         nums = _batch_numbers(args.me)
@@ -4065,12 +4252,17 @@ def main():
                 print("NONE")
         else:
             for (mid, ts, sender, recipient, body, handled, mtype, in_reply_to,
-                 sess, result, archived) in rows:
+                 sess, result, attempts, archived) in rows:
+                # 2026-10-31 recovery note: the recipient reading its own requeued
+                # task (the watch / signal-only path reads bodies here) gets the
+                # prefix; --json keeps the stored body and adds requeued/attempt.
+                rq = redelivery_prefix(mtype, attempts) if recipient == args.me else ""
                 if args.json:
                     print(json.dumps(
                         {"id": mid, "ts": ts, "from": sender, "to": recipient,
                          "type": mtype, "task": in_reply_to, "session": sess,
                          "unread": not handled, "result": result, "body": body,
+                         "requeued": bool(rq), "attempt": attempts,
                          "archived": archived is not None,
                          "archived_ts": archived[0] if archived else None,
                          "archived_versions": archived[1] if archived else 0},
@@ -4087,6 +4279,8 @@ def main():
                 if mtype == "ack" and not body:
                     tgt = in_reply_to if in_reply_to is not None else "?"
                     body = f"[done-marker -> task #{tgt}]"
+                if rq:
+                    body = f"{rq}\n{body}"
                 print(f"#{mid} [{ts}] {sender}->{recipient}: {body}{flag}")
     elif args.cmd == "archive":
         try:
@@ -4275,6 +4469,11 @@ def main():
                     f"[{info['state']}]  attempts={info['attempts']}")
             if info["result"]:
                 line += f"  result={info['result']}"
+            if info.get("for_task") is not None:
+                line += f"  for-task=#{info['for_task']}"
+            if info["replies"]:   # 2026-10-31: linked rows, a --for-task forward shows as `note A`
+                line += "  linked=" + " ".join(
+                    f"#{x['id']}({x['type']} {x['from']})" for x in info["replies"])
             if info.get("archived"):
                 line += "  [archived]"
             print(line)

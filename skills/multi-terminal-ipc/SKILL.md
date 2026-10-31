@@ -1,24 +1,34 @@
 ---
 name: multi-terminal-ipc
 description: >-
-  Operate cross-model terminal IPC: onboard projects, dispatch/collect work, recover roles, start, restart or reconnect fleets; 多终端、多模型互通、派活、收回复、主从终端、信箱、编队重连、启动/重启 wezterm. Use for ipc.py operations. Covers hub/workers and window loss without assuming a fleet restart.
+  Shared Claude Code / Codex terminal IPC: claim hub (main), recover standby (recover ROLE), onboard projects, dispatch/collect work, recover roles, start, restart or reconnect fleets; 多终端、多模型互通、派活、收回复、主从终端、信箱、编队重连、启动/重启 wezterm. Use for ipc.py operations. Covers hub/workers and window loss without assuming a fleet restart.
 ---
 
 # multi-terminal-ipc
 
-Operating manual for the project's **multi-terminal IPC** feature: several
-persistent, independent Claude Code terminals — which may be driven by models
-from **different vendors** — collaborate as peers through a **file-based sqlite
-mailbox**. Unlike subagents/same-harness agent teams (single-vendor, single
-process), each terminal here is a full separate session; the mailbox is just
-files on disk and doesn't care which model drives each terminal.
+Operating manual for **multi-terminal IPC**: several persistent, independent
+Claude Code terminals, possibly driven by models from **different vendors**,
+collaborate as peers through a **file-based sqlite mailbox**. Unlike subagents or
+same-harness agent teams, each terminal is a full separate session; the mailbox
+is files on disk and does not care which model drives each terminal.
 
 **This skill is the single authority for the protocol (2026-08-21).** Project
-`AGENTS.md` files no longer restate it — they carry only that deployment's own
-facts and hard rules (mailbox key, model bindings, dispatch exceptions), which
-override this skill on exactly those points. The claude-star-ipc repo's
-`CLAUDE.md` is likewise a pointer here; `install_user.py` ships this skill
-user-level, version-locked to the machinery.
+`AGENTS.md` files carry only that deployment's own facts and hard rules (mailbox
+key, model bindings, dispatch exceptions), which override this skill on exactly
+those points. The claude-star-ipc repo's `CLAUDE.md` is a pointer here;
+`install_user.py` ships this skill user-level, version-locked to the machinery.
+
+## Shared entrypoints
+
+Maintainer: this shared skill; canonical files live in `~/.claude/skills/multi-terminal-ipc`, exposed to Codex by the `~/.agents/skills/multi-terminal-ipc` junction.
+- Claude: `/multi-terminal-ipc main [task]` or `/multi-terminal-ipc recover ROLE`; `/main` and `/ipc-recover ROLE` remain thin compatibility commands.
+- Codex: `$multi-terminal-ipc main [task]` or `$multi-terminal-ipc recover ROLE`.
+- Main: read `references/claude-main.md` on Claude or `references/codex-main.md` on Codex.
+- Recover: read `references/claude-recover.md` on Claude or `references/codex-recover.md` on Codex. Explicit role arguments take precedence.
+- Other operations: use the protocol and operation-specific references below. Reading or maintaining this skill does not claim a role or start a receiver.
+
+Run IPC commands from the intended project root with the installed stdlib Python runtime. Main changes role ownership and may dispatch the supplied task; recover restores that role's receiver. Preserve project validation and restart approval boundaries. Claude uses its Monitor/background receive adapter; Codex uses the in-turn receiver and explicit full CODEX_THREAD_ID. Never substitute one host's receiver for the other.
+Verified 2026-10-29: merged role procedures and launcher invocation routes; static lint and PowerShell parser checks. No live fleet was started for migration validation.
 
 ## Mental model
 
@@ -28,8 +38,9 @@ user-level, version-locked to the machinery.
 - **The star is code-enforced**, not just convention: `send()` rejects any
   non-hub→non-hub message (`send --from B --to C` → `StarViolation`, exit 3), and
   an echo ceiling (`hop > ttl`) kills relay loops. A worker driven by *any*
-  vendor's model literally cannot message a peer or echo a loop. Hub is
-  configurable via `IPC_HUB` (default `A`).
+  vendor's model literally cannot message a peer or echo a loop; the only
+  code-generated messages are the hub→worker notes `send()` writes for
+  `--for-task` forwards (2026-10-31). Hub is configurable via `IPC_HUB` (default `A`).
 - **One mailbox per project root.** The user-level `~/.claude/ipc/ipc.py` keeps
   state (`_ipc.db`, registry, heartbeats) in `~/.claude/projects/<slug>-<hash>/ipc/`
   (`ipc.py:124-132`). The hash is SHA-1 of the normalized project root:
@@ -39,8 +50,8 @@ user-level, version-locked to the machinery.
   lossy and CJK paths collide). Two terminals share a mailbox **iff both resolve
   to the same project root**; a terminal started elsewhere gets a different
   mailbox and can never connect. `ipc.py` below = `python ~/.claude/ipc/ipc.py`
-  run from that root. Legacy project-local installs (a `_ipc.db` beside the
-  script) keep state in the script's own directory — see Deployment topologies.
+  run from that root. Legacy project-local installs keep state beside the
+  script: see Deployment topologies.
 - **More code-level guarantees** (atomic single-consumer claim, `alive`/`busy`
   heartbeat split, QUEUED-BUSY, reaper caveats): read
   `references/state-and-lifecycle.md` when judging whether a worker is parked,
@@ -49,14 +60,14 @@ user-level, version-locked to the machinery.
 ## Hard prerequisite
 
 All terminals **must launch from the same project root** (the cwd when starting
-`claude`). Confirm cwd matches before opening a terminal. This is the #1 cause of
+`claude`); confirm it before opening a terminal. This is the #1 cause of
 "they can't see each other".
 
 ## Enable in a new project (onboarding) — `references/onboarding.md`
 
 One per-project artifact only: run `python ~/.claude/ipc/ipc_role.py enable` with `CLAUDE_PROJECT_DIR`
 set to the project root (unset = resolved from cwd) (creates `.claude/ipc.enabled`; validates the user-level install; refuses the home dir and `~/.claude`;
-idempotent). Then launch panes via the fleet script (it types `/ipc-recover <role>` into each pane; Codex panes `$ipc-recover <role>`), verify with
+idempotent). Then launch the hub pane via the fleet script (`-Roles A`; A adds the workers it picks after reading the task, `references/orchestration-and-dispatch.md` § Lineup decided by the hub, user rule 2026-10-27; the script types `/ipc-recover <role>` into each pane; Codex panes `$multi-terminal-ipc recover <role>`), verify with
 `ipc_role.py status` plus one A→B round-trip. Guards, the per-project AGENTS.md pointer rule and the
 fresh-machine path (`install_user.py`) are in the reference file — read it when the trigger is
 在新项目启用 IPC / enable IPC.
@@ -67,7 +78,7 @@ The SessionStart hook claims roles (first-in = A, the rest take the lowest free
 slot). Read `references/bring-up.md` when opening, claiming or re-claiming a
 terminal: the claim guard (Claude claims only with `WEZTERM_PANE` or `IPC_ROLE`
 set; Codex only with an explicit `IPC_ROLE`), the manual floor (the fleet
-launcher types `/ipc-recover <role>` — Codex: `$ipc-recover <role>` — into each
+launcher types `/ipc-recover <role>` — Codex: `$multi-terminal-ipc recover <role>` — into each
 pane itself; only a window opened by hand needs it typed), forcing a role with `IPC_ROLE=A claude …`, and the role
 registry commands.
 
@@ -90,7 +101,7 @@ pane or GUI window is gone, or to check role→model bindings. Routing:
   timeout or missing reply is not a terminal state: re-poll the same handle
   (`status --watch <role>`, the pane in `wezterm cli list`) before recycling.
   (Codex goal-continuation template, openai/codex codex-rs, read 2026-10-04.)
-- Pane alive but silent after a launch, refresh or `/ipc-recover`: probe it (`python ~/.claude/ipc/ipc_pane_probe.py <role>`); verdict `BLOCKED-NOTICE` means a harness notice or the Codex update prompt sits over the TUI and the model never sees the next tool result. Dismiss it (Enter; Codex update prompt: Esc), re-probe, only then dispatch. the hub's reply clock (built into `watch --me A` since 2026-10-18) reports it at its 15/30/45-minute checks (2026-10-17, see fleet-operations gotcha).
+- Pane alive but silent after a launch, refresh or `/ipc-recover`: probe it (`python ~/.claude/ipc/ipc_pane_probe.py <role>`); verdict `BLOCKED-NOTICE` means a harness notice or the Codex update prompt sits over the TUI and the model never sees the next tool result. Dismiss it (Enter; Codex update prompt: Esc), re-probe, only then dispatch. The hub's reply clock (in `watch --me A` since 2026-10-18) reports it at its 15/30/45-minute checks (fleet-operations gotcha).
 - `ipc_fleet1_restart.ps1` is whole-fleet only: `-Roles` picks what comes back,
   never what gets torn down. It is also the project-switch path (`-Project`);
   `ipc_newcycle.ps1` never changes a pane's cwd. The user runs it from a window
@@ -100,7 +111,7 @@ pane or GUI window is gone, or to check role→model bindings. Routing:
 
 **When launching a fleet on the
 user's behalf, ask which project first and pass `-Project` — unless the user already named the
-project and scope in this request (2026-09-05 relaxation: do not re-confirm what was just stated;
+project and scope in this request (2026-09-05: do not re-confirm what was just stated;
 still validate the `-Project` value and never widen the scope to a whole-fleet restart, another
 project, or someone else's running task).**
 **Every WezTerm start or restart is fleet form (user rule 2026-10-18):** never an ad-hoc standalone
@@ -109,63 +120,21 @@ running (is the fleet-1 mux socket reachable, then `status --watch <role>`):
 - "启动/打开 wezterm" and the fleet-1 mux is alive (GUI window closed or never attached) → the
   GUI-gone routing above: workers ALIVE = reattach only (`wezterm connect fleet1`, contexts intact,
   no project question); workers DOWN = restart script.
-- "启动 wezterm" and no fleet-1 mux → `ipc_wezterm_launch.ps1`; ask the project.
+- "启动 wezterm" and no fleet-1 mux → `ipc_wezterm_launch.ps1 -Roles A`; ask the project. Only the hub
+  comes up (user rule 2026-10-27); A launches the workers it needs after the first task.
 - "重启 wezterm" with the fleet up → the user asking for the whole-fleet restart
   (`ipc_fleet1_restart.ps1`), so the never-widen clause above does not block it.
-Lineup size, launch method and routing are Claude's call per [[fleet-default-lineup-20261017]]; a
-launch or restart still asks the project. A request that explicitly names a standalone window, a
+The lineup is the hub's call after the task arrives (user rule 2026-10-27:
+`references/orchestration-and-dispatch.md` § Lineup decided by the hub; role profiles in
+[[fleet-default-lineup-20261017]]); launch method and routing are Claude's call; a
+launch or restart on the user's behalf still asks the project unless the user already named it in
+the same request (the exception above); the hub launching its own workers after a task has
+arrived is not a project question at all ([[hub-no-midtask-questions]]). A request that explicitly names a standalone window, a
 single pane or one command is done as named. Why and the incident: [[fleet-launch-ask-project]].
 
-## Command surface (run from project root)
+## Command surface
 
-### Hub A — dispatch & collect
-```
-ipc.py send --from A --to B "task"                    # one worker
-ipc.py send --from A --to B,C "task"                  # fan out (one row each)
-ipc.py send --from A --to ALL "task"                  # broadcast to every live worker
-ipc.py send --from A --to B --body-file task.md       # body from file — REQUIRED for bodies with backticks/$()/quotes (shell mangles them)
-ipc.py send --from A --to B "task" --require-watcher  # parked=SENT; mid-task (busy fresh)=QUEUED-BUSY exit 0, delivers when B finishes; parked-but-role-unclaimed=REFUSED-SQUATTER exit 3 (2026-08-17 #1186: an orphan heartbeat is not dispatch evidence — remedy printed: ipc_role.py take <role>); neither=REFUSED exit 3, not queued
-ipc.py recv --me A                                    # take unread replies (NONE = nothing yet)
-ipc.py recv --me A --block                            # block until a reply arrives
-ipc.py recv --me A --block --count 3                  # BARRIER: after fanning to 3, wait for all 3 — COUNT TRAP: a worker that text-replies AND runs `done` sends TWO rows (reply + bodyless ack), so the quota can fill on the fastest workers' pairs; size ~2×workers, or tell workers to close with a single message (a text reply alone already marks done)
-ipc.py peek --me A --tail 5                            # review last 5 WITHOUT marking read
-ipc.py peek --me A --id 12 15                          # exactly those ids (from NEW MSG / DONE signals), no marking
-ipc.py peek --me C --batch [N] / --batches             # a complete saved recv --json batch (latest or N; numbered files, last 20 kept): recovery when tool output was truncated
-ipc.py pending --hub A [--detail]                     # tasks dispatched with no reply yet (empty = done)
-ipc.py task --id N [--json]                           # ONE task's state (QUEUED|IN_PROGRESS|DONE|FAILED|CANCELLED|NEEDS-REVIEW|STALE|UNKNOWN), read-only; use it to confirm a claim - pending omits DONE tasks (2026-10-15)
-ipc.py board --type FAIL [--grep kw]                  # typed NEW items (FAIL / FACT / OBSERVED, 2026-10-22 from Agensh) across this project's replies, read-only; read before writing a brief so no role retries a falsified path: references/command-details.md
-ipc.py status --watch B --json                        # {alive,busy,squatter,owner_valid,parked,reason}; scripts gate on `parked` only (2026-10-15)
-ipc.py cancel --task N --by A                          # retract a dispatched task
-# --submit-id / --no-requeue, --json envelopes, pending --json states (QUEUED-STALLED / IN-PROGRESS-SILENT / NEEDS-REVIEW), redeliver, archive table, routing ledger (`类型:`, `ipc_estimate.py rank`, `grade`): references/command-details.md
-# --- mechanical gates & clocks (2026-08-30, from the 2026-08-29 postmortem; user: "能用脚本固化的就固化") ---
-pwsh ~/.claude/ipc/ipc_dispatch.ps1 -Role E -BodyFile brief.md [-SubmitId k] [-MaxMinutes 15] [-DryRun] [-Force]
-                                                      # THE dispatch path: brief lint + recipient pane probe, then park -> send -> nudge -> confirm claim. Gate rules, probes, the reply clock, timing, budget estimates: references/command-details.md
-python ~/.claude/ipc/ipc_supervisor.py start|stop|status  # OUT-OF-SESSION reply clock (2026-10-20): ticks ipc.clock_tick every 60 s as a detached process, dismisses BLOCKED-NOTICE itself (Enter / Esc), writes the rest to <state>/_supervisor_A.events which `watch --me A` relays verbatim; while its heartbeat is fresh the watch runs no clock and `ipc.py clock` refuses. ipc_wezterm_launch.ps1 starts it; log <state>/_supervisor_A.log
-                                                      # QUOTA-HANDOFF lines (2026-10-21): a claimed task's role reached 90 % of its 5h window or 98 % of its 7d window -> the clock typed a handoff request into its pane; on its `[HANDOFF]` reply re-dispatch the rest (original brief + handoff file) to a role with room. `queued, not started` -> cancel + re-route. `hub A` (85 %) -> update _A_ledger.md, dispatch nothing new. Caution 14
-python ~/.claude/ipc/ipc_state.py A E [--all]          # per-role ctx %, quota windows, cache, activity age FROM FILES (2026-10-20): statusline.js writes ~/.claude/ipc/state/<ROLE>.json (IPC_ROLE + settings.json refreshInterval 30 s); codex roles read their registered rollout; Kimi Code / Zhipu roles (state vendor kimi-code / zhipu-cn) get windows from the vendor usage API via ipc_quota, cached 60 s (2026-10-21). ipc_pane_probe.py / ipc_quota.py / the reply clock use it first; the pane regex is the fallback. A claimed task whose transcript grew within 15 min is not probed (ipc.py _CLOCK_ACTIVE_S)
-```
-
-### Worker B/C/D — execute & report
-```
-ipc.py recv --me B                 # take my unread tasks (mark read)
-ipc.py recv --me B --block --signal-only --timeout 3500   # IDLE PARK (2026-10-22, Claude workers, the default park): hosted as a BACKGROUND Bash (run_in_background), no turn while parked; exits on delivery (exit 0: watch-shaped `NEW MSG #id` signals in the task's output file -> peek --id -> ack -> work -> reply -> re-park) or on timeout (exit 2: re-park). recv forks the busy beater for a delivered task; the heartbeat is kept on exit (<= max_age false-alive). Replaces the Monitor watch for workers (idle: 3 turns per 30 min -> 1 per ~58 min); A keeps `watch` (clock relay, DONE compression). From Agensh's event-driven runtime (arXiv:2609.26781 App. B); verified 2026-10-22 (700 s background run survives, delivery wakes the session)
-# Watcher hosting (2026-08-17 #1188 HARD RULE): on Claude, `watch --me <role>` runs under the Monitor tool ONLY — a background-Bash watch buffers its signals to a file the harness surfaces only on exit (observed 1h55m delivery gap); watch now refuses file-stdout hosts with exit 4
-# Codex has no Monitor and an infinite watch never wakes the model (2026-07-28): stand by with the `$ipc-recover` step 3 supervisor — one-shot `recv --me <role> --block --keep-heartbeat` in a loop, re-armed before each notify(); it lives only within the current turn
-# Monitor host is BASH (2026-08-23): a backslash path `C:\Users\<user>\.claude\ipc\ipc.py` is stripped to `Users<user>.claudeipcipc.py` (exit 2) — write `python ~/.claude/ipc/ipc.py watch --me <role>` or `C:/Users/...` forward slashes; PowerShell-tool calls are unaffected [[C--Users-<user>-Downloads-------::monitor-host-bash-forward-slash]]
-ipc.py send --from B --to A --in-reply-to N --body-file result.md   # THE result path (2026-09-16): a linked reply closes task N by itself — no separate `done`, no `--type note`. With several open tasks an unlinked reply is REFUSED-LINK (exit 3), never guessed; --in-reply-to naming a task dispatched to someone else is refused too
-                                   # RESULT-line protocol (2026-09-19): result.md OPENS with one `RESULT: <absolute path>` line per product file (caution 6). send()'s disk check, the `DONE #N` summary and its hold rule: references/command-details.md
-                                   # QUOTA HANDOFF (2026-10-21): a line typed into the pane mid-task, "IPC A: your 5h quota is N% used ...", comes from the hub clock: finish the current step, write the handoff file it names (first line `HANDOFF: <path>`), send it as the linked reply, stop. Hub side and thresholds: references/operational-cautions.md caution 14
-ipc.py send --from B --to A --type note "progress"   # progress/FYI only — a note never closes a task (F's four note-typed results left #1592-#1598 open, 2026-09-16)
-ipc.py done --me B --task N         # close task N WITHOUT a text result (bodyless ack); redundant after a linked reply
-ipc.py ack  --me B --task N         # FIRST ACTION after reading a task (2026-08-17): stamps last_seen_ts so A's IN-PROGRESS-SILENT alarm clears; also the lease-extender for long tasks (no --task = all my claimed)
-ipc.py fail --me B --task N [--reason ...]   # mark failed (won't requeue)
-```
-
-### Role registry (`~/.claude/ipc/ipc_role.py`; legacy project-local installs used `.claude/hooks/ipc_role.py`)
-
-`ipc_role.py status` / `take` / `reclaim-dead` and `ipc.py status --watch <role>`
-(ALIVE / BUSY / DOWN / `[SQUATTER]` exit codes): `references/bring-up.md` § Role
-registry. Read it when verifying a claim, re-taking a role or reading a watcher state.
+Read `references/command-surface.md` for hub, worker and role-registry commands before sending or collecting messages.
 
 ## Orchestration, brief standard, capacity — `references/orchestration-and-dispatch.md`
 
@@ -191,32 +160,15 @@ STALE, NEEDS-REVIEW or failed after retries, or before changing `--lease`.
 
 ## How A waits / recovery after /clear — see the role procedures
 
-This skill owns the protocol; the two role procedures own their steps (not
-restated here). Claude forms: `~/.claude/commands/main.md`, `ipc-recover.md`.
-Codex forms: `~/.agents/skills/ipc-main/`, `ipc-recover/` (in-turn `recv`
-supervisor in place of the Monitor `watch`). Edit both forms in the same pass;
-lint-codex COMMAND-PAIR flags a one-sided edit (2026-10-04: `$ipc-main` lacked
-two 2026-09-16 rules).
-- **Hub duties & collecting replies** → `/main` / `$ipc-main`:
-  persistent Monitor on `watch --me A`, signal → `peek`, bash fallback. Since
-  2026-08-21 (user decision) the hub parks this watcher at BOOT like a worker —
-  the fleet launcher sends `/ipc-recover A` to the hub pane too, and newcycle
-  re-parks it after /clear. Registry exemption is unchanged: a dead hub
-  heartbeat is never auto-reclaimed (`status` shows "watcher down", role kept).
-- **Recovery after /clear / compaction / hook failure** →
-  `/ipc-recover <role>` / `$ipc-recover <role>`. Key invariant:
-  `/clear` keeps the role, kills only the watcher — recovery = re-park the
-  watcher, never re-claim or switch roles.
+Read the matching main or recover adapter listed under Shared entrypoints. Both host adapters are maintained inside this single shared skill; compatibility commands contain no protocol.
 
 ## 注意事项 (the cautions that actually bite)
 
-Before any IPC operation, read `references/operational-cautions.md`. It retains all numbered cautions (1–17), result protocol, watcher requirements, restart boundaries and reply clocks. References to caution numbers below refer to that file.
+Before any IPC operation, read `references/operational-cautions.md`: all numbered cautions (1–18), result protocol, watcher requirements, restart boundaries and reply clocks. Caution numbers in this file refer to it.
 
 ## Deployment topologies (where state lives)
 
-User-level shared install is the current default; legacy project-local installs
-keep `_ipc.db`, registry and heartbeats beside the script. Layout of both and the
-migration rule: `references/state-and-lifecycle.md` § Deployment topologies.
-
-Confirm which topology a project uses from its `AGENTS.md` Deployment note before
-assuming where `_ipc.db` and the registry live.
+User-level shared install is the default; legacy project-local installs keep
+`_ipc.db`, registry and heartbeats beside the script. Layout and migration rule:
+`references/state-and-lifecycle.md` § Deployment topologies. Read the project's
+`AGENTS.md` Deployment note before assuming where state lives.

@@ -66,7 +66,7 @@ pwsh -NoProfile -c "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" 
 python ~/.claude/ipc/fleet_get_text.py gui-sock-<fleet1 GUI pid> <C 或 E 的映射 id + 1> 20
 ```
 判据：进程表里没有 `recv --me C/E` → 收件器已随 codex 回合结束被杀，屏幕那句是假的；状态行 `Context NN% left` 健康（>20%）→ pane 本身没病。若 `Context 0%` + 屏幕反复 `recv --block` → 另一种病（memory `codex-context-zero-recv-loop`），处置=撤单改派+刷新 pane。
-处置：**什么都不做**。不要 `reclaim-dead`（owner 清成 `-` 后派单撞 `REFUSED-SQUATTER`），不要刷新 pane（白烧上下文）。派单时 `ipc_dispatch.ps1` 步骤 1 会自动往 pane 打 `$ipc-recover <角色>` 再排队——前提是 fleet1 socket 健康（T1）。
+处置：**什么都不做**。不要 `reclaim-dead`（owner 清成 `-` 后派单撞 `REFUSED-SQUATTER`），不要刷新 pane（白烧上下文）。派单时 `ipc_dispatch.ps1` 步骤 1 会自动往 pane 打 `$multi-terminal-ipc recover <角色>` 再排队——前提是 fleet1 socket 健康（T1）。
 验证：派单后 `python ~/.claude/ipc/ipc.py status --watch C` 出 ALIVE。
 备注：E 曾在 `recv --me E` 抛 `sqlite3.OperationalError: attempt to write a readonly database`（2026-08-30 11:0x），DB 及 -wal/-shm 实测可写、C 同为 codex 写库正常，原因未定；复现时让 E 把完整 traceback 落盘。
 
@@ -131,7 +131,7 @@ again at 9:05 PM.
 ## T7. 整队重启把 hub A 也带走了（用户 2026-10-18 定：hub 留在编队，接受此代价）
 
 症状：`ipc_fleet1_restart.ps1` 后 A 的上下文消失；日志出现 `[A] orphan watcher pid … killed` + `[A] pane 0: claude …`。
-根因：A 的 pane 与 worker 同在 fleet1 的 mux 里，kill mux 即 kill A；脚本默认 `-Roles A,B,C,D,E,F`，`-Roles` 去掉 A 也救不了（pane 随 mux 死）。实例 2026-08-30 14:33（#1255）：新 A 14:33:15 起，从信箱重建了在途状态，但上午对话没了。
+根因：A 的 pane 与 worker 同在 fleet1 的 mux 里，kill mux 即 kill A；脚本当时默认 `-Roles A,B,C,D,E,F`(2026-10-27 起默认只 A)，`-Roles` 去掉 A 也救不了（pane 随 mux 死）。实例 2026-08-30 14:33（#1255）：新 A 14:33:15 起，从信箱重建了在途状态，但上午对话没了。
 探查：
 ```
 pwsh -NoProfile -c "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'claude.exe' } | Select-Object ProcessId,CreationDate,CommandLine | Sort-Object CreationDate | Format-Table -AutoSize"
@@ -178,8 +178,8 @@ ls -lt --time-style=+%H:%M:%S <项目>\_staging\_A_brief_*.md | head          # 
 pwsh -NoProfile -File <scratch>\test_panekind.ps1        # 或：. ~/.claude/ipc/ipc_wezterm_common.ps1; Get-PaneKind <pane>
 python ~/.claude/ipc/fleet_get_text.py fleet1.sock <pane> 30   # 看 resume 提示与 PS 提示符的先后
 ```
-判据：`Get-PaneKind` 返回 `shell` = TUI 已不在，先起 TUI 再谈命令；`codex` = 不许 Ctrl+C、不许 claude 专用斜杠命令（`/clear`→`/new`，`/ipc-recover`→`$ipc-recover`）。
-处置：pane 里敲 `codex --model gpt-6-luna -c model_reasoning_effort=max`（C 的现行绑定，2026-10-04 起；或裸 `codex`）起 TUI → `pwsh ~/.claude/ipc/ipc_wake_pane.ps1 -Role C -NoClear -Message '$ipc-recover C'`（**必须 `-NoClear`**）→ `ipc.py status --watch C` 出 ALIVE、`ipc_role.py status` owner 为会话 id 即成（codex 的 SessionStart 钩子会自己 claim）。
+判据：`Get-PaneKind` 返回 `shell` = TUI 已不在，先起 TUI 再谈命令；`codex` = 不许 Ctrl+C、不许 claude 专用斜杠命令（`/clear`→`/new`，`/ipc-recover`→`$multi-terminal-ipc recover`）。
+处置：pane 里敲 `codex --model gpt-6-luna -c model_reasoning_effort=max`（C 的现行绑定，2026-10-04 起；或裸 `codex`）起 TUI → `pwsh ~/.claude/ipc/ipc_wake_pane.ps1 -Role C -NoClear -Message '$multi-terminal-ipc recover C'`（**必须 `-NoClear`**）→ `ipc.py status --watch C` 出 ALIVE、`ipc_role.py status` owner 为会话 id 即成（codex 的 SessionStart 钩子会自己 claim）。
 已修（共享代码）：`ipc_wezterm_common.ps1` 新增 `Get-PaneKind`（按 pane 自己的页脚/提示符形态判 codex/claude/shell），`Clear-PaneInput` 对 codex pane 直接返回不发 Ctrl+C；`_staging\_A_send_pane_command.ps1` 发前判 kind：shell → 拒发，codex → `/clear`→`/new`、`/exit`→`/quit`、claude 专用命令拒发、不 Ctrl+C；`ipc_newcycle.ps1:30-31` 的 codex 表补上 C（否则下次 newcycle 给 C 发 `/clear`）。
 
 ## T11. pane 满屏鼠标转义序列（TUI 死后未还原终端模式）——判 dead-tui，不是 unknown

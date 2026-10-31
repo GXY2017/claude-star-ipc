@@ -35,7 +35,14 @@ its stale claim parks as **NEEDS-REVIEW** in `pending` (fail-closed) until the
 hub `cancel`s or the worker `done`/`fail`s it (`ack` revives it to
 IN_PROGRESS); unresolved NEEDS-REVIEW rows are also never auto-archived. Requeued rows that already have a reply/ack are
 **done-dropped at claim** (claimed silently, never redelivered), so a phantom
-requeue can't make a worker redo finished work. The mailbox also self-trims:
+requeue can't make a worker redo finished work. A task delivered again (reaper
+requeue or `redeliver`, `--no-requeue` included: attempts > 1 at claim) reaches
+the worker with the fixed prefix `[REQUEUED attempt k/MAX] 此单此前已投递过、未结清就被收回。…`
+(recv text, the `NEW MSG` signal tag, the recipient's own `peek`; `--json` adds
+`requeued` and `attempt` instead): check the working directory, the brief's
+product paths, git history and files on disk, skip finished parts, and confirm
+send/commit/order actions did not already happen; the stored body is never
+changed (2026-10-31, from DeepSeek Super-agent article). The mailbox also self-trims:
 past 300 rows, handled/terminal history is lazily archived inside
 recv/watch/pending (newest 150 always kept). Since 2026-10-17 archived rows are
 moved, not deleted: they go to the table `messages_archive` in the same `_ipc.db`

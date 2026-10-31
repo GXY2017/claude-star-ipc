@@ -502,7 +502,7 @@ function Invoke-PaneRelaunch([string]$Role, [int]$PaneId, [string]$Project, [swi
     Submit-PaneText $PaneId "Set-Location -LiteralPath '$projQ'; `$env:IPC_ROLE='$Role'; $cmd"
     $ready = if ($isCodex) { Wait-CodexReady $PaneId 150 $cmd } else { Wait-PaneReady $PaneId 90 }
     if (-not $ready) { return "[$Role] ERROR - relaunched but not ready in time; look at pane $PaneId (no wake sent)" }
-    $wake = if ($isCodex) { "`$ipc-recover $Role" } else { "/ipc-recover $Role" }
+    $wake = if ($isCodex) { "`$multi-terminal-ipc recover $Role" } else { "/ipc-recover $Role" }
     Submit-PaneText $PaneId $wake
     return "[$Role] pane $PaneId : relaunched ($cmd), sent $wake"
 }

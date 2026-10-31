@@ -12,7 +12,7 @@
 # it), so role assignment is deterministic, not launch-order roulette.
 
 param(
-    [string[]]$Roles = @('A','B'),
+    [string[]]$Roles = @('A'),   # user rule 2026-10-27: a fleet starts with the hub alone; A runs this script again with -Roles <workers> after it has read the task (orchestration-and-dispatch.md § Lineup decided by the hub)
     [string]$Project,   # empty = ask (console) / error (headless, incl. Claude sessions)
     [switch]$DryRun,
     [switch]$Force     # add a pane even if the role's mapped pane is still alive (normally refused, 2026-09-15)
@@ -71,6 +71,8 @@ $Roles = @($Roles | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim(
 #   modelUsage contextWindow=1000000 with or without [1m], and A's transcript ran to 689K
 #   uncompacted. E's ~/.codex/config.toml moved to gpt-6.1-sol high the same day;
 #   C stays gpt-6-luna max (models_cache.json lists no gpt-6.1-luna).
+# E rebound 2026-10-27 (user): codex gpt-6.1-terra, reasoning xhigh (models_cache.json
+#   lists gpt-6.1-terra since at least 2026-10-27; was gpt-6.1-sol xhigh 10-20..10-27).
 # F added 2026-08-14: GLM via Zhipu direct (claude-glm profile fn, glm-5.3[1m]).
 # G added 2026-10-21 (user): MiniMax M3.1 Flash via Ollama Cloud, free only until the
 #   $RoleFreeUntil deadline below. ollama launch sets no context size for this slug
@@ -80,10 +82,10 @@ $Roles = @($Roles | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim(
 # ollama forwards what follows `--` to the integration.
 $LaunchCmd = @{
     A     = 'claude --model claude-opus-5-5 --permission-mode auto'   # user pick 2026-08-03: hub on Opus; Opus 5.5 from 2026-10-05, 1M native (was claude-opus-5[1m] 09-14..10-05: fixed ctx 206K > 200K caused an auto-compact loop, so A needs a 1M window)
-    B     = "claude-kimi 'k3[1m]' --permission-mode auto"    # positional -Model MUST come first or it swallows the flag (ValidateSet)
+    B     = "claude-kimi -Model 'k3.1-pro-highspeed' --permission-mode auto"    # user 2026-10-26: B on K3.1 (claude-kimi default since 2026-10-24, natively 1M, no [1m]); was k3[1m] until 10-26
     C     = 'codex --model gpt-6-luna -c model_reasoning_effort=max'  # user 2026-10-04: C = codex gpt-6-luna max (was gpt-5.6-luna max 09-19..10-04, sol xhigh 08-30..09-19); flags pin it even if ~/.codex/config.toml defaults change
     D     = 'claude-ds --permission-mode auto'               # profile fn, DeepSeek env block
-    E     = 'codex --model gpt-6.1-sol -c model_reasoning_effort=xhigh'  # user 2026-10-20: E = codex gpt-6.1-sol xhigh, pinned by flags (was bare `codex` following ~/.codex/config.toml: gpt-6.1-sol high 10-05..10-17, gpt-6-astra medium 10-18..10-20)
+    E     = 'codex --model gpt-6.1-terra -c model_reasoning_effort=xhigh'  # user 2026-10-27: E = codex gpt-6.1-terra xhigh, pinned by flags (was gpt-6.1-sol xhigh 10-20..10-27; before that bare `codex` following ~/.codex/config.toml: gpt-6.1-sol high 10-05..10-17, gpt-6-astra medium 10-18..10-20)
     F     = 'claude-glm --permission-mode auto'              # profile fn, Zhipu direct (glm-5.3[1m]); added 2026-08-14
     G     = '$env:CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000; $env:CLAUDE_CODE_AUTO_COMPACT_WINDOW=750000; ollama launch claude --model minimax-m3.1-flash:cloud -y -- --permission-mode auto'   # added 2026-10-21; no inner quotes (ipc.py _role_variant parses this line)
     CODEX = 'codex'      # legacy named channel, redundant with E since 2026-08-03
@@ -103,7 +105,7 @@ $ModelTag = @{
     B     = 'Kimi'
     C     = 'Codex-gpt6-luna'  # 2026-10-04: second codex pane, gpt-6-luna max (was Codex-luna = gpt-5.6-luna 09-19..10-04, Codex-sol 08-30..09-19; E stays the config.toml-driven one)
     D     = 'DeepSeek'
-    E     = 'Codex-gpt6.1-sol'  # 2026-10-20: pinned sol xhigh (was bare 'Codex' while E followed config.toml)
+    E     = 'Codex-gpt6.1-terra'  # 2026-10-27: pinned terra xhigh (Codex-gpt6.1-sol 10-20..10-27; bare 'Codex' before that while E followed config.toml)
     F     = 'GLM-Zhipu'
     G     = 'MiniMax-ollama'
     CODEX = 'Codex'
@@ -197,7 +199,7 @@ if (-not $freshGui -and -not $Force) {
     foreach ($r in $Roles) {
         $entry = $map[$r]
         if ($entry -and $entry.pane_id -ne $null -and $livePanes -contains [int]$entry.pane_id) {
-            $recover = if ($CodexRoles -contains $r) { "`$ipc-recover $r" } else { "/ipc-recover $r" }
+            $recover = if ($CodexRoles -contains $r) { "`$multi-terminal-ipc recover $r" } else { "/ipc-recover $r" }
             $dupes += "  role $r -> pane $($entry.pane_id) is still alive. Wake it in place instead:`n" +
                       "    pwsh ~/.claude/ipc/ipc_wake_pane.ps1 -Role $r -Message '$recover'`n" +
                       "  (low context? pwsh ~/.claude/ipc/ipc_newcycle.ps1 -Roles $r ; TUI dead back to the shell? type its launch command into that pane)"
@@ -257,10 +259,10 @@ foreach ($l in $launched) {
         # drives the npm self-update flow unattended (confirm + relaunch,
         # user rule 2026-08-06).
         if (Wait-CodexReady $l.pane) {
-            Submit-PaneText $l.pane "`$ipc-recover $($l.role)"
-            Write-Host "[$($l.role)] codex TUI ready, `$ipc-recover $($l.role) sent - heartbeat should park"
+            Submit-PaneText $l.pane "`$multi-terminal-ipc recover $($l.role)"
+            Write-Host "[$($l.role)] codex TUI ready, `$multi-terminal-ipc recover $($l.role) sent - heartbeat should park"
         } else {
-            Write-Warning "[$($l.role)] pane $($l.pane) codex TUI not ready within timeout (first-run trust dialog?) - send `$ipc-recover $($l.role) manually"
+            Write-Warning "[$($l.role)] pane $($l.pane) codex TUI not ready within timeout (first-run trust dialog?) - send `$multi-terminal-ipc recover $($l.role) manually"
         }
         continue
     }

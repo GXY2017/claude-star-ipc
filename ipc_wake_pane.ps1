@@ -1,6 +1,6 @@
 # Wake a role's WezTerm pane by injecting a short drain instruction.
 # Reason to exist (2026-08-06): the codex pane (role E) cannot self-wake on IPC
-# delivery - its $ipc-recover supervisor does not survive turn end (observed: only
+# delivery - its $multi-terminal-ipc recover supervisor does not survive turn end (observed: only
 # `ipc.py keepalive --me E` left running, no recv armed), and the keepalive beat
 # makes `status --watch E` report ALIVE while the mailbox is actually unattended.
 # So the hub MUST follow every `send --to E` with this wake. Works for any mapped
@@ -10,7 +10,7 @@
 #   pwsh ~/.claude/ipc/ipc_wake_pane.ps1                 # wake E, default drain msg
 #   pwsh ~/.claude/ipc/ipc_wake_pane.ps1 -Role E -Message 'custom instruction'
 #   pwsh ~/.claude/ipc/ipc_wake_pane.ps1 -Role E -Model luna   # cheap-tier task: restart codex on gpt-6-luna
-# -Model (codex roles only): 'luna'|'sol'|'astra' (GPT-6 family, sol = gpt-6.1-sol since 2026-10-05; 'terra' = astra, there is no gpt-6-terra)
+# -Model (codex roles only): 'luna'|'sol'|'astra'|'terra' (GPT-6 family, sol = gpt-6.1-sol since 2026-10-05, terra = gpt-6.1-terra since 2026-10-27; before that 'terra' aliased astra because no gpt-6-terra existed)
 # or a full model id. GPT-6 only since 2026-10-04: ~/.codex/AGENTS.md relies on the GPT-6
 # templates' built-in base rules, which gpt-5.6-* lack. Quota economics
 # (2026-08-08): Luna usage counts ~80% cheaper against the Codex subscription, so
@@ -43,12 +43,12 @@ $livePanes = @(Get-WeztermPanes | ForEach-Object { $_.pane_id })
 if ($livePanes -notcontains $paneId) { throw "pane $paneId for role $Role is gone - relaunch via ipc_wezterm_launch.ps1" }
 
 if ($CodexRoles -contains $Role) {
-    $modelMap = @{ luna = 'gpt-6-luna'; sol = 'gpt-6.1-sol'; astra = 'gpt-6-astra'; terra = 'gpt-6-astra' }   # newest per tier in ~/.codex/models_cache.json (2026-10-05: sol has 6.1, luna/astra do not)
+    $modelMap = @{ luna = 'gpt-6-luna'; sol = 'gpt-6.1-sol'; astra = 'gpt-6-astra'; terra = 'gpt-6.1-terra' }   # newest per tier in ~/.codex/models_cache.json (2026-10-27: sol and terra have 6.1, luna/astra do not)
     $targetModel = ''
     if ($Model) {
         $targetModel = if ($modelMap.ContainsKey($Model.ToLower())) { $modelMap[$Model.ToLower()] } else { $Model }
     }
-    # 2026-10-20: without -Model, relaunch with the role's pinned $LaunchCmd (E = gpt-6.1-sol xhigh,
+    # 2026-10-20: without -Model, relaunch with the role's pinned $LaunchCmd (E = gpt-6.1-terra xhigh since 10-27, sol xhigh 10-20..10-27;
     # C = gpt-6-luna max) instead of a bare `codex` that would fall back to ~/.codex/config.toml.
     $tableCmd = (Get-LauncherTable 'LaunchCmd')[$Role]
     $launchCmd = if ($targetModel) { "codex -m $targetModel" } elseif ($tableCmd) { $tableCmd } else { 'codex' }

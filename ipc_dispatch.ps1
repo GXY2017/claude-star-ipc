@@ -11,6 +11,7 @@
 #   pwsh ~/.claude/ipc/ipc_dispatch.ps1 -Role E -BodyFile task.md -SubmitId mat-b3
 #   pwsh ~/.claude/ipc/ipc_dispatch.ps1 -Role B -BodyFile task.md            # claude-family: no nudge
 #   pwsh ~/.claude/ipc/ipc_dispatch.ps1 -Role E -BodyFile task.md -Nudge "自定义开工提示"
+#   pwsh ~/.claude/ipc/ipc_dispatch.ps1 -Role D -BodyFile review.md -ForTask 12   # D's CLEAN reply is forwarded to #12's owner (ipc.py send --for-task, 2026-10-31)
 #   -Force      = environment gates only (socket/pane/ctx unreadable); recipient must have a parked watcher
 #   -ForceLint  = skip the brief lint explicitly (printed as such); the two never imply each other
 
@@ -18,6 +19,7 @@ param(
     [Parameter(Mandatory)][string]$Role,
     [Parameter(Mandatory)][string]$BodyFile,
     [string]$SubmitId,
+    [int]$ForTask,         # passthrough to `ipc.py send --for-task N` (hub task subscription, 2026-10-31)
     [string]$Nudge,        # override the default start-now nudge (codex roles only)
     [string]$From = 'A',
     [int]$ParkTimeoutSec = 180,
@@ -91,7 +93,7 @@ if ($gate -ne 'PARKED') {
     if (-not (Resolve-WeztermSocket -Fleet $fleet)) { throw "$Role watcher $($verdict.state) and no $fleet wezterm socket to re-park it" }
     $pane = Get-PaneIdForRole $Role   # override-aware (socket detour, 2026-08-30 #1235)
     Write-Host "[$Role] watcher $($verdict.state) - re-parking via pane $pane"
-    if ($isCodex) { Submit-PaneText $pane "`$ipc-recover $Role" 800 }
+    if ($isCodex) { Submit-PaneText $pane "`$multi-terminal-ipc recover $Role" 800 }
     else          { Submit-PaneText $pane 'standby' 800 }
     $deadline = (Get-Date).AddSeconds($ParkTimeoutSec)
     while ((Get-Date) -lt $deadline) {
@@ -131,6 +133,7 @@ $sendFile = Join-Path ([IO.Path]::GetTempPath()) ("ipc-brief-{0}-{1}.md" -f $Rol
 # --- 2. queue the task (no --require-watcher: freshly parked heartbeats lose its <8s race) ---
 $sendArgs = @('send', '--from', $From, '--to', $Role, '--body-file', $sendFile)
 if ($SubmitId) { $sendArgs += @('--submit-id', $SubmitId) }
+if ($ForTask)  { $sendArgs += @('--for-task', "$ForTask") }
 $out = (& python $ipc @sendArgs 2>&1) -join "`n"
 Remove-Item $sendFile -ErrorAction SilentlyContinue   # temp copy; the body now lives in the mailbox DB
 Write-Host $out

@@ -68,7 +68,7 @@ rules (guard-safe constraints verbatim; preprocessed inputs ship as files).
    incremental flush (append each finished unit to the deliverable file before
    starting the next — B lost 4 hours of work in 2026-08-29 #1076 by holding it
    all in context). A then runs the 15-minute reply clock from
-   `~/.claude/commands/main.md` § A 的职责边界与节奏: no reply at 15 min →
+   `references/claude-main.md` § A 的职责边界与节奏: no reply at 15 min →
    inspect; working normally → one more 15 min; stalled/abnormal → act now;
    two extensions max. Workers do not self-report quota; the hub clock asks a
    role near the end of its window for a handoff file (operational-cautions.md
@@ -99,9 +99,9 @@ rules (guard-safe constraints verbatim; preprocessed inputs ship as files).
    cutoff). On a `[REPLAN]` reply, A fixes the premise and writes a new brief;
    on `[UNSOLVABLE]`, A reroutes or reports — never re-sends the same brief.
 6. **Shared view, separate writers, central ruling** (user decision
-   2026-10-22, from the AI财务分析 Anthropic case post-mortem: 69 briefs, 17
-   review rounds, most bytes were restated background and receipts repeating
-   briefs). The mailbox is the doorbell; the content lives in files that every
+   2026-10-22, from one project's case post-mortem: 69 briefs, 17 review
+   rounds, most bytes were restated background and receipts repeating briefs;
+   [[ai-fin::process-revision-2026-10-22]]). The mailbox is the doorbell; the content lives in files that every
    role can read and exactly one role writes:
    - **Case brief** (extends rule 3): A writes one file per case holding the
      background every role needs (question and deliverable, outline, units and
@@ -134,6 +134,12 @@ rules (guard-safe constraints verbatim; preprocessed inputs ship as files).
      if that is impossible, A pauses the affected tasks until the re-submit.
      A change note alone protects nothing. When a shared caliber changes, A logs
      it in the case brief and sends one notice to every affected in-flight task.
+   - **Findings reach the author by code** (2026-10-31, from DeepSeek Super-agent
+     article): a reviewer task dispatched with `--for-task <author task>`
+     (`ipc_dispatch.ps1 -ForTask N`) has its CLEAN findings reply forwarded to
+     the author as a note the moment it lands; the author task must still be
+     open (a delivered one is closed, so name its revision task). A's ruling
+     still follows as its own note; assignment and conflicts stay with A.
    - Roles never dispatch to each other; assignment and cross-role conflicts
      stay with A. No shared-write tables, no file watchers: the existing
      dispatch, wake, reply-correlation, `task --id` and RESULT path are enough.
@@ -141,6 +147,48 @@ rules (guard-safe constraints verbatim; preprocessed inputs ship as files).
    with the project; this rule names none. Acceptance of the change is judged
    on outcomes, not bytes: less hub restating and re-entry, less waiting and
    rework, no wrong-version reads or missed acceptance.
+
+## Lineup decided by the hub after the task arrives (user rule 2026-10-27)
+
+Fleet 1 launches with the hub alone: `pwsh ~/.claude/ipc/ipc_wezterm_launch.ps1 -Project "<root>" -Roles A`
+(the launcher's `-Roles` default is `A` since 2026-10-27; `ipc_fleet1_restart.ps1` relaunches `A` alone
+too). No worker pane exists until A has read a task. User, 2026-10-27 (session 8dbd5deb):
+"先启动A，再由A根据收到的任务大小、难度、复杂度、剩余额度，自主决定其他哪些角色". Before that the
+lineup was fixed at boot (`-Roles A,B,D,E,F[,G]`, [[fleet-default-lineup-20261017]]); the role
+profiles and routing rules in that memory remain the input to A's choice.
+
+Procedure, run by A in its own pane once the first task is in (typed by the user, or passed as
+`/main` arguments), and again whenever a later task needs a role that is not up:
+
+1. **Size the task before naming anyone**: how many 15-minute slices (`UNITS`), which `类型:`
+   values, whether the output is script-verifiable (data pulls, tables, scripts) or needs judgment
+   (arguments, root causes, audit verdicts), whether any slice is genuinely hard code.
+2. **Quota first**: `python ~/.claude/ipc/ipc_quota.py` (all roles). HOLD roles are not launched;
+   THROTTLE roles only for slices that fit the remainder; D is pay-per-token, so long or unbounded
+   work prefers a windowed role with remainder; B is preferred while its Kimi week has quota; G
+   launches only while the launcher's `$RoleFreeUntil` allows (the launcher drops it otherwise).
+   `python ~/.claude/ipc/ipc_estimate.py rank --type <类型> [--open]` ranks the candidates by ledger.
+3. **Smallest lineup that covers the work** (binding authority: `$LaunchCmd` in
+   `ipc_wezterm_launch.ps1`; profiles: [[fleet-default-lineup-20261017]]):
+   - one slice, script-verifiable → one producer: D for scripts and data, F or B for Chinese
+     writing, web and long documents (A manages only, it does not execute: `references/claude-main.md` § A 的职责边界与节奏 rule 1);
+   - several slices, or judgment needed → producer(s) plus one reviewer of another vendor (D first,
+     briefed for counterexamples; D's own output → E or F; D never checks D; the reviewer rule
+     and its no-fleet fallback are stated once in review-discipline SKILL.md § Dispatching a reviewer, authoritative);
+   - large or multi-track → parallel producers (D + F/B) and a cross-vendor closing review (E,
+     review-only); C (codex gpt-6-luna max) only for a slice that is genuinely hard code, kept off
+     the critical path, at most one task while E runs (C and E share the Codex window).
+4. **Launch exactly those** from A's own pane:
+   `pwsh ~/.claude/ipc/ipc_wezterm_launch.ps1 -Project "<cwd>" -Roles D,F` (same fleet, so the
+   inherited `WEZTERM_*` env is the right one; fleet-operations caution 11 concerns the OTHER fleet).
+   The launcher refuses a role whose pane is alive ("refusing to add a duplicate pane" = already
+   up), so the same command adds a role later without harm. Then
+   `python ~/.claude/ipc/ipc.py status --watch <role>` per new role: ALIVE before any dispatch; a
+   silent pane → `python ~/.claude/ipc/ipc_pane_probe.py <role>`.
+5. **Record the decision** in `_A_ledger.md`: task shape, quota snapshot, roles launched, why. An
+   idle pane costs no tokens, so launched roles stay for the session; nothing is exited for idleness.
+6. A new task type still gets n=1 before volume; capacity, seams and verification-after-delivery
+   below are unchanged.
 
 ## Capacity-aware dispatch (hub A, adopted 2026-08-19)
 
@@ -207,3 +255,62 @@ Moved verbatim from `SKILL.md` on 2026-10-03 (lint-skills size rule); the rule l
     workers write each product to a file and keep a one-line result in context; a
     dozen mechanical items go to subagents/Workflow, not one serial worker.
     [[C--Users-<user>-Downloads-AI-----::ipc-worker-queue-context-limit]]
+
+## Analytical fan-out contract (lifted 2026-10-28 from a project analysis skill)
+
+Applies when one analysis (a company screen, a credit review, a research report) is split
+across subagents or fleet workers for coverage or wall-clock time. The default is one
+session working sequentially; fan out only when data volume or a deadline justifies it.
+Coverage can fan out, judgment cannot: gates, cross-source reconciliation, verdicts and
+ratings stay with the hub. A project skill that uses this contract keeps its own checklist,
+gate and verdict scale.
+
+1. **Brief content: workers return evidence, not conclusions, enforced by schema.** Give
+   every fan-out agent a structured output schema with evidence fields only (figure,
+   period, source location, comparison baseline, suspected lead) and no verdict or rating
+   field, so a conclusion has nowhere to go. "Do not conclude" in a prompt is a soft
+   constraint and is regularly overstepped; validate the schema at the tool layer. Split
+   the work accordingly:
+   - Mechanical layer (delegable): ratios, threshold comparisons, cross-statement
+     tie-outs, news dedup and clustering, field extraction from notes. Deterministic,
+     computed and returned.
+   - Reasoning layer (hub only): whether an outlier is believed, whether a change is
+     legitimate or cosmetic, which side is wrong when numbers and narrative conflict. A
+     worker's "suspected lead" is a pointer the hub may overturn after seeing raw numbers.
+   - No "suggested verdict" field in a brief either; if the user asks a worker to rate,
+     the hub says the rating stays with it and then rules.
+2. **Where to fan out: large data in, small summary out.** Multi-agent costs more tokens
+   overall; the one net saving is isolating bulky raw data in a disposable context (data
+   pulls of 60–150 KB per statement call, PDF extraction, news clustering). The worker
+   swallows hundreds of KB and returns a few KB; the raw blocks never reach the hub.
+   - Workers write scratch to a temp directory and the hub sweeps the project root after
+     the round; extraction agents otherwise scatter `chunk*`, `extract*`, `*_text.txt` and
+     downloaded PDFs there (one run left 208 MB; [[ai-fin::subagent-scratch-pollutes-cwd]]).
+     Keep only the files that get archived.
+   - Do not split light work: twenty checklist items over one shared summarized dataset is
+     one agent, not twenty. Judgment steps take summaries in and conclusions out, so
+     parallelizing them costs money and quality.
+   - Drafting and review go to one or two strong models (2026-10-21: one case had 60 briefs
+     in 15 minutes with over 30% rework, and three rounds of weak-model review caught fewer
+     errors than one opus subagent in 15 minutes; [[ai-fin::process-revision-2026-10-21]]).
+     Data-pull fan-out stays; each drafting stage and each review stance goes to one strong
+     model end to end, which caps the number of briefs.
+   - Keep the gate: a screening stage that stops most cases before the expensive deep stage
+     saves that whole fan-out. Under a tight budget, scale concurrency with Workflow
+     `budget.total`, run fewer agents, or fall back to sequential.
+3. **Result format and writing: outline first, one owner per coherent module** (2026-10-22,
+   from a 69-brief case post-mortem; [[ai-fin::process-revision-2026-10-22]]). Evidence
+   gathering by source domain stays parallel. Before formal writing, the hub writes a
+   one-page outline (core judgments, main evidence, what cannot be determined, the question
+   each chapter answers) and attaches it to every chapter brief; authors write against it
+   and reviewers challenge those judgments. A coherent module (a chapter, a worksheet
+   section, a set of linked facts) is done start to finish by one owner; do not cut it by
+   a fixed task duration so the next owner rereads the context. Seams between separately
+   drafted parts (calibers, wording, cross-references) were the main source of editor
+   comments and unsourced patches in that case.
+4. **Merge rules (hub).** Check coverage item by item against the analysis checklist: a
+   fan-out round easily leaves an item unclaimed, or a worker fails silently and returns
+   nothing, so many returned reports prove nothing about coverage. Re-dispatch the gaps.
+   Then reconcile across workers: each saw only its slice, so cross-source findings (one
+   statement against another, narrative against numbers) exist only at the hub. Shared
+   files and ruling follow rule 6 of the dispatch brief standard above.

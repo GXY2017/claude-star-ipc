@@ -44,18 +44,44 @@ HEADER = re.compile(r"^#\s*(\w+)\s*(?:->|→|=>|—>|-->)\s*(\w+)")
 BUDGET = re.compile(r"(?:预算|时间预算|BUDGET)\s*[:：]\s*(\d+)\s*(?:分钟|min)?", re.I)
 UNITS = re.compile(r"UNITS\s*[:：]\s*(\d+)", re.I)
 FEN = re.compile(r"(\d+)\s*份")
-ABS_PATH = re.compile(r"[A-Za-z]:\\[^\s`'\"()（）,，。;；|<>]+")
+ABS_PATH = re.compile(
+    # A trailing backslash followed by whitespace ends a directory path.
+    # Match this alternative first, before seeking an extension in later prose.
+    r"[A-Za-z]:\\(?:(?![A-Za-z]:\\|\\[ \t\r\n])[^\r\n`'\"()（）,，。;；|<>])*\\(?=[ \t\r\n]|$)"
+    r"|[A-Za-z]:\\(?:(?![A-Za-z]:\\)[^\r\n`'\"()（）,，。;；|<>])*?"
+    r"\.[A-Za-z0-9]{1,8}(?![\w./\\-])"
+    r"|[A-Za-z]:\\[^\s`'\"()（）,，。;；|<>]+"
+)
 DANGLING = re.compile(r"(追加进|追加到|写进|写入|输出到|产物)\s*[:：]?\s*(?:[。.]|$)", re.M)
 NEXT_LINE_ABS = re.compile(r"^[`*]*[A-Za-z]:\\")
-PRODUCT_KW = re.compile(r"(产物|追加进|追加到|写进|写入|新建|落盘|输出到|产出)")
+PRODUCT_KW = re.compile(r"(?:产物(?:文件|路径|清单)?\s*[:：]|追加进|追加到|写进|写入|新建|落盘|输出到|产出)")
+PRODUCT_SECTION = re.compile(r"^\s*(?:#{1,6}\s*)?产物(?:文件|路径|清单)?\s*[:：]?\s*$")
+SECTION_BOUNDARY = re.compile(r"^\s*(?:#{1,6}\s+|[\w\u4e00-\u9fff]+\s*[:：]\s*$)")
 # a file-looking token that is NOT part of an absolute path (absolute paths are removed first)
 # bare `name.md` or relative `_staging\name.md` (absolute paths are removed first)
 BARE_FILE = re.compile(r"(?<![\w\\/.])((?:[\w\-\u4e00-\u9fff<>*]+[\\/])*[\w\-\u4e00-\u9fff<>*]+\.(?:md|tsv|txt|py|json|csv|log|xlsx|docx|pdf))(?![\w\\/.])(:\d+)?")
+TEMPLATE_TOKEN = re.compile(r"(?:`[^`\n]*[<*][^`\n]*`|(?<!\S)\S*[<*]\S*)")
 NEGATED_BEFORE = re.compile(r"(不要|不得|不准|不能|不许|禁止|别|勿|只读|不)\s*(?:直接|再|去|往|向|改|动)?\s*$")
 CD_COMPOUND = re.compile(r"\bcd\s+[^\n]*&&")
 HEREDOC = re.compile(r"<<\s*'?[A-Z_]+'?")
 BRACE = re.compile(r"\{[^{}\n]*,[^{}\n]*\}")
 CRITERIA = re.compile(r"(完成判据|验收标准|DONE[-_ ]WHEN|ACCEPTANCE)\s*[:：]?", re.I)
+
+
+def outside_parentheses(line):
+    """Mask parenthesized commentary, preserving offsets into the original line."""
+    depth = 0
+    result = []
+    for c in line:
+        if c in "(（":
+            depth += 1
+            result.append(" ")
+        elif c in ")）" and depth:
+            depth -= 1
+            result.append(" ")
+        else:
+            result.append(" " if depth else c)
+    return "".join(result)
 
 
 def main():
@@ -150,16 +176,26 @@ def main():
         fails.append(f"D 第 {ln} 行产物/写入目标为空: {seg[:60]!r}（下一行也不是以绝对路径开头）")
 
     # D2 product declared as a bare filename (must be absolute)
+    in_product_section = False
     for i, l in enumerate(lines, 1):
+        if PRODUCT_SECTION.match(l):
+            in_product_section = True
+            continue
+        if in_product_section and SECTION_BOUNDARY.match(l):
+            in_product_section = False
         if l.strip().startswith("#"):
             continue
-        kw = PRODUCT_KW.search(l)
-        if not kw:
-            continue
-        if NEGATED_BEFORE.search(l[:kw.start()]):   # "不写入 分析素材.md": a prohibition, not a product
+        visible = outside_parentheses(l)
+        matches = [m for m in PRODUCT_KW.finditer(visible)
+                   if not NEGATED_BEFORE.search(visible[:m.start()])]
+        if matches:
+            target = l[matches[0].end():]
+        elif in_product_section:
+            target = l
+        else:
             continue
         # same line, and only AFTER the keyword ("不要改 `x.py`…写进回复" has its token before it)
-        stripped = ABS_PATH.sub(" ", l[kw.end():])
+        stripped = TEMPLATE_TOKEN.sub(" ", ABS_PATH.sub(" ", target))
         for mm in BARE_FILE.finditer(stripped):
             name, cite = mm.group(1), mm.group(2)
             if cite:                       # `file.md:98` is an evidence citation, not a product

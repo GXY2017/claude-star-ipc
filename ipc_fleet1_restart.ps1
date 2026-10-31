@@ -9,7 +9,7 @@
 #
 # Usage:
 #   pwsh ~/.claude/ipc/ipc_fleet1_restart.ps1 -Project "C:\path\to\project"
-#   pwsh ~/.claude/ipc/ipc_fleet1_restart.ps1 -Project ... -Roles A,B,C,E,F
+#   pwsh ~/.claude/ipc/ipc_fleet1_restart.ps1 -Project ... -Roles A,B,C,E,F   # explicit lineup; default since 2026-10-27 is A alone
 #   ... -Force        # proceed even if A has tasks in flight to fleet-1 roles, or -Roles omits the hub
 #
 # !! Run from a window OUTSIDE fleet 1 (plain PowerShell or another wezterm window);
@@ -38,7 +38,7 @@
 #      sleeps, no hand-rolled slash-command injection.
 param(
     [Parameter(Mandatory)][string]$Project,
-    [string[]]$Roles = @('A','B','C','D','E','F'),
+    [string[]]$Roles = @('A'),   # user rule 2026-10-27: hub alone; A adds workers with ipc_wezterm_launch.ps1 -Roles <workers> after reading the task
     [switch]$Force
 )
 $ErrorActionPreference = 'Stop'
